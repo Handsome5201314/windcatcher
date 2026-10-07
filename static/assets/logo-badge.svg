@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 96" width="256" height="192" role="img" aria-label="风见 Windcatcher 品牌标志：风进入鼻腔">
+  <title>风见 Windcatcher</title>
+  <!-- badge 底 -->
+  <rect x="20" y="4" width="88" height="88" rx="20" fill="#151b1d"/>
+  <!-- 负空间鼻侧影（面向左侧，前额顶到上缘，下颌落到下缘） -->
+  <path fill="#ffffff" d="M62 4
+    C54 16 46 28 41 38
+    C39 42 37 45 36 47
+    C40 49 43 50 45 52
+    C43 55 44 58 47 60
+    C45 64 46 69 51 73
+    C57 78 64 81 70 84
+    C76 88 83 92 90 96
+    L108 96 L108 4 Z"/>
+  <!-- 鼻腔内的气道（青绿） -->
+  <path fill="#2bb3a6" d="M49 38
+    C56 33 64 37 65 44
+    C66 51 58 56 51 53
+    C45 50 45 42 49 38 Z"/>
+  <!-- 三条风线：从 badge 左外侧吸入鼻孔 -->
+  <g fill="none" stroke="#2bb3a6" stroke-width="3" stroke-linecap="round">
+    <path d="M4 40 C16 40 26 42 34 45"/>
+    <path d="M4 48 C14 48 24 49 32 50"/>
+    <path d="M6 56 C14 56 22 55 30 53"/>
+  </g>
+</svg>

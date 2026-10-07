@@ -1,0 +1,28 @@
+# 风见（Windcatcher）本地产物 —— 一律不入库、不外传
+.venv/
+__pycache__/
+*.py[cod]
+cases/
+tests/phantom_ct/
+.taskbook/
+.pytest_cache/
+*.log
+*.env
+.env
+*.png
+*.jpg
+*.jpeg
+*.bak
+.design-explore/
+tests/*real*.json
+tests/results-ui-smoke-report.json
+tests/results-ui-*.png
+
+# 影像与病例数据红线：任何 DICOM / STL / CFD 结果都不进版本库
+*.dcm
+*.ima
+*.nii
+*.nii.gz
+*.stl
+*.vtu
+*.vtk
