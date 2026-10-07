@@ -127,6 +127,7 @@
               <div class="endplane-3d-tools" role="group" aria-label="裁切面操作">
                 <button id="endplane-tool-translate" class="vt-btn is-on" type="button" aria-pressed="true">移动切面</button>
                 <button id="endplane-tool-rotate" class="vt-btn" type="button" aria-pressed="false">旋转切面</button>
+                <button id="endplane-flip-normal" class="vt-btn" type="button" title="不改变切面位置，翻转当前切面的保留方向" disabled>翻转当前端面方向</button>
                 <button id="endplane-reset-camera" class="vt-btn" type="button">复位视角</button>
                 <span>拖动空白处旋转模型；选中彩色手柄可移动或旋转端面。</span>
               </div>
@@ -135,7 +136,7 @@
                 <div id="endplane-3d-overlay" class="endplane-3d-overlay" role="status" aria-live="polite">正在准备临时 3D 气道…</div>
               </div>
               <p id="endplane-orientation" class="endplane-orientation"></p>
-              <p class="endplane-3d-help">蓝色＝鼻孔端，橙色＝咽喉端；亮色是拟保留的气道，灰淡部分将移除。单击气道表面放置端面，拖动空白处旋转视角，拖动彩色手柄调整端面。这里是着色器裁切预览，保存后才由后端精确裁切并重新做几何质检。</p>
+              <p class="endplane-3d-help">蓝色＝鼻孔端，橙色＝咽喉端；亮色是拟保留的气道，灰淡部分将移除。生成 STL 后显示精确裁切并封盖的模型，以几何质检结果为准。</p>
               <p id="endplane-preview-status" class="endplane-preview-status" role="status" aria-live="polite">请先放置两端裁切面，再检查几何预检结果。</p>
               <details class="endplane-precise" id="endplane-precise">
                 <summary>精确调整 CT 层号（仅正交裁切）</summary>
@@ -353,6 +354,6 @@
   <!-- Three.js r128 examples/js/controls/TransformControls.js; MIT license in static/vendor/LICENSE-three-r128.txt -->
   <script src="/static/vendor/TransformControls.js"></script>
   <script src="/static/cfd-viewer.js?v=20261004-real-results1"></script>
-  <script src="/static/app.js?v=20261006-env-layout2"></script>
+  <script src="/static/app.js?v=20261007-stl-preview2"></script>
 </body>
 </html>

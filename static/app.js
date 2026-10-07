@@ -14,6 +14,7 @@ const state = {
   viewerAssetCaseId: null,
   viewerAssetMode: null,
   viewer3dCaseId: null,
+  viewer3dKey: null,
   ctViewer: {
     caseId: null,
     maskKey: null,
@@ -473,7 +474,10 @@ function endplaneValidation() {
     const outward = (side === "anterior" ? 1 : -1) * Number(e.profile.anterior_sign);
     const projection = plane.normal_lps.reduce((sum, value, axis) =>
       sum + value * e.profile.ap_direction_lps[axis] * outward, 0);
-    if (projection <= 0) return "裁切面的外侧方向反了，请旋转使鼻孔侧与咽喉侧朝向模型外部";
+    if (projection <= 0) {
+      const sideLabel = side === "anterior" ? "鼻孔端" : "咽喉端";
+      return `${sideLabel}法向朝向模型内部。请选中“选${sideLabel}”，点击“翻转当前端面方向”后再检查。`;
+    }
     if (isAxialEndplane(e.profile, side, plane)) {
       const area = endplaneArea(ctIndexFromPlane(e.profile, plane));
       if (area === null || area < 1) return "正交端面的掩膜估算面积低于 1 mm² 技术下限，请重新放置";
@@ -492,7 +496,8 @@ function renderEndplaneUi(preserveNumber = null) {
   button.classList.toggle("is-on", e.open);
   button.setAttribute("aria-expanded", String(e.open));
   panel.hidden = !e.open;
-  if (!e.open) return;
+  if (!e.open) { e.viewer?.pause(); return; }
+  e.viewer?.resume();
   const context = endplaneContext();
   const feedback = $("endplane-feedback");
   const status = $("endplane-status");
@@ -536,6 +541,8 @@ function renderEndplaneUi(preserveNumber = null) {
       button.setAttribute("aria-pressed", String(e.tool === tool));
     }
   }
+  const flipButton = $("endplane-flip-normal");
+  if (flipButton) flipButton.disabled = e.saving || !e.planes[e.mode];
   const placementStatus = $("endplane-placement-status");
   if (placementStatus) {
     const sideLabel = e.mode === "anterior" ? "鼻孔端" : "咽喉端";
@@ -561,7 +568,10 @@ function renderEndplaneUi(preserveNumber = null) {
     areaNode.classList.toggle("is-warning", index !== null && (area === null || area < 1));
   }
   const validation = endplaneValidation();
-  if (e.dirty && validation && !e.error) feedback.textContent = validation;
+  if (e.dirty && validation && !e.error) {
+    feedback.textContent = validation;
+    feedback.classList.add("is-error");
+  }
   $("endplane-save").disabled = e.saving || e.profile?.can_save === false || !e.dirty || Boolean(validation);
   $("endplane-discard").disabled = e.saving || !e.dirty;
 }
@@ -578,6 +588,17 @@ function planeNormalFromObject(object) {
   return new THREE.Vector3(0, 0, 1).applyQuaternion(object.getWorldQuaternion(new THREE.Quaternion())).normalize();
 }
 
+function endplaneClippingPlanes(planes) {
+  return ["anterior", "posterior"].flatMap((side) => {
+    const data = normalizedEndplane(planes?.[side]);
+    if (!data) return [];
+    // Three.js clips the negative side; the backend retains outward dot (x - point) <= 0.
+    return [new THREE.Plane().setFromNormalAndCoplanarPoint(
+      new THREE.Vector3(...data.normal_lps).negate(), new THREE.Vector3(...data.point_lps_mm),
+    )];
+  });
+}
+
 function createEndplaneViewer(host) {
   const width = () => host.clientWidth || 640;
   const height = () => host.clientHeight || 420;
@@ -585,6 +606,7 @@ function createEndplaneViewer(host) {
   scene.background = new THREE.Color(0x0d1519);
   const camera = new THREE.PerspectiveCamera(40, width() / height(), 0.01, 10000);
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.localClippingEnabled = true;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(width(), height());
   host.replaceChildren(renderer.domElement);
@@ -609,6 +631,8 @@ function createEndplaneViewer(host) {
   const pointer = new THREE.Vector2();
   const planeObjects = { anterior: null, posterior: null };
   let modelMesh = null;
+  let removedMesh = null;
+  let animationId = null;
   let profile = null;
   let activeSide = "anterior";
   let pointerStart = null;
@@ -641,6 +665,15 @@ function createEndplaneViewer(host) {
     const position = object.getWorldPosition(new THREE.Vector3());
     const normal = planeNormalFromObject(object);
     state.endplanes.planes[side] = { point_lps_mm: position.toArray(), normal_lps: normal.toArray() };
+    updateClipping();
+  }
+
+  function updateClipping() {
+    if (!modelMesh) return;
+    const planes = endplaneClippingPlanes(state.endplanes.planes);
+    modelMesh.material.clippingPlanes = planes;
+    modelMesh.material.needsUpdate = true;
+    if (removedMesh) removedMesh.visible = planes.length > 0;
   }
 
   function syncActivePlane() {
@@ -694,6 +727,7 @@ function createEndplaneViewer(host) {
       }
     }
     attachActivePlane();
+    updateClipping();
   }
 
   function setActiveSide(side) {
@@ -745,6 +779,11 @@ function createEndplaneViewer(host) {
 
   function clear() {
     if (transform) { transform.detach(); transform.visible = false; }
+    if (removedMesh) {
+      modelGroup.remove(removedMesh);
+      removedMesh.material.dispose();
+      removedMesh = null;
+    }
     if (modelMesh) {
       modelGroup.remove(modelMesh);
       modelMesh.geometry.dispose();
@@ -765,6 +804,12 @@ function createEndplaneViewer(host) {
     modelMesh = new THREE.Mesh(geometry, material);
     modelMesh.renderOrder = 1;
     modelGroup.add(modelMesh);
+    removedMesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+      color: 0xa8afb2, transparent: true, opacity: 0.12,
+      side: THREE.DoubleSide, depthWrite: false,
+    }));
+    removedMesh.renderOrder = 0;
+    modelGroup.add(removedMesh);
     frame();
     setPlanes(state.endplanes.planes, activeSide);
   }
@@ -777,17 +822,25 @@ function createEndplaneViewer(host) {
 
   function resetCamera() { frame(); }
 
-  (function animate() {
-    requestAnimationFrame(animate);
+  function animate() {
+    animationId = requestAnimationFrame(animate);
     controls.update();
     renderer.render(scene, camera);
-  })();
+  }
+  function pause() {
+    if (animationId !== null) cancelAnimationFrame(animationId);
+    animationId = null;
+  }
+  function resume() { if (animationId === null) animate(); }
+  resume();
   window.addEventListener("resize", resize);
 
   return {
     clear,
     loadGeometry,
     resize,
+    pause,
+    resume,
     resetCamera,
     setActiveSide,
     setPlanes,
@@ -898,6 +951,8 @@ async function saveEndplanes() {
     if (state.caseId !== context.caseId) return;
     state.case = await api(`/api/cases/${encodeURIComponent(context.caseId)}`);
     state.viewer3dCaseId = null;
+    state.viewer3dKey = null;
+    state.viewer3d?.clear();
     state.mode = "slices";
     await loadEndplaneProfile(endplaneContext(), true);
     if (!endplaneSaved()) throw new Error("端面已提交，但未能核对当前保存状态");
@@ -981,6 +1036,15 @@ function bindEndplaneControls() {
     state.endplanes.tool = "rotate";
     state.endplanes.viewer?.setTool("rotate");
     renderEndplaneUi();
+  });
+  $("endplane-flip-normal").addEventListener("click", () => {
+    const e = state.endplanes;
+    const side = e.mode;
+    const plane = normalizedEndplane(e.planes[side]);
+    if (e.saving || !plane) return;
+    e.planes[side] = { ...plane, normal_lps: plane.normal_lps.map((value) => -value) };
+    e.viewer?.setPlanes(e.planes, side);
+    updateEndplaneDraft(true);
   });
   $("endplane-reset-camera").addEventListener("click", () => state.endplanes.viewer?.resetCamera());
   window.addEventListener("beforeunload", (event) => {
@@ -1384,10 +1448,9 @@ function navigateToStage(stageName) {
       break;
     case "surface": {
       const maskNeedsReview = requiresMaskReview(state.case?.stages);
-      const surfaceReady = state.case?.stages?.surface?.status === "ok" && !maskNeedsReview;
+      const surfaceReady = hasSurfaceModel() && !maskNeedsReview;
       if (surfaceReady) {
-        state.mode = "3d";
-        refreshViewer();
+        if (!activateStlPreview()) return;
         jump($("viewer-card"), $("viewer-card"));
       } else {
         jump($("detail-surface") || $("viewer-card"));
@@ -1583,6 +1646,8 @@ function renderEmptyCase() {
   state.viewerAssetCaseId = null;
   state.viewerAssetMode = null;
   state.viewer3dCaseId = null;
+  state.viewer3dKey = null;
+  state.viewer3d?.clear();
   resetCtViewer(null);
   resetEndplaneState();
 }
@@ -1602,6 +1667,9 @@ async function selectCase(caseId) {
   state.maskEditor.dirty = false;
   state.maskEditor.history = [];
   state.caseId = caseId;
+  state.viewer3d?.clear();
+  state.viewer3dCaseId = null;
+  state.viewer3dKey = null;
   resetEndplaneState();
   state.modelScope = "complete_candidate";
   try {
@@ -1852,6 +1920,10 @@ async function runAction(button, fn, stageName) {
     state.case = fresh;
     state.clientRunningStage = null;
     renderCase();
+    if (stageName === "surface" && hasSurfaceModel()) {
+      activateStlPreview({ reload: true });
+      focusStageTarget($("viewer-card"));
+    }
     toast("完成");
   } catch (error) {
     if (state.caseId !== capturedCaseId) return;
@@ -2573,9 +2645,32 @@ function miniMarkdown(text) {
 }
 
 /* ---------- 视窗 ---------- */
+function hasSurfaceModel() {
+  return Boolean(state.caseId && ["ok", "warn"].includes(state.case?.stages?.surface?.status));
+}
+
+function surfaceModelKey() {
+  const surface = state.case?.stages?.surface;
+  return [state.caseId, surface?.updated_at || "", state.case?.stages?.segment?.data?.mask_version ?? ""].join("|");
+}
+
+function activateStlPreview({ reload = false } = {}) {
+  if (!guardEndplaneDraft()) return false;
+  state.endplanes.open = false;
+  state.maskEditor.active = false;
+  if (reload) {
+    state.viewer3dCaseId = null;
+    state.viewer3dKey = null;
+    state.viewer3d?.clear();
+  }
+  state.mode = "3d";
+  refreshViewer();
+  return true;
+}
+
 function refreshViewer() {
   const hasCase = Boolean(state.caseId);
-  const hasStl = hasCase && state.case?.stages?.surface?.status === "ok";
+  const hasStl = hasSurfaceModel();
   const hasVolume = hasCase && ["ok", "warn"].includes(state.case?.stages?.import?.status);
   const maskNeedsReview = requiresMaskReview(state.case?.stages);
   const hasMask = hasCase && Boolean(state.ctViewer.meta?.mask_available || ["ok", "warn"].includes(state.case?.stages?.segment?.status));
@@ -3111,14 +3206,26 @@ function show3d() {
   $("viewer-empty").hidden = true;
   const host = $("viewer-3d");
   host.hidden = false;
-  $("viewer-note").textContent = "真实气道 STL · 拖拽旋转 / 滚轮缩放";
+  const warning = state.case?.stages?.surface?.status === "warn";
+  $("viewer-note").textContent = warning ? "真实气道 STL · 几何质检有警告，详见下方结果" : "真实气道 STL · 拖拽旋转 / 滚轮缩放";
   $("viewer-sub").textContent = "3D 气道模型 · 本机生成的 airway.stl";
   if (!state.viewer3d) state.viewer3d = createViewer3d(host);
   state.viewer3d.resize();
-  if (state.viewer3dCaseId !== state.caseId) {
-    state.viewer3dCaseId = state.caseId;
-    state.viewer3d.load(`/api/cases/${state.caseId}/model`, () => {
-      if (state.viewer3dCaseId === state.caseId) state.viewer3dCaseId = null;
+  const caseId = state.caseId;
+  const modelKey = surfaceModelKey();
+  if (state.viewer3dCaseId !== caseId || state.viewer3dKey !== modelKey) {
+    state.viewer3dCaseId = caseId;
+    state.viewer3dKey = modelKey;
+    $("viewer-sub").textContent = "正在加载最新裁切 STL…";
+    state.viewer3d.load(`/api/cases/${encodeURIComponent(caseId)}/model?v=${encodeURIComponent(modelKey)}`, () => {
+      if (state.caseId !== caseId || state.viewer3dKey !== modelKey) return;
+      state.viewer3dCaseId = null;
+      state.viewer3dKey = null;
+      if (state.mode === "3d") show3dBlocked("STL 加载失败，请重试 STL 预览或检查本地产物。");
+    }, () => {
+      if (state.caseId === caseId && state.viewer3dKey === modelKey && state.mode === "3d") {
+        $("viewer-sub").textContent = "3D 气道模型 · 本机生成的 airway.stl";
+      }
     });
   }
 }
@@ -3149,6 +3256,16 @@ function createViewer3d(host) {
   const group = new THREE.Group();
   scene.add(group);
   let currentMesh = null;
+  let loadRequestId = 0;
+
+  function clear() {
+    loadRequestId += 1;
+    if (!currentMesh) return;
+    group.remove(currentMesh);
+    currentMesh.geometry.dispose();
+    currentMesh.material.dispose();
+    currentMesh = null;
+  }
 
   function frame() {
     const box = new THREE.Box3().setFromObject(group);
@@ -3176,14 +3293,14 @@ function createViewer3d(host) {
 
   return {
     resize,
-    load(url, onError) {
+    clear,
+    load(url, onError, onLoad) {
+      clear();
+      const requestId = loadRequestId;
       const loader = new THREE.STLLoader();
       loader.load(url, (geometry) => {
+        if (requestId !== loadRequestId) { geometry.dispose(); return; }
         geometry.computeVertexNormals();
-        if (currentMesh) {
-          group.remove(currentMesh);
-          currentMesh.geometry.dispose();
-        }
         const material = new THREE.MeshPhysicalMaterial({
           color: 0x7cc6b9,
           metalness: 0.0,
@@ -3198,9 +3315,10 @@ function createViewer3d(host) {
         currentMesh = new THREE.Mesh(geometry, material);
         group.add(currentMesh);
         frame();
+        if (onLoad) onLoad();
       }, undefined, () => {
+        if (requestId !== loadRequestId) return;
         if (onError) onError();
-        toast("STL 加载失败", true);
       });
     },
   };
@@ -3828,7 +3946,7 @@ $("btn-edit-path").addEventListener("click", (event) => {
   if (editing) input.focus();
 });
 $("btn-view-slices").addEventListener("click", () => { state.mode = "slices"; refreshViewer(); });
-$("btn-view-3d").addEventListener("click", () => { state.mode = "3d"; refreshViewer(); });
+$("btn-view-3d").addEventListener("click", () => activateStlPreview());
 async function refreshAfterMaskReview(button, path, successMessage) {
   const capturedCaseId = state.caseId;
   if (!capturedCaseId) return;
