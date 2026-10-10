@@ -43,6 +43,7 @@ function harness(names, overrides = {}) {
   const nodes = new Map();
   const calls = [];
   const context = vm.createContext({
+    window: {},
     $: (id) => {
       if (!nodes.has(id)) nodes.set(id, element());
       return nodes.get(id);

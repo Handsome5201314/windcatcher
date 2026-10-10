@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>风见 · 鼻腔气流工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20261006-env-layout2" />
+  <link rel="stylesheet" href="/static/app.css?v=20261009-cfd-progress2" />
 </head>
 <body>
   <div class="shell">
@@ -288,6 +288,17 @@
           <button id="btn-refresh-env" class="button button-quiet">重新探测</button>
         </div>
         <div id="env-body"><div class="skeleton" style="height:180px;"></div></div>
+        <section class="activity-monitor" aria-labelledby="monitor-title">
+          <div class="monitor-heading">
+            <h2 id="monitor-title">本机操作记录</h2>
+            <span id="monitor-status" role="status" aria-live="polite">等待连接</span>
+            <button id="monitor-refresh" class="button button-quiet" type="button">刷新记录</button>
+          </div>
+          <p id="monitor-summary">操作记录仅保存在本机。</p>
+          <label class="check"><input id="monitor-errors-only" type="checkbox" />只看失败与错误</label>
+          <p id="monitor-error" role="alert" hidden></p>
+          <ol id="monitor-events" class="monitor-events" aria-label="最近五十条操作记录"><li>等待读取记录。</li></ol>
+        </section>
       </section>
 
       <!-- ============ 处理流程 ============ -->
@@ -348,12 +359,13 @@
 
   <div class="toast-wrap" id="toasts"></div>
 
+  <script src="/static/activity-monitor.js?v=20261009-monitor1"></script>
   <script src="/static/vendor/three.min.js"></script>
   <script src="/static/vendor/STLLoader.js"></script>
   <script src="/static/vendor/OrbitControls.js"></script>
   <!-- Three.js r128 examples/js/controls/TransformControls.js; MIT license in static/vendor/LICENSE-three-r128.txt -->
   <script src="/static/vendor/TransformControls.js"></script>
   <script src="/static/cfd-viewer.js?v=20261004-real-results1"></script>
-  <script src="/static/app.js?v=20261007-stl-preview2"></script>
+  <script src="/static/app.js?v=20261010-results-recovery2"></script>
 </body>
 </html>

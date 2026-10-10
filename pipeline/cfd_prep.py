@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 
-from .config import MIN_OPENING_AREA_MM2, SOP_DEFAULTS
+from .config import MIN_OPENING_AREA_MM2, SOP_DEFAULTS, resolve_parallel_plan
 from .errors import PipelineError
 from .volume import ANTERIOR_LPS, load_volume
 
@@ -408,6 +408,14 @@ def prepare_case(case_id: str, params: dict | None = None) -> dict:
     )
     if params:
         p.update({k: v for k, v in params.items() if v is not None})
+    try:
+        parallel_plan = resolve_parallel_plan({
+            "profile": p.get("parallel_profile", p.get("parallel", {}).get("profile") if isinstance(p.get("parallel"), dict) else None),
+            "custom_subdomains": p.get("custom_subdomains", p.get("parallel", {}).get("custom_subdomains") if isinstance(p.get("parallel"), dict) else None),
+        })
+        mpi_subdomains = parallel_plan["requested_subdomains"]
+    except ValueError as exc:
+        raise PipelineError("blocked", str(exc), ["选择有效的计算资源模式或 MPI 进程数后重新生成算例"]) from exc
     try:
         rho = float(p["air_rho"])
         inlet_pressure_pa = float(p["inlet_pressure_pa"])
@@ -907,6 +915,17 @@ snGradSchemes { default corrected; }
     )
 
     _write(
+        cfd_root / "system" / "decomposeParDict",
+        "dictionary",
+        "decomposeParDict",
+        f"""numberOfSubdomains {mpi_subdomains};
+method          scotch;
+distributed     no;
+roots           ();
+""",
+    )
+
+    _write(
         cfd_root / "system" / "fvSolution",
         "dictionary",
         "fvSolution",
@@ -985,6 +1004,11 @@ docker run --rm -v "$CASE_DIR":/case -w /case "$IMAGE" bash -c \\
     meta = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "solver": "simpleFoam",
+        "parallel": {
+            **parallel_plan,
+            "enabled": mpi_subdomains > 1,
+            "method": "scotch",
+        },
         "openfoam_flavour": p["openfoam_flavour"],
         "turbulence_model": turbulence,
         "inlet_mode": p["inlet_mode"],
@@ -1035,6 +1059,7 @@ docker run --rm -v "$CASE_DIR":/case -w /case "$IMAGE" bash -c \\
             "cfd/constant/triSurface/nasal_cfd.stl",
             "cfd/system/blockMeshDict",
             "cfd/system/snappyHexMeshDict",
+            "cfd/system/decomposeParDict",
             "cfd/0/U",
             "cfd/0/p",
             "cfd/case_meta.json",
@@ -1044,6 +1069,8 @@ docker run --rm -v "$CASE_DIR":/case -w /case "$IMAGE" bash -c \\
             "inlet_area_mm2": round(inlet_area_mm2, 2),
             "mean_inlet_velocity_mps": round(mean_velocity, 3),
             "solver": "simpleFoam",
+            "parallel": meta["parallel"],
+            "solver_gpu_note": meta.get("parallel", {}).get("capabilities", {}).get("solver_gpu_note"),
             "solved": False,
         },
     )

@@ -9,17 +9,22 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import preview
+from . import mesh_cache, preview
 from .cfd_validation import (
     inspect_latest_fields, parse_mesh_checks, parse_residuals, pressure_metadata, read_json,
 )
 from .errors import PipelineError
+from .config import openfoam_mpi_processes
 
 
 def configured_image() -> str:
@@ -52,6 +57,436 @@ def _run(cmd: list[str], timeout: int) -> tuple[int, str, str]:
         return 124, "", "执行超时"
     except OSError as exc:
         return 125, "", str(exc)
+
+
+def _stop_command(proc, cmd: list[str]) -> dict:
+    """停止本次任务，Docker CLI 退出本身不能证明容器已停止。"""
+    cleanup = {"status": "stopped"}
+    if cmd[:2] == ["docker", "run"]:
+        if "--name" not in cmd:
+            cleanup = {"status": "unverified", "reason": "Docker 命令没有专属容器名，无法确认后台求解已停止"}
+        else:
+            name = cmd[cmd.index("--name") + 1]
+            code, out, err = _run(["docker", "rm", "--force", name], timeout=20)
+            if code != 0 and "No such container" not in out + err:
+                cleanup = {"status": "unverified", "container": name, "reason": err or out or f"docker rm 退出码 {code}"}
+            else:
+                cleanup["container"] = name
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    return cleanup
+
+
+def _run_streaming(
+    cmd: list[str],
+    timeout: int,
+    on_line=None,
+    *,
+    on_tick=None,
+    log_path: Path | None = None,
+    cwd: Path | None = None,
+) -> dict:
+    """运行长任务并逐行回传输出，避免求解期间页面只看到空白等待。
+
+    ``subprocess.run`` 只有进程结束后才会返回，无法支持实时残差和超时诊断。
+    读取线程把 stdout 与主线程解耦，主线程因此可以同时执行超时检查和状态落盘。
+    """
+    started = time.monotonic()
+    lines: list[str] = []
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            shell=False,
+            cwd=cwd,
+        )
+    except FileNotFoundError as exc:
+        return {"returncode": 127, "output": "", "timed_out": False, "elapsed_seconds": 0, "error": str(exc)}
+    except PermissionError as exc:
+        return {"returncode": 126, "output": "", "timed_out": False, "elapsed_seconds": 0, "error": str(exc)}
+    except OSError as exc:
+        return {"returncode": 125, "output": "", "timed_out": False, "elapsed_seconds": 0, "error": str(exc)}
+
+    events: queue.Queue[str | None] = queue.Queue()
+
+    def reader() -> None:
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                events.put(line)
+        finally:
+            events.put(None)
+
+    thread = threading.Thread(target=reader, name="openfoam-output", daemon=True)
+    thread.start()
+    closed, timed_out = False, False
+    cleanup = None
+    handle = None
+    try:
+        if log_path:
+            handle = log_path.open("w", encoding="utf-8")
+            handle.write(f"$ {' '.join(cmd)}\n\n")
+            handle.flush()
+        last_tick = started
+        while True:
+            try:
+                line = events.get(timeout=0.25)
+            except queue.Empty:
+                line = ""
+            if line is None:
+                closed = True
+            elif line:
+                lines.append(line)
+                if handle:
+                    handle.write(line)
+                    handle.flush()
+                if on_line:
+                    on_line(line, time.monotonic() - started)
+            now = time.monotonic()
+            if on_tick and now - last_tick >= 1:
+                on_tick(now - started)
+                last_tick = now
+            if not timed_out and proc.poll() is None and now - started >= timeout:
+                timed_out = True
+                cleanup = _stop_command(proc, cmd)
+            if proc.poll() is not None and closed:
+                break
+        if on_tick:
+            on_tick(time.monotonic() - started)
+    finally:
+        if proc.poll() is None:
+            _stop_command(proc, cmd)
+        if handle:
+            handle.close()
+        thread.join(timeout=2)
+    elapsed = round(time.monotonic() - started, 3)
+    return {
+        "returncode": 124 if timed_out else int(proc.returncode or 0),
+        "output": "".join(lines),
+        "timed_out": timed_out,
+        "elapsed_seconds": elapsed,
+        "cleanup": cleanup,
+    }
+
+
+def _solver_progress(log_text: str, cfd_dir: Path, controls: tuple[str, str] | None = None) -> dict:
+    """从当前日志提取可证实的外层迭代、残差和 endTime。"""
+    if controls is None:
+        controls = tuple(path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+                         for path in (cfd_dir / "system" / "fvSolution", cfd_dir / "system" / "controlDict"))
+    parsed = parse_residuals(log_text, *controls)
+    last = parsed.get("history", [])[-1] if parsed.get("history") else {}
+    end_time = parsed.get("end_time")
+    current_time = parsed.get("last_time")
+    iteration_percent = None
+    if isinstance(end_time, (int, float)) and isinstance(current_time, (int, float)) and end_time > 0:
+        iteration_percent = round(max(0.0, min(100.0, current_time / end_time * 100)), 3)
+    return {
+        "iteration": parsed.get("iterations", 0),
+        "time": parsed.get("last_time"),
+        "end_time": parsed.get("end_time"),
+        "iteration_percent": iteration_percent,
+        "initial_residual": parsed.get("initial_residual", {}),
+        "final_residual": parsed.get("final_residual", {}),
+        "status": parsed.get("status"),
+        "last": last,
+        "stop_reason": parsed.get("stop_reason"),
+    }
+
+
+def _write_status(path: Path, payload: dict) -> None:
+    """原子写入运行记录，轮询时不会读到半截 JSON。"""
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    temp.write_text(text, encoding="utf-8")
+    last_error = None
+    # Windows may briefly deny replacing a file that the API reader or an
+    # antivirus scanner has open. Retry the atomic replace before surfacing a
+    # real status-write failure to the caller.
+    for delay in (0.03, 0.08, 0.18, 0.35, 0.6):
+        try:
+            temp.replace(path)
+            _clear_live_status(path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(delay)
+
+    # Windows Defender、索引器或浏览器读取器可能在整个重试窗口内暂时
+    # 占用目标文件。状态记录不能反过来终止求解，因此保留一个旁路快照，
+    # 读取端会优先使用它，下一次成功替换主文件时自动清理。
+    live_path = _live_status_path(path)
+    try:
+        temp.replace(live_path)
+        return
+    except PermissionError:
+        try:
+            live_path.write_text(text, encoding="utf-8")
+            temp.unlink(missing_ok=True)
+            return
+        except OSError:
+            pass
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    # 状态文件写入失败不应伪装成求解器失败。主流程会继续执行，下一次
+    # 心跳或最终状态写入仍会再次尝试。
+    return
+
+
+def _live_status_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.live")
+
+
+def _clear_live_status(path: Path) -> None:
+    try:
+        _live_status_path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def read_latest_status(path: Path) -> dict:
+    """读取主状态或 Windows 锁定期间写入的旁路状态。"""
+    live_path = _live_status_path(path)
+    candidates = [candidate for candidate in (path, live_path) if candidate.exists()]
+    if not candidates:
+        raise FileNotFoundError(path)
+    source = max(candidates, key=lambda candidate: candidate.stat().st_mtime_ns)
+    return json.loads(source.read_text(encoding="utf-8"))
+
+
+def status_exists(path: Path) -> bool:
+    return path.exists() or _live_status_path(path).exists()
+
+
+def _error_diagnosis(name: str, result: dict, output: str, timeout: int) -> tuple[str, list[str]]:
+    if name == "foamToVTK":
+        if result.get("timed_out") or result.get("returncode") == 124:
+            cleanup = result.get("cleanup") or {}
+            stop = "；容器停止未能确认，请检查 Docker" if cleanup.get("status") == "unverified" else ""
+            reason = f"附加 VTK 文件导出超时（超过 {timeout} 秒）{stop}；已完成的 OpenFOAM 求解场保留"
+        else:
+            reason = f"附加 VTK 文件导出失败（退出码 {result.get('returncode')}）；已完成的 OpenFOAM 求解场保留"
+        return reason, [
+            "病例流场页面直接读取 OpenFOAM 的 U、p 场，可单独生成浏览器可视化，不需要重新求解",
+            "VTK 文件供外部查看器使用，导出失败不等于气流计算失败；未完成的 VTK 文件不能用于复核",
+            "查看 cfd/logs/foamToVTK.log 定位导出错误",
+        ]
+    if result.get("timed_out") or result.get("returncode") == 124:
+        stopped = result.get("cleanup") or {}
+        stop_message = "已被终止" if stopped.get("status") != "unverified" else "容器停止未能确认，请检查 Docker"
+        return (
+            f"{name} 超过 {timeout} 秒仍未完成，{stop_message}（这是超时，不是求解器返回的收敛失败）",
+            [
+                "查看最后一次外层迭代和残差，确认求解是否仍在推进",
+                "优先使用 MPI 并行求解；若网格仍超过机器承受范围，再调整网格策略",
+            ],
+        )
+    capacity = re.search(r"WINDCATCHER_MPI_CAPACITY_EXCEEDED requested=(\d+) available=(\d+)", output)
+    slots = re.search(r"not enough slots.*?satisfy the\s+(\d+)\s+slots", output, flags=re.I | re.S)
+    if capacity or slots:
+        count = (capacity or slots).group(1)
+        available = f"当前容器可用上限为 {capacity.group(2)} 个 CPU 进程" if capacity else "MPI 在当前运行环境中识别到的 CPU 槽位少于请求数"
+        return (
+            f"MPI 槽位不足：请求 {count} 个进程，{available}；未开始气流迭代",
+            [
+                "Windows 的 CPU 数量与 Docker / WSL 中实际可用的 CPU 数量可能不同",
+                "新版会先检查并行启动，并在 Docker 中按可用虚拟 CPU 线程分配 MPI 槽位",
+                "若请求数超过后端上限，请降低自定义进程数，或调整 Docker / WSL 的 CPU 资源后重试",
+            ],
+        )
+    fatal = re.search(r"FOAM FATAL (?:ERROR|IO ERROR)\s*:\s*(.*?)(?:\n|$)", output, flags=re.I)
+    if fatal:
+        return (
+            f"{name} 返回 OpenFOAM 致命错误：{fatal.group(1).strip()}",
+            ["打开对应步骤日志查看完整上下文", "检查边界名称、字段边界条件与网格 patch 是否一致"],
+        )
+    return (
+        f"{name} 退出码 {result.get('returncode')}" + (f"：{result['error']}" if result.get("error") else ""),
+        [f"查看 cfd/logs/{name}.log 的最后 100 行", "不要把未完成的场数据当作成功结果"],
+    )
+
+
+def _progress_message(name: str, solver: dict, elapsed: float) -> str:
+    if name == "foamToVTK":
+        return f"正在导出最终场的附加 VTK 文件 · 已耗时 {elapsed:.0f} 秒；浏览器病例流场直接读取 OpenFOAM 场，该导出没有可核实的百分比"
+    if name == "simpleFoam":
+        iteration = solver.get("iteration") or 0
+        end_time = solver.get("end_time")
+        if isinstance(end_time, (int, float)) and solver.get("time") is not None:
+            note = f" · 外层迭代上限参考 {solver['time']:g}/{end_time:g}（{solver.get('iteration_percent', 0):g}%）"
+        elif isinstance(end_time, (int, float)):
+            note = f" · 外层迭代上限 {end_time:g}"
+        else:
+            note = " · 总迭代数未知"
+        if solver.get("initial_residual"):
+            residual = ", ".join(f"{key}={value:.2e}" for key, value in solver["initial_residual"].items())
+            return f"外层迭代 {iteration} · 初始残差 {residual}{note} · 已耗时 {elapsed:.0f} 秒"
+        return f"等待求解器首轮残差 · 已耗时 {elapsed:.0f} 秒"
+    return f"正在处理 · 已耗时 {elapsed:.0f} 秒；该步骤没有可核实的百分比"
+
+
+def _mesh_summary(cfd_dir: Path) -> dict:
+    """从 checkMesh 日志提取可核对的规模，失败时保留缺失原因。"""
+    path = cfd_dir / "logs" / "checkMesh.log"
+    if not path.exists():
+        return {"check_status": "missing", "reason": "缺少 checkMesh 日志"}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    counts = {}
+    for label, pattern in (
+        ("points", r"\bpoints:\s*(\d+)"),
+        ("faces", r"\bfaces:\s*(\d+)"),
+        ("internal_faces", r"\binternal faces:\s*(\d+)"),
+        ("cells", r"\bcells:\s*(\d+)"),
+    ):
+        match = re.search(pattern, text)
+        if match:
+            counts[label] = int(match.group(1))
+    checks = parse_mesh_checks(cfd_dir)
+    return {
+        **counts,
+        "check_status": checks.get("status", "missing"),
+        "mesh_ok": bool(checks.get("mesh_ok")),
+        "clean": bool(checks.get("clean")),
+        "reason": checks.get("reason"),
+    }
+
+
+def _execution_summary(backend: str, parallel_active: bool, requested_procs: int) -> dict:
+    return {
+        "backend": backend,
+        "mode": "mpi" if parallel_active else "serial",
+        "requested_subdomains": requested_procs if parallel_active else 1,
+        "gpu_used": False,
+        "note": "OpenFOAM simpleFoam 默认使用 CPU；GPU 不会自动参与" if not parallel_active else "MPI 并行使用 CPU；GPU 不会自动参与",
+    }
+
+
+def _docker_mpi_command(count: int, program: str) -> str:
+    # Docker / WSL 的虚拟核心拓扑不等于 Windows 的物理核心拓扑。
+    # 显式允许按线程分配，但仍由 MPI 检查实际槽位，不能 oversubscribe。
+    return f"mpirun --allow-run-as-root --use-hwthread-cpus -np {count} {program}"
+
+
+def _docker_mpi_preflight(count: int) -> str:
+    """生成网格前验证真实容器资源和相同的 MPI 启动配置。"""
+    return f'''set -eu
+logical=$(nproc)
+physical=0
+if command -v lscpu >/dev/null 2>&1; then
+    physical=$(lscpu -p=CORE,SOCKET | sed '/^#/d' | sort -u | wc -l)
+fi
+limit=$logical
+# nproc respects affinity; also respect Docker cgroup CPU quotas.
+quota=max
+period=100000
+if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max
+elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+    quota=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    period=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+fi
+if [ "$quota" != max ] && [ "$quota" -gt 0 ] && [ "$period" -gt 0 ]; then
+    quota_limit=$(( (quota + period - 1) / period ))
+    if [ "$quota_limit" -lt "$limit" ]; then limit=$quota_limit; fi
+fi
+printf 'WINDCATCHER_CPU_LOGICAL=%s\\nWINDCATCHER_CPU_PHYSICAL=%s\\nWINDCATCHER_MPI_MAX_PROCS=%s\\n' "$logical" "$physical" "$limit"
+if [ {count} -gt "$limit" ]; then
+    printf 'WINDCATCHER_MPI_CAPACITY_EXCEEDED requested={count} available=%s\\n' "$limit"
+    exit 2
+fi
+command -v simpleFoam
+simpleFoam -help >/dev/null
+{_docker_mpi_command(count, 'true')}
+'''
+
+
+def _docker_runtime_summary(output: str, requested_procs: int) -> dict:
+    cpu = {}
+    for marker, key in (("CPU_LOGICAL", "logical_cores"), ("CPU_PHYSICAL", "physical_cores"),
+                        ("MPI_MAX_PROCS", "max_processes")):
+        match = re.search(rf"(?m)^WINDCATCHER_{marker}=(\d+)\s*$", output)
+        if match and int(match.group(1)) > 0:
+            cpu[key] = int(match.group(1))
+    return {"backend": "docker", "cpu": cpu, "allocation_mode": "hwthread", "requested_subdomains": requested_procs}
+
+
+def _prepare_decomposition(cfd_dir: Path, count: int) -> None:
+    """确保分区文件与 mpirun 核数一致，保留已配置的分区方法。"""
+    path = cfd_dir / "system" / "decomposeParDict"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+        if len(re.findall(r"(?m)^\s*numberOfSubdomains\s+\d+\s*;", text)) != 1:
+            raise PipelineError("blocked", "无法确认 decomposeParDict 的分区数量", ["检查 numberOfSubdomains 配置后重试"])
+        text = re.sub(r"(?m)^(\s*numberOfSubdomains\s+)\d+(\s*;)", rf"\g<1>{count}\2", text)
+    else:
+        text = ('FoamFile\n{\n    version 2.0;\n    format ascii;\n    class dictionary;\n'
+                '    object decomposeParDict;\n}\n'
+                f'numberOfSubdomains {count};\nmethod scotch;\ndistributed no;\nroots ();\n')
+    path.write_text(text, encoding="utf-8")
+
+
+def _mesh_backend_identity(chosen: str, meta: dict) -> dict:
+    identity = {"name": chosen, "openfoam_flavour": meta.get("openfoam_flavour", "org")}
+    if chosen == "docker":
+        code, out, err = _run(["docker", "image", "inspect", "--format", "{{.Id}}", configured_image()], timeout=20)
+        if code == 0 and re.fullmatch(r"sha256:[0-9a-f]{64}", out.strip()):
+            identity["image_id"] = out.strip()
+        else:
+            identity["reason"] = err or out or "无法核对本机镜像内容标识"
+    return identity
+
+
+def _archive_run_outputs(cfd_dir: Path, run_id: str, *, rebuild: bool, previous_status: dict) -> dict:
+    """Move old outputs aside so latestTime cannot silently select a previous run."""
+    archive = cfd_dir / "run_history" / run_id
+    if not archive.resolve().is_relative_to(cfd_dir.resolve()):
+        raise PipelineError("blocked", "归档目录超出当前算例，无法安全保存旧结果", ["检查 cfd/run_history 后重试"])
+    candidates = []
+    for path in cfd_dir.iterdir():
+        is_time = False
+        try:
+            value = float(path.name)
+            is_time = math.isfinite(value) and value != 0
+        except ValueError:
+            pass
+        if is_time or re.fullmatch(r"processors?\d+(?:_\d+-\d+)?", path.name) or path.name in {"postProcessing", "VTK", "results"}:
+            candidates.append(path)
+    for relative in ("0/polyMesh", *(["constant/polyMesh", mesh_cache.MANIFEST_FILENAME] if rebuild else [])):
+        path = cfd_dir / relative
+        if path.exists():
+            candidates.append(path)
+    archive.mkdir(parents=True, exist_ok=False)
+    archived = []
+    for path in candidates:
+        if path.is_symlink() or not path.resolve().is_relative_to(cfd_dir.resolve()):
+            raise PipelineError("blocked", "旧结果路径超出当前算例，无法安全归档", ["检查算例内的链接目录后重试"])
+        relative = path.relative_to(cfd_dir)
+        target = archive / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(target))
+        archived.append(relative.as_posix())
+    old_logs = archive / "logs"
+    for path in (cfd_dir / "logs").iterdir():
+        if path.is_file() and path.name not in {"mpiPreflight.log", "prepareRun.log"}:
+            old_logs.mkdir(exist_ok=True)
+            shutil.copy2(path, old_logs / path.name)
+    if previous_status:
+        (archive / "run_status.json").write_text(json.dumps(previous_status, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"path": archive.relative_to(cfd_dir).as_posix(), "artifacts": archived}
 
 
 def detect_backends() -> dict:
@@ -327,80 +762,283 @@ def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) ->
         return payload
 
     chosen = backend or detection["available"][0]
+    if chosen not in detection["available"]:
+        raise PipelineError("blocked", f"所选 {chosen} 求解后端不可用", ["在环境页面检查所选后端"])
     (cfd_dir / "logs").mkdir(parents=True, exist_ok=True)
 
+    try:
+        meta = read_json(cfd_dir / "case_meta.json")
+    except (OSError, ValueError) as exc:
+        raise PipelineError("blocked", f"算例配置无法读取：{exc}", ["检查 cfd/case_meta.json 后重试"]) from exc
+    parallel_meta = meta.get("parallel", {}) if isinstance(meta.get("parallel", {}), dict) else {}
+    try:
+        requested_procs = openfoam_mpi_processes(parallel_meta)
+    except ValueError as exc:
+        raise PipelineError("blocked", str(exc), ["修正并行核数配置后重试"]) from exc
+    parallel_requested = requested_procs > 1
+    if parallel_requested:
+        if chosen == "native" and any(not shutil.which(tool) for tool in ("decomposePar", "mpirun", "reconstructPar")):
+            raise PipelineError("blocked", "当前本机后端缺少 MPI 工具，不能按指定核数并行", ["安装 MPI 和 OpenFOAM 并行工具，或设置 OPENFOAM_MPI_PROCS=1 使用单进程"])
+        _prepare_decomposition(cfd_dir, requested_procs)
+    run_id = uuid.uuid4().hex
+    status_path = cfd_dir / "run_status.json"
+    previous_status = read_latest_status(status_path) if status_exists(status_path) else {}
+    identity = _mesh_backend_identity(chosen, meta)
+    signature = mesh_cache.mesh_inputs_signature(cfd_dir, identity)
+    reuse = mesh_cache.inspect_reuse(cfd_dir, signature)
+    reuse_mesh = reuse["reusable"]
+    parallel_mesh = chosen == "docker" and parallel_requested
+    generation = (reuse.get("manifest", {}).get("generation", {}) if reuse_mesh else
+                  {"mode": "parallel" if parallel_mesh else "serial", "requested_subdomains": requested_procs if parallel_mesh else 1, "run_id": run_id})
+
     if chosen == "docker":
-        image = configured_image()
+        # Pin the actual local image, so changing a tag cannot change this run.
+        image = identity.get("image_id") or configured_image()
         volume_arg = f"{cfd_dir.resolve()}:/case"
         env_source = ". /opt/openfoam11/etc/bashrc >/dev/null 2>&1; "
 
-        def docker_cmd(inner: str) -> list[str]:
-            return ["docker", "run", "--rm", "--entrypoint", "bash", "-v", volume_arg, "-w", "/case", image, "-c", env_source + inner]
-
-        commands = [
-            (docker_cmd("blockMesh"), "blockMesh"),
-            (docker_cmd("snappyHexMesh -overwrite"), "snappyHexMesh"),
-            (docker_cmd("checkMesh"), "checkMesh"),
-            (docker_cmd("simpleFoam"), "simpleFoam"),
-            (docker_cmd("foamToVTK -ascii"), "foamToVTK"),
-        ]
+        def command(inner: str, step: str) -> list[str]:
+            name = f"windcatcher-{run_id}-{step}"
+            return ["docker", "run", "--rm", "--name", name, "--entrypoint", "bash", "-v", volume_arg, "-w", "/case", image, "-c", env_source + inner]
+        def mpi(program: str) -> str:
+            return _docker_mpi_command(requested_procs, program)
     elif chosen == "wsl":
-        commands = [
-            (["wsl.exe", "bash", "-lc", f"cd '{cfd_dir.as_posix()}' && blockMesh"], "blockMesh"),
-            (["wsl.exe", "bash", "-lc", f"cd '{cfd_dir.as_posix()}' && snappyHexMesh -overwrite"], "snappyHexMesh"),
-            (["wsl.exe", "bash", "-lc", f"cd '{cfd_dir.as_posix()}' && checkMesh"], "checkMesh"),
-            (["wsl.exe", "bash", "-lc", f"cd '{cfd_dir.as_posix()}' && simpleFoam"], "simpleFoam"),
-        ]
+        prefix = f"cd '{cfd_dir.as_posix()}' && "
+        def command(inner: str, step: str) -> list[str]:
+            return ["wsl.exe", "bash", "-lc", prefix + inner]
+        def mpi(program: str) -> str:
+            return f"mpirun -np {requested_procs} {program}"
     else:  # native
-        commands = [
-            (["blockMesh"], "blockMesh"),
-            (["snappyHexMesh", "-overwrite"], "snappyHexMesh"),
-            (["checkMesh"], "checkMesh"),
-            (["simpleFoam"], "simpleFoam"),
-        ]
+        def command(inner: str, step: str) -> list[str]:
+            return inner.split()
+        def mpi(program: str) -> str:
+            return f"mpirun -np {requested_procs} {program}"
+
+    plan = []
+    if chosen == "docker" and parallel_requested:
+        plan.append(("mpiPreflight", _docker_mpi_preflight(requested_procs)))
+    plan.append(("prepareRun", ""))
+    if not reuse_mesh:
+        plan.append(("blockMesh", "blockMesh"))
+        if parallel_mesh:
+            plan.extend([
+                ("decomposeMesh", "decomposePar -force -noFields"),
+                ("snappyHexMesh", mpi("snappyHexMesh -parallel -overwrite")),
+                ("reconstructMesh", "reconstructPar -constant -noFields -time 0"),
+            ])
+        else:
+            plan.append(("snappyHexMesh", "snappyHexMesh -overwrite"))
+    plan.append(("checkMesh", "checkMesh"))
+    if parallel_requested:
+        plan.extend([
+            ("decomposePar", "decomposePar -force -time 0"),
+            ("simpleFoam", mpi("simpleFoam -parallel")),
+            ("reconstructPar", "reconstructPar -latestTime"),
+        ])
+    else:
+        plan.append(("simpleFoam", "simpleFoam"))
+    if chosen == "docker":
+        # External-viewer export is independent of the browser, which reads
+        # OpenFOAM directly. Avoid converting the initial field and writing
+        # millions of cell values as text on Windows bind mounts.
+        plan.append(("foamToVTK", "foamToVTK -latestTime -fields '(U p)' -noFunctionObjects"))
+    commands = [(command(inner, name) if inner else [], name) for name, inner in plan]
+    parallel_active = parallel_requested
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    run_started = time.monotonic()
+    mesh_summary = {"check_status": "pending", "reason": "等待本次 checkMesh 检查"}
+    execution = _execution_summary(chosen, parallel_active, requested_procs)
+    execution["mesh"] = {
+        "action": "reused" if reuse_mesh else "rebuilt", **generation,
+        "status": "pending",
+        "reason": reuse["reason"], "cache": {"status": "checking", "reason": "等待本次网格质量检查"},
+    }
+    if reuse_mesh:
+        execution["mesh"]["source_run_id"] = generation.get("run_id") or reuse["manifest"]["check_mesh"]["run_id"]
+    parallel_record = {**parallel_meta, "enabled": parallel_active,
+                       "requested_subdomains": requested_procs if parallel_active else 1}
+
+    def live_status(current_step: str | None, progress: dict, solver: dict, message: str | None = None) -> dict:
+        payload = {
+            "status": "running",
+            "run_id": run_id,
+            "backend": chosen,
+            "execution": execution,
+            "parallel": parallel_record,
+            "mesh": mesh_summary,
+            "current_step": current_step,
+            "started_at": started_at,
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "elapsed_seconds": round(time.monotonic() - run_started, 1),
+            "timeout_seconds": timeout_s,
+            "steps": steps,
+            "progress": progress,
+            "solver": solver,
+        }
+        if message:
+            payload["message"] = message
+        return payload
 
     update_stage(
         case_id,
         "cfd_run",
         "running",
-        message=f"已选择 {chosen} 后端，准备执行 CFD 求解",
-        data={"solved": False, "backend": chosen},
+        message=f"已选择 {chosen} 后端，准备执行 CFD 求解" + (f"（{requested_procs} 核并行）" if parallel_active else "（单进程）"),
+        data={"solved": False, "backend": chosen, "current_step": None, "run_id": run_id},
     )
     steps = []
+    solver_progress = {}
+    _write_status(status_path, live_status(
+        None,
+        {"percent": 0, "completed": 0, "total": len(commands), "current_step_percent": None, "label": "准备执行"},
+        solver_progress,
+    ))
     for cmd, name in commands:
+        step_started = time.monotonic()
+        current_lines: list[str] = []
+        solver_progress = {}
+        solver_records = 0
+        current_counted = False
+        controls = tuple(path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+                         for path in (cfd_dir / "system" / "fvSolution", cfd_dir / "system" / "controlDict"))
+        last_output_at = None
+        progress = {
+            "percent": round(len(steps) / len(commands) * 100, 1),
+            "completed": len(steps),
+            "total": len(commands),
+            "current_step_percent": None,
+            "label": f"正在执行 {name}",
+        }
+        _write_status(status_path, live_status(name, progress, solver_progress))
+
+        def refresh_solver() -> None:
+            nonlocal solver_progress, solver_records, current_counted
+            if name != "simpleFoam":
+                return
+            # 只解析当前外层迭代，避免每行重扫从启动到现在的全部日志。
+            parsed = _solver_progress("".join(current_lines), cfd_dir, controls)
+            if parsed.get("iteration"):
+                if not current_counted:
+                    solver_records += 1
+                    current_counted = True
+                solver_progress = {**parsed, "iteration": solver_records}
+
+        def on_line(line: str, elapsed: float) -> None:
+            nonlocal current_counted, last_output_at
+            last_output_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            if name == "simpleFoam":
+                if re.match(r"^\s*Time\s*=", line):
+                    refresh_solver()
+                    current_lines.clear()
+                    current_counted = False
+                current_lines.append(line)
+
+        def on_tick(elapsed: float) -> None:
+            refresh_solver()
+            message = _progress_message(name, solver_progress, elapsed)
+            progress["current_step_percent"] = (
+                solver_progress.get("iteration_percent") if name == "simpleFoam" else None
+            )
+            payload = live_status(name, {**progress, "label": message}, solver_progress)
+            payload["step_elapsed_seconds"] = round(elapsed, 1)
+            payload["last_output_at"] = last_output_at
+            _write_status(status_path, payload)
         update_stage(
             case_id,
             "cfd_run",
             "running",
             message=f"正在执行 {name}，请保持页面打开查看进度",
-            data={"backend": chosen, "current_step": name, "solved": False},
+            data={"backend": chosen, "current_step": name, "solved": False, "run_id": run_id},
         )
-        code, out, err = _run(cmd, timeout=timeout_s)
         log_path = cfd_dir / "logs" / f"{name}.log"
-        log_path.write_text(f"$ {' '.join(cmd)}\n\n{out}\n{err}\n", encoding="utf-8")
-        steps.append({"name": name, "returncode": code, "log": f"cfd/logs/{name}.log"})
+        step_timeout = min(timeout_s, 60) if name == "mpiPreflight" else timeout_s
+        if name == "prepareRun":
+            try:
+                execution["archive"] = _archive_run_outputs(cfd_dir, run_id, rebuild=not reuse_mesh, previous_status=previous_status)
+                out = f"旧结果已归档：{execution['archive']['path']}\n"
+                result = {"returncode": 0, "output": out, "elapsed_seconds": round(time.monotonic() - step_started, 3)}
+            except (OSError, PipelineError) as exc:
+                result = {"returncode": 1, "output": str(exc), "error": str(exc), "elapsed_seconds": round(time.monotonic() - step_started, 3)}
+            log_path.write_text(result["output"], encoding="utf-8")
+        else:
+            result = _run_streaming(cmd, timeout=step_timeout, on_line=on_line, on_tick=on_tick,
+                                    log_path=log_path, cwd=cfd_dir if chosen == "native" else None)
+        code, out = result["returncode"], result.get("output", "")
+        if result.get("error"):
+            log_path.write_text(f"$ {' '.join(cmd)}\n\n{result['error']}\n", encoding="utf-8")
+        if name == "mpiPreflight":
+            execution["runtime"] = _docker_runtime_summary(out, requested_procs)
+        if name == "checkMesh":
+            mesh_summary = _mesh_summary(cfd_dir)
+        step_elapsed = result.get("elapsed_seconds")
+        steps.append({
+            "name": name,
+            "returncode": code,
+            "log": f"cfd/logs/{name}.log",
+            "elapsed_seconds": step_elapsed,
+            "step_elapsed_seconds": step_elapsed,
+            "timed_out": result.get("timed_out", False) or code == 124,
+            "cleanup": result.get("cleanup"),
+        })
+        if name == "foamToVTK" and code != 0:
+            reason, remediation = _error_diagnosis(name, result, out, step_timeout)
+            steps[-1].update(message=reason, remediation=remediation)
+        if name == "checkMesh" and code == 0:
+            execution["mesh"]["status"] = "checked"
+            if signature.get("valid"):
+                current_signature = mesh_cache.mesh_inputs_signature(cfd_dir, identity)
+                if not current_signature.get("valid") or current_signature.get("signature") != signature["signature"]:
+                    code = 1
+                    out += "\n网格输入在运行期间发生变化，已停止求解；请重新生成算例后重试\n"
+                    result.update(returncode=code, output=out, error="网格输入在运行期间发生变化")
+                    steps[-1]["returncode"] = code
+            if code == 0:
+                cache_result = mesh_cache.record_mesh(cfd_dir, signature, run_id, check_result=result,
+                                                      completed_steps=steps, generation=generation)
+                execution["mesh"]["cache"] = {"status": "ready" if cache_result["recorded"] else "unavailable", "reason": cache_result["reason"]}
+                if cache_result.get("input_changed") or (reuse_mesh and not cache_result["recorded"]):
+                    code = 1
+                    out += f"\n复用网格复核失败：{cache_result['reason']}\n"
+                    result.update(returncode=code, output=out, error=cache_result["reason"])
+                    steps[-1]["returncode"] = code
         if code != 0 and name != "foamToVTK":  # 可视化转换失败不阻断求解状态
+            reason, remediation = _error_diagnosis(name, result, out, step_timeout)
+            if name in mesh_cache.MESH_STEPS:
+                execution["mesh"]["status"] = "failed"
+                execution["mesh"]["cache"] = {"status": "unavailable", "reason": reason}
+            final_solver = _solver_progress(out, cfd_dir) if name == "simpleFoam" else solver_progress
+            progress["current_step_percent"] = final_solver.get("iteration_percent") if name == "simpleFoam" else None
+            progress["label"] = reason
             payload = {
                 "status": "failed",
+                "run_id": run_id,
                 "backend": chosen,
+                "execution": execution,
+                "parallel": parallel_record,
+                "mesh": mesh_summary,
                 "failed_step": name,
+                "current_step": name,
+                "returncode": code,
+                "timed_out": bool(result.get("timed_out") or code == 124),
+                "cleanup": result.get("cleanup"),
                 "steps": steps,
-                "remediation": [
-                    f"步骤 {name} 退出码 {code}，请查看 cfd/logs/{name}.log",
-                    "常见原因：几何有自交/破洞导致网格失败、边界条件不一致、求解不收敛",
-                    "不要降低网格精度后直接把结果标成合格；先定位原因",
-                ],
+                "elapsed_seconds": round(time.monotonic() - run_started, 1),
+                "step_elapsed_seconds": step_elapsed,
+                "last_output_at": last_output_at,
+                "timeout_seconds": timeout_s,
+                "progress": progress,
+                "solver": final_solver, "message": reason,
+                "last_output": [line for line in out.splitlines() if line.strip()][-20:],
+                "remediation": [*remediation, f"日志：cfd/logs/{name}.log"],
             }
-            (cfd_dir / "run_status.json").write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            _write_status(status_path, payload)
             update_stage(
                 case_id,
                 "cfd_run",
                 "failed",
-                message=f"求解失败于 {name}",
+                message=reason,
                 artifacts=["cfd/run_status.json"],
-                data={"solved": False, "backend": chosen, "failed_step": name},
+                data={"solved": False, "backend": chosen, "failed_step": name, "run_status": payload, "run_id": run_id},
             )
             return payload
 
@@ -412,8 +1050,14 @@ def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) ->
 
     payload = {
         "status": "ran",
+        "run_id": run_id,
         "backend": chosen,
+        "execution": execution,
+        "parallel": parallel_record,
+        "mesh": mesh_summary,
         "steps": steps,
+        "elapsed_seconds": round(time.monotonic() - run_started, 1),
+        "progress": {"percent": 100, "completed": len(steps), "total": len(commands), "current_step_percent": None, "label": "命令流程已结束，结果待复核"},
         "residuals": residuals,
         "postprocessing": post,
         "field_validation": fields,
@@ -424,14 +1068,14 @@ def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) ->
             "note": "即使求解结束，也需要残差/质量守恒/网格敏感性复核后才能进入患者报告",
         },
     }
-    (cfd_dir / "run_status.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_status(status_path, payload)
     update_stage(
         case_id,
         "cfd_run",
         "warn",
         message=f"求解已在 {chosen} 后端执行完毕，等待 CFD 工程师复核",
         artifacts=["cfd/run_status.json"],
-        data={"solved": True, "backend": chosen, "report_eligible": False},
+        data={"solved": True, "backend": chosen, "report_eligible": False, "run_id": run_id},
     )
     return payload
 
@@ -462,7 +1106,7 @@ def check_result_gate(case_id: str) -> dict:
         }
 
     try:
-        status = read_json(status_path)
+        status = read_latest_status(status_path)
     except (OSError, ValueError) as exc:
         return {"eligible": False, "numeric_ok": False, "checks": [{"name": "求解状态文件", "status": "invalid", "detail": str(exc)}], "reasons": ["求解状态文件无法读取"]}
     if status.get("status") != "ran":

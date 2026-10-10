@@ -77,8 +77,13 @@ const state = {
     requestId: 0,
   },
   installJobs: new Map(),
-  cfdResults: { viewer: null, caseId: null, requestId: 0, controller: null, pollTimer: null, status: null, payloadKey: null, actionPending: false },
+  computeCapabilities: null,
+  cfdResults: { viewer: null, caseId: null, requestId: 0, controller: null, pollTimer: null, status: null, result: null, payloadKey: null, actionPending: false },
 };
+window.WindcatcherMonitor?.setContextProvider(() => ({
+  case_id: window.location.hash === "#results" ? state.cfdResults.caseId : state.caseId,
+  route: state.route || window.location.hash.slice(1) || "work",
+}));
 
 // 与后端实际执行顺序一致：先质控，再按选项生成匿名化副本。
 const STAGE_ORDER = ["import", "qc", "anonymize", "segment", "surface", "cfd_prep", "cfd_run", "report"];
@@ -135,6 +140,111 @@ function modelScopeParams(caseId) {
       keep_largest_component: effectiveScope === "main_nasal_airway",
     },
   };
+}
+
+function cfdParallelStorageKey(caseId) {
+  return `windcatcher:cfd-parallel:${caseId}`;
+}
+
+function getCfdParallelConfig(caseId = state.caseId) {
+  const fallback = { profile: "strongest", custom_subdomains: null };
+  if (!caseId) return fallback;
+  try {
+    const saved = JSON.parse(localStorage.getItem(cfdParallelStorageKey(caseId)) || "null");
+    if (!saved || !["strongest", "balanced", "custom"].includes(saved.profile)) return fallback;
+    const custom = Number.isInteger(Number(saved.custom_subdomains)) ? Number(saved.custom_subdomains) : null;
+    return { profile: saved.profile, custom_subdomains: custom };
+  } catch {
+    return fallback;
+  }
+}
+
+function setCfdParallelConfig(caseId, patch) {
+  const next = { ...getCfdParallelConfig(caseId), ...patch };
+  try { localStorage.setItem(cfdParallelStorageKey(caseId), JSON.stringify(next)); } catch { /* 当前页面仍可继续提交 */ }
+  return next;
+}
+
+function cfdParallelLabel(profile) {
+  return ({ strongest: "最强", balanced: "适度", custom: "自定义", legacy: "历史配置", env: "环境变量" })[profile] || "最强";
+}
+
+function cfdEffectiveParallelPlan(data) {
+  const prepared = data.stages?.cfd_prep?.data?.parallel;
+  const runData = data.stages?.cfd_run?.data || {};
+  const actual = runData.run_status?.parallel || runData.parallel || prepared;
+  if (!actual) return null;
+  // 运行记录是实际子域数的依据；仅在数量一致时沿用生成算例时的模式标签。
+  const matchesPrepared = prepared && Number(actual.requested_subdomains) > 0
+    && Number(actual.requested_subdomains) === Number(prepared.requested_subdomains);
+  return { ...actual, profile: actual.profile || (matchesPrepared && prepared.profile) || "legacy" };
+}
+
+function cfdRuntimeRows(execution) {
+  const runtime = execution.runtime || {};
+  const cpu = runtime.cpu || {};
+  const rows = [];
+  if (Number.isInteger(cpu.logical_cores) && cpu.logical_cores > 0) {
+    const physical = Number.isInteger(cpu.physical_cores) && cpu.physical_cores > 0 ? ` / ${cpu.physical_cores} 个物理核` : "";
+    rows.push(["求解环境 CPU", `${runtime.backend === "docker" ? "容器" : "运行环境"}可用 ${cpu.logical_cores} 个逻辑核${physical}`]);
+  }
+  if (runtime.allocation_mode === "hwthread") {
+    rows.push(["MPI 分配", "按可用 CPU 线程分配"]);
+  }
+  return rows;
+}
+
+function cfdMeshRows(execution) {
+  const mesh = execution.mesh || {};
+  const count = Number.isInteger(mesh.requested_subdomains) && mesh.requested_subdomains > 0 ? mesh.requested_subdomains : null;
+  const generation = mesh.mode === "parallel" ? `并行生成气道网格${count ? `（${count} 个进程）` : "（进程数未记录）"}`
+    : mesh.mode === "serial" ? "单进程生成气道网格" : "执行方式未记录；不能据求解子域数判断网格并行";
+  const planned = mesh.action === "reused" ? "复用已生成网格 · 本次重新检查质量" : generation;
+  const label = mesh.status === "pending" ? `计划：${planned}` : mesh.status === "failed" ? `未完成：${planned}` : planned;
+  const rows = [["网格执行", label]];
+  if (mesh.action === "reused") rows.push(["复用范围", "仅复用网格；本次重新求解气流"], ["原网格生成", generation]);
+  if (mesh.reason) rows.push(["复用判定", escapeHtml(mesh.reason)]);
+  const cache = mesh.cache || {};
+  const cacheLabel = cache.status === "ready" ? "检查证据已保存"
+    : cache.status === "unavailable" ? cache.reason || "缓存不可用，原因未记录"
+      : cache.status === "checking" ? "等待本次网格检查" : cache.reason;
+  if (cacheLabel) rows.push(["下次复用", escapeHtml(cacheLabel)]);
+  if (mesh.action === "reused" && mesh.source_run_id) rows.push(["网格来源", escapeHtml(mesh.source_run_id)]);
+  return rows;
+}
+
+function cfdResourceCard(data, { locked = false } = {}) {
+  const config = getCfdParallelConfig(data.case_id);
+  const compute = state.computeCapabilities || {};
+  const cpu = compute.cpu || {};
+  const parallel = compute.parallel || {};
+  const gpu = compute.gpu || {};
+  const prepared = data.stages?.cfd_prep?.status === "ok" || data.stages?.cfd_prep?.status === "warn";
+  const preparedPlan = cfdEffectiveParallelPlan(data);
+  const strongest = parallel.strongest ?? "自动";
+  const balanced = parallel.balanced ?? "自动";
+  const customMax = parallel.custom_max ?? cpu.logical_cores ?? 1;
+  const customValue = config.custom_subdomains || strongest;
+  const gpuText = gpu.detected ? `${gpu.name || "NVIDIA GPU"}${gpu.memory_gb ? ` · ${gpu.memory_gb} GB` : ""}` : "未检测到 NVIDIA GPU";
+  const note = compute.solver_gpu_note || "标准 simpleFoam 当前只使用 CPU；GPU 不会自动参与。";
+  const selectedSubdomains = config.profile === "custom" ? config.custom_subdomains : parallel[config.profile] || strongest;
+  const preparedSubdomains = Number(preparedPlan?.requested_subdomains);
+  const planChanged = prepared && Number.isFinite(preparedSubdomains) && Number(selectedSubdomains) !== preparedSubdomains;
+  const preparedText = preparedPlan
+    ? `${cfdParallelLabel(preparedPlan.profile)} · ${preparedSubdomains || "?"} 个 MPI 子域`
+    : "尚未生成 CFD 算例";
+  return `<div class="cfd-resource-card" aria-label="CFD 计算资源设置">
+    <div class="cfd-resource-head"><div><strong>计算资源</strong><p>默认按本机物理核心选择子域数；Docker 网格生成与气流求解使用该设置；其他后端以运行记录为准。</p></div><span class="pill pill-mute">当前选择：${cfdParallelLabel(config.profile)}</span></div>
+    ${prepared ? `<div class="cfd-resource-current">当前算例：${escapeHtml(preparedText)}</div>` : ""}
+    <div class="cfd-resource-options" role="radiogroup" aria-label="选择计算资源模式">
+      <label class="cfd-resource-option"><input type="radio" name="cfd-parallel-profile" value="strongest" ${config.profile === "strongest" ? "checked" : ""} ${locked ? "disabled" : ""}><span><b>最强</b><small>${strongest} 个 MPI 子域 · 网格与求解</small></span></label>
+      <label class="cfd-resource-option"><input type="radio" name="cfd-parallel-profile" value="balanced" ${config.profile === "balanced" ? "checked" : ""} ${locked ? "disabled" : ""}><span><b>适度</b><small>${balanced} 个 MPI 子域 · 留出约 25% 余量</small></span></label>
+      <label class="cfd-resource-option"><input type="radio" name="cfd-parallel-profile" value="custom" ${config.profile === "custom" ? "checked" : ""} ${locked ? "disabled" : ""}><span><b>自定义</b><small>按逻辑核心数范围选择</small></span></label>
+    </div>
+    <label class="cfd-resource-custom">自定义 MPI 子域数<input id="cfd-custom-subdomains" type="number" min="1" max="${customMax}" step="1" value="${customValue}" ${config.profile === "custom" && !locked ? "" : "disabled"} aria-describedby="cfd-resource-note"></label>
+    <div id="cfd-resource-note" class="cfd-resource-note">检测到 CPU：${cpu.physical_cores ?? "?"} 个物理核 / ${cpu.logical_cores ?? "?"} 个逻辑核；GPU：${escapeHtml(gpuText)}。${escapeHtml(note)}</div>
+    ${planChanged && !locked ? `<div class="cfd-resource-change">已选择 ${escapeHtml(cfdParallelLabel(config.profile))}（${selectedSubdomains} 个子域），需要重新生成 CFD 算例后才会生效。</div><button id="act-cfd-rebuild" class="button button-quiet">按当前选择重新生成 CFD 算例</button>` : ""}
+  </div>`;
 }
 
 function endplaneContext(data = state.case) {
@@ -753,6 +863,7 @@ function createEndplaneViewer(host) {
     setPlanes(state.endplanes.planes, activeSide);
     updateEndplaneDraft(true);
     renderEndplaneUi();
+    window.WindcatcherMonitor?.record("viewer", "plane_selected", { mode: activeSide, dirty: true }, "endplane-model");
   }
 
   renderer.domElement.addEventListener("pointerdown", (event) => {
@@ -770,7 +881,13 @@ function createEndplaneViewer(host) {
     transform.addEventListener("dragging-changed", (event) => {
       transformDrag = Boolean(event.value);
       controls.enabled = !transformDrag;
-      if (!transformDrag) syncActivePlane();
+      if (!transformDrag) {
+        syncActivePlane();
+        window.WindcatcherMonitor?.record("viewer", "plane_adjusted", {
+          mode: activeSide, tool: transform.getMode(), dirty: state.endplanes.dirty,
+          controls: state.endplanes.planes[activeSide]?.normal_lps,
+        }, "endplane-model");
+      }
     });
     transform.addEventListener("objectChange", () => {
       if (transformDrag) syncPlaneFromObject(activeSide);
@@ -1056,6 +1173,7 @@ function bindEndplaneControls() {
 
 /* ---------- 基础设施 ---------- */
 function toast(message, isError = false) {
+  window.WindcatcherMonitor?.record(isError ? "error" : "ui", "feedback", { outcome: isError ? "error" : "ok" });
   const node = document.createElement("div");
   node.className = "toast" + (isError ? " is-error" : "");
   node.textContent = message;
@@ -1070,6 +1188,10 @@ async function api(path, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   const payload = await response.json().catch(() => ({}));
+  const status = payload?.status || payload?.detail?.status;
+  if (["failed", "missing", "blocked"].includes(status)) {
+    window.WindcatcherMonitor?.record("error", "api_outcome", { status }, "api", response.headers.get("X-Windcatcher-Request-Id"));
+  }
   if (!response.ok) {
     const detail = payload && payload.detail ? payload.detail : {};
    throw Object.assign(new Error([detail.reason || "请求失败", ...(detail.remediation || [])].join("\n")), { detail });
@@ -1189,19 +1311,20 @@ function hasRunningStages(data) {
 
 /* ---------- 当前病例真实 CFD 结果 ---------- */
 function cfdResultsCaseRecord(caseId = state.cfdResults.caseId || state.caseId) {
-  return state.cases.find((item) => item.case_id === caseId) || (state.case?.case_id === caseId ? state.case : null);
+  return (state.case?.case_id === caseId ? state.case : null) || state.cases.find((item) => item.case_id === caseId) || null;
 }
 
-function cfdCanPostprocess(record) {
-  const status = record?.stages?.cfd_run?.status;
-  return Boolean(record && ["ok", "warn"].includes(status) && !requiresMaskReview(record.stages));
+function cfdCanPostprocess(result) {
+  return Boolean(result?.generation?.can_generate === true &&
+    !["running", "queued"].includes(result?.status) &&
+    !["running", "queued"].includes(result?.task?.status));
 }
 
-function renderCfdResultsError(message) {
+function renderCfdResultsError(message, title = "真实病例结果读取失败") {
   const box = $("cfd-results-state");
   if (!box) return;
   box.className = "cfd-results-state is-failed";
-  box.innerHTML = `<h2>真实病例结果读取失败</h2><p>${escapeHtml(message || "服务没有返回结果")}</p>`;
+  box.innerHTML = `<h2>${escapeHtml(title)}</h2><p>${escapeHtml(message || "服务没有返回结果")}</p>`;
   $("cfd-results-ready").hidden = true;
   $("btn-cfd-postprocess").disabled = true;
 }
@@ -1219,7 +1342,7 @@ function renderCfdValidation(validation) {
   const metrics = validation?.metrics || {};
   const flow = Number.isFinite(Number(metrics.mass_conservation_error_percent))
     ? `质量守恒误差 ${Number(metrics.mass_conservation_error_percent).toFixed(4)}%` : "质量守恒尚无记录";
-  const pressure = metrics.pressure_unit ? `压力按 ${metrics.pressure_unit === "m2/s2" ? "m²/s²" : metrics.pressure_unit} 展示${metrics.pressure_unit === "m2/s2" ? "（运动学压力）" : ""}` : "压力单位尚未确认";
+  const pressure = metrics.pressure_unit ? `复核统计压力单位为 ${metrics.pressure_unit === "m2/s2" ? "m²/s²（运动学压力）" : metrics.pressure_unit}；流场色标单位见图例` : "复核统计压力单位尚未确认；流场色标单位见图例";
   box.innerHTML = `<div class="kv"><dt>数值闸门</dt><dd>${validation?.eligible ? "可进入工程复核" : "尚未整体通过，当前仅用于真实场可视化"}</dd><dt>复核说明</dt><dd>${escapeHtml(flow)}；${escapeHtml(pressure)}</dd></div>${rows ? `<ul class="cfd-check-list">${rows}</ul>` : ""}`;
 }
 
@@ -1232,6 +1355,7 @@ function disposeCfdResults() {
   result.viewer?.dispose();
   result.viewer = null;
   result.payloadKey = null;
+  result.result = null;
   $("cfd-results-ready")?.setAttribute("hidden", "");
 }
 
@@ -1279,7 +1403,8 @@ function renderCfdResultState(result, record) {
   const source = result?.source || result?.manifest?.source;
   const isRunning = ["running", "queued"].includes(status) || ["running", "queued"].includes(task?.status);
   $("cfd-results-source").textContent = record ? `当前病例：${record.case_id}` : "尚未选择病例";
-  generate.disabled = !cfdCanPostprocess(record) || isRunning;
+  generate.disabled = !cfdCanPostprocess(result) || state.cfdResults.actionPending;
+  generate.title = result?.generation?.reason || "先刷新并核对当前病例的求解场";
   generate.hidden = isRunning;
   cancel.hidden = !isRunning;
   ready.hidden = status !== "ready";
@@ -1308,9 +1433,9 @@ function renderCfdResultState(result, record) {
     box.className = "cfd-results-state is-failed";
     box.innerHTML = `<h2>后处理${status === "cancelled" ? "已取消" : "失败"}</h2><p>${escapeHtml(task?.message || result?.reason || "请查看后处理日志后重试")}</p>`;
   } else {
-    box.innerHTML = cfdCanPostprocess(record)
-      ? `<h2>还没有浏览器流场</h2><p>病例已有 CFD 求解场。点击“生成可视化”读取最终时间步，原始求解场不会被修改。</p>`
-      : `<h2>暂不能生成流场</h2><p>请先完成 CFD 求解并确认气道范围；参考样本页面不会替代当前病例计算。</p>`;
+    box.innerHTML = cfdCanPostprocess(result)
+      ? `<h2>求解场已存在，尚未生成浏览器流场</h2><p>${escapeHtml(result.generation.reason)}。点击“生成可视化”读取最终时间步的速度、压力和流线。</p><p>当前可生成真实场观察结果；数值与工程复核状态将单独显示。</p>`
+      : `<h2>暂不能生成流场</h2><p>${escapeHtml(result?.generation?.reason || (record ? "尚未取得当前病例的求解场状态，请点击刷新重试" : "请先选择病例"))}</p>${result?.generation?.remediation?.length ? `<p>${escapeHtml(result.generation.remediation.join("；"))}</p>` : ""}`;
   }
 }
 
@@ -1338,6 +1463,7 @@ async function loadCfdResults(caseId = null) {
   try {
     const result = await api(`/api/cases/${encodeURIComponent(selected)}/cfd-results`, { signal: controller.signal });
     if (!isCurrentRequest()) return;
+    resultState.result = result;
     const record = cfdResultsCaseRecord(selected);
     renderCfdResultState(result, record);
     if (result.status === "ready") {
@@ -1370,9 +1496,13 @@ function bindCfdResultsControls() {
     const id = state.cfdResults.caseId;
     if (!id || state.cfdResults.actionPending) return;
     state.cfdResults.actionPending = true;
+    $("btn-cfd-postprocess").disabled = true;
     try { await api(`/api/cases/${encodeURIComponent(id)}/cfd-postprocess`, { method: "POST", body: {} }); await loadCfdResults(id); }
-    catch (error) { renderCfdResultsError(error.detail?.reason || error.message); }
-    finally { state.cfdResults.actionPending = false; }
+    catch (error) { renderCfdResultsError(error.detail?.reason || error.message, "后处理启动失败"); }
+    finally {
+      state.cfdResults.actionPending = false;
+      if (state.cfdResults.caseId === id) $("btn-cfd-postprocess").disabled = !cfdCanPostprocess(state.cfdResults.result);
+    }
   });
   $("btn-cfd-postprocess-cancel").addEventListener("click", async () => {
     const id = state.cfdResults.caseId;
@@ -1396,6 +1526,10 @@ function bindCfdResultsControls() {
 const routes = ["work", "cases", "env", "method", "sample", "results"];
 function showRoute(route) {
   if (!routes.includes(route)) route = "work";
+  if (state.route !== route) {
+    state.route = route;
+    window.WindcatcherMonitor?.record("navigation", "page_opened", {}, route);
+  }
   for (const name of routes) $("page-" + name).classList.toggle("is-visible", name === route);
   for (const button of document.querySelectorAll(".side-nav button")) {
     button.classList.toggle("is-active", button.dataset.route === route);
@@ -1678,6 +1812,9 @@ async function selectCase(caseId) {
   } catch { /* 浏览器禁用存储时使用当前病例的默认范围 */ }
   try { localStorage.setItem("windcatcher:last-case", caseId); } catch { /* 浏览器禁用存储时不影响工作台 */ }
   state.case = await api("/api/cases/" + caseId);
+  if (!state.computeCapabilities) {
+    try { state.computeCapabilities = (await api("/api/capabilities")).compute || null; } catch { /* 环境探测失败不阻断病例操作 */ }
+  }
   // 进入病例先打开 CT 复核，STL 只有用户明确点击后才加载，避免错误或超大网格阻塞页面。
   state.mode = "slices";
   // 先清除上一病例的 CT 元数据，避免异步加载当前病例时沿用旧的边界警告。
@@ -1864,7 +2001,10 @@ function renderActions(data) {
     } else {
       primary = s.surface.status === "warn" ? "几何有警告，检查后生成 CFD 算例" : "生成 CFD 算例";
       primaryStage = "cfd_prep";
-      primaryFn = () => api(`/api/cases/${data.case_id}/cfd-prep`, { method: "POST", body: {} });
+      primaryFn = () => {
+        const config = getCfdParallelConfig(data.case_id);
+        return api(`/api/cases/${data.case_id}/cfd-prep`, { method: "POST", body: { params: { parallel_profile: config.profile, custom_subdomains: config.custom_subdomains } } });
+      };
     }
   } else if (s.cfd_prep.status === "ok" && ["pending", "failed", "blocked"].includes(s.cfd_run.status)) {
     primary = "开始气流求解"; primaryStage = "cfd_run"; primaryFn = () => api(`/api/cases/${data.case_id}/cfd-run`, { method: "POST", body: {} });
@@ -1874,9 +2014,30 @@ function renderActions(data) {
     primary = "重新生成报告"; primaryStage = "report"; primaryFn = () => api(`/api/cases/${data.case_id}/report`);
   }
   const reportReady = s.report.status === "ok" && !maskNeedsReview;
-  box.innerHTML = `
+  const showResourceCard = ["ok", "warn"].includes(s.surface.status) && ["pending", "failed", "blocked", "ok", "warn"].includes(s.cfd_prep.status);
+  const resourceLocked = s.cfd_prep.status === "running" || s.cfd_run.status === "running";
+  box.innerHTML = `${showResourceCard ? cfdResourceCard(data, { locked: resourceLocked }) : ""}
     <button id="act-primary" class="button ${primaryFn ? "button-primary" : "button-quiet"}" ${(!primaryFn && !primaryUiFn) || state.clientRunningStage === primaryStage || s[primaryStage]?.status === "running" ? "disabled" : ""}>${primary}</button>
     <button id="act-report-dl" class="button button-quiet" ${reportReady ? "" : "disabled"}>导出报告</button>`;
+  box.querySelectorAll("input[name='cfd-parallel-profile']").forEach((input) => input.addEventListener("change", () => {
+    const profile = input.value;
+    setCfdParallelConfig(data.case_id, { profile });
+    renderActions(state.case);
+  }));
+  box.querySelector("#cfd-custom-subdomains")?.addEventListener("change", (event) => {
+    const max = Number(event.currentTarget.max) || 1;
+    const value = Math.max(1, Math.min(max, Math.round(Number(event.currentTarget.value) || 1)));
+    event.currentTarget.value = String(value);
+    setCfdParallelConfig(data.case_id, { custom_subdomains: value, profile: "custom" });
+    renderActions(state.case);
+  });
+  box.querySelector("#act-cfd-rebuild")?.addEventListener("click", (event) => {
+    const config = getCfdParallelConfig(data.case_id);
+    runAction(event.currentTarget, () => api(`/api/cases/${data.case_id}/cfd-prep`, {
+      method: "POST",
+      body: { params: { parallel_profile: config.profile, custom_subdomains: config.custom_subdomains } },
+    }), "cfd_prep");
+  });
   $("act-primary").addEventListener("click", (event) => {
     if (primaryUiFn) primaryUiFn();
     else if (primaryFn) runAction(event.currentTarget, primaryFn, primaryStage);
@@ -1886,6 +2047,7 @@ function renderActions(data) {
 
 async function runAction(button, fn, stageName) {
   if (!guardEndplaneDraft()) return;
+  window.WindcatcherMonitor?.record("stage", "action_started", { stage: stageName, status: "running" }, button?.id);
   const capturedCaseId = state.caseId;
   state.clientRunningStage = stageName;
   busy(button, true);
@@ -1925,15 +2087,19 @@ async function runAction(button, fn, stageName) {
       focusStageTarget($("viewer-card"));
     }
     toast("完成");
+    window.WindcatcherMonitor?.record("stage", "action_finished", { stage: stageName, status: "ok" }, button?.id);
   } catch (error) {
+    window.WindcatcherMonitor?.record("stage", "action_failed", { stage: stageName, status: error.detail?.status || "failed" }, button?.id);
     if (state.caseId !== capturedCaseId) return;
     state.clientRunningStage = null;
     // 后端会把 failed/blocked 落盘；失败时重新取一次，步骤卡也要同步到最终状态。
+    let stageDiagnosisRendered = false;
     try {
       state.case = await api("/api/cases/" + capturedCaseId);
       renderCase();
+      stageDiagnosisRendered = stageName === "cfd_run" && state.case.stages?.cfd_prep?.status === "ok" && state.case.stages?.cfd_run?.data?.run_status?.status === "failed";
     } catch { /* 保留下面的错误面板，避免二次读取失败遮住原始原因 */ }
-    if (!error.detail?.geom_qc) {
+    if (!error.detail?.geom_qc && !stageDiagnosisRendered) {
       renderErrorPanel(error.detail || { reason: String(error.message), remediation: [] });
     }
     toast(error.detail?.reason || "操作失败", true);
@@ -2248,6 +2414,42 @@ function bindModelScopeCard(data) {
   });
 }
 
+function renderCfdProgress(runStatus, stageData, status) {
+  if (!["running", "failed"].includes(status)) return "";
+  const number = (value) => value == null || value === "" || typeof value === "boolean" || !Number.isFinite(Number(value)) ? null : Number(value);
+  const progress = runStatus.progress || stageData.progress || {};
+  const solver = runStatus.solver || stageData.solver || {};
+  const steps = Array.isArray(runStatus.steps) ? runStatus.steps : [];
+  const completed = number(progress.completed) ?? steps.filter((step) => step.returncode === 0).length;
+  const total = number(progress.total);
+  // 旧记录只列出已执行的命令，不能把它们的数量当成整条流程的总步数。
+  const percent = total > 0 ? Math.max(0, Math.min(100, number(progress.percent) ?? completed / total * 100)) : null;
+  const elapsed = number(runStatus.elapsed_seconds ?? stageData.elapsed_seconds);
+  const stepElapsed = number(runStatus.step_elapsed_seconds);
+  const duration = (seconds) => seconds == null ? "未记录" : `${Math.floor(seconds / 60)} 分 ${Math.floor(seconds % 60)} 秒`;
+  const name = runStatus.current_step || runStatus.failed_step || stageData.current_step;
+  const stepPercent = number(progress.current_step_percent ?? (name === "simpleFoam" ? solver.iteration_percent : null));
+  const mesh = (runStatus.execution || stageData.execution || {}).mesh || {};
+  const meshCount = Number.isInteger(mesh.requested_subdomains) && mesh.requested_subdomains > 0 ? mesh.requested_subdomains : null;
+  const meshLabel = mesh.mode === "parallel" ? `并行生成气道网格${meshCount ? `（${meshCount} 个进程）` : "（进程数未记录）"}`
+    : mesh.mode === "serial" ? "单进程生成气道网格" : "生成气道网格（执行方式未记录）";
+  const labels = { mpiPreflight: "检查 MPI 并行启动", meshCacheCheck: "核对已有网格", prepareRun: "归档旧结果，准备本次计算", blockMesh: "生成背景网格", decomposeMesh: "分配网格到 CPU 子域", snappyHexMesh: meshLabel, reconstructMesh: "合并并行网格", checkMesh: "检查网格质量", decomposePar: "分配到 CPU 子域", simpleFoam: "计算气流", reconstructPar: "合并并行结果", foamToVTK: "导出可视化文件" };
+  const stepLabel = labels[name] || name || "准备执行";
+  const currentPercent = stepPercent == null ? null : Math.max(0, Math.min(100, stepPercent));
+  const active = status === "running";
+  const stepCount = total > 0 ? `${completed}/${total} 个步骤已完成` : `${completed} 个步骤已完成，总步数未记录`;
+  const currentProgress = currentPercent != null
+    ? `<progress class="cfd-result-progress" max="100" value="${currentPercent}" aria-label="外层迭代相对上限的比例"></progress>`
+    : active ? '<progress class="cfd-result-progress" aria-label="当前步骤正在处理，百分比未知"></progress>' : "";
+  return `<div class="cfd-live-progress${active ? "" : " is-failed"}" aria-live="polite">
+    <div class="progress-copy"><strong>${active ? "当前步骤" : "停止步骤"}：${escapeHtml(stepLabel)}</strong><b>${currentPercent == null ? (active ? "处理中" : "已停止") : `${currentPercent.toFixed(1)}%`}</b></div>
+    ${currentProgress}
+    ${percent != null ? `<div class="progress-copy cfd-step-count"><span>${escapeHtml(stepCount)}</span><b>${percent.toFixed(1)}%</b></div><progress class="cfd-result-progress" max="100" value="${percent}" aria-label="已完成的命令步骤比例"></progress>` : `<p>${escapeHtml(stepCount)}</p>`}
+    <p>总耗时 ${escapeHtml(duration(elapsed))}${stepElapsed == null ? "" : ` · 本步骤 ${escapeHtml(duration(stepElapsed))}`}</p>
+    <p>${currentPercent == null ? "当前步骤无法计算可靠的完成百分比。" : "当前百分比表示迭代数相对上限的比例，是否收敛需看残差。"}步骤完成比例不代表剩余时间。</p>
+  </div>`;
+}
+
 function renderDetails(data) {
   const box = $("detail-panels");
   const parts = [];
@@ -2339,8 +2541,24 @@ function renderDetails(data) {
     const failedPostprocess = solved && Number.isInteger(exportStep?.returncode) && exportStep.returncode !== 0;
     const recordError = cfdRunData.run_status_error || (completed && !solved ? "求解阶段与运行记录不一致，请检查 cfd/run_status.json。" : null);
     const running = s.cfd_run.status === "running";
+    const failed = s.cfd_run.status === "failed";
     const runLabel = solved ? "已完成" : recordError ? "运行记录异常"
       : ({ running: "正在执行", failed: "失败", blocked: "受阻" }[s.cfd_run.status] || "尚未求解");
+    const solver = runStatus.solver || cfdRunData.solver || {};
+    const residualText = Object.entries(solver.initial_residual || {}).map(([key, value]) => `${key}=${Number(value).toExponential(2)}`).join(", ");
+    const solverDetail = solver.iteration
+      ? `已解析外层迭代 ${solver.iteration}${solver.time != null && solver.end_time != null ? ` · 上限参考 ${solver.time}/${solver.end_time}（${solver.iteration_percent ?? "—"}%）` : ""}${residualText ? ` · 初始残差 ${residualText}` : ""}`
+      : ((running || failed) ? "尚未收到可解析的外层迭代残差；不能据此判断是否收敛" : "—");
+    const progressDetail = renderCfdProgress(runStatus, cfdRunData, s.cfd_run.status);
+    const execution = runStatus.execution || cfdRunData.execution || {};
+    const executionLabel = execution.mode === "mpi" ? `MPI 并行（${execution.requested_subdomains || "?"} 个子域）` : execution.mode === "serial" ? "单进程 CPU" : "—";
+    const mesh = runStatus.mesh || cfdRunData.mesh || {};
+    const failureStep = runStatus.failed_step || s.cfd_run.data?.failed_step;
+    const failureReturncode = runStatus.returncode ?? steps.find((step) => step?.name === failureStep)?.returncode;
+    const failureMessage = runStatus.message || s.cfd_run.message || (runStatus.timed_out || failureReturncode === 124 ? "求解器超时并被终止" : null);
+    const failureRemediation = Array.isArray(runStatus.remediation) ? runStatus.remediation : [];
+    const failureLogUrl = failureStep ? `/api/cases/${encodeURIComponent(data.case_id)}/artifact?rel=${encodeURIComponent(`cfd/logs/${failureStep}.log`)}` : null;
+    const failureDetail = failed ? `<div class="remedy is-fail"><p><strong>失败原因</strong>：${escapeHtml(failureMessage || "求解器退出，原因未记录")}</p><p>失败步骤：${escapeHtml(failureStep || "未记录")} · 退出码：${failureReturncode == null ? "—" : failureReturncode}${runStatus.timed_out ? " · 已确认超时" : ""}</p>${mesh.cells ? `<p>网格规模：${escapeHtml(fmt(mesh.cells, " 个单元"))}；这是网格检查后的真实数量。</p>` : ""}${failureRemediation.length ? `<ol>${failureRemediation.slice(0, 4).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol>` : ""}${failureLogUrl ? `<a href="${failureLogUrl}">查看 ${escapeHtml(failureStep || "失败步骤")} 日志</a>` : ""}</div>` : "";
     const exportLabel = solved ? (exportStep?.returncode === 0 ? "已完成" : failedPostprocess ? "失败" : exportStep ? "状态未记录" : "未执行")
       : running && cfdRunData.current_step === "foamToVTK" ? "正在导出" : "尚未完成";
     const backend = runStatus.backend || cfdRunData.backend;
@@ -2357,6 +2575,12 @@ function renderDetails(data) {
       <div class="card-body">${kvList([
         ["求解器", `${escapeHtml(s.cfd_prep.data.solver || "simpleFoam")}（OpenFOAM）`],
         ["运行环境", backendLabel],
+        ["执行方式", executionLabel],
+        ["计算资源", (() => { const plan = cfdEffectiveParallelPlan(data) || {}; return `${escapeHtml(cfdParallelLabel(plan.profile || "legacy"))} · ${plan.requested_subdomains || "?"} 个 MPI 子域`; })()],
+        ...cfdRuntimeRows(execution),
+        ["GPU", (() => { const note = cfdRunData.solver_gpu_note || s.cfd_prep.data.solver_gpu_note; return escapeHtml(note || "标准 simpleFoam 只使用 CPU"); })()],
+        ...cfdMeshRows(execution),
+        ["网格规模", mesh.cells ? fmt(mesh.cells, " 个单元") : "—"],
         ["气流求解", runLabel],
         ["可视化导出", exportLabel],
         ["结果复核", solved ? "网格敏感性与工程师复核待完成" : "等待求解结果"],
@@ -2365,8 +2589,11 @@ function renderDetails(data) {
         ["平均入口速度", fmt(s.cfd_prep.data.mean_inlet_velocity_mps, " m/s")],
       ])}
       ${s.cfd_run.status === "blocked" ? remedyBlock(s.cfd_run.data || {}) : ""}
+      ${progressDetail}
+      ${running ? `<div class="remedy"><p>当前求解状态</p><p>${escapeHtml(solverDetail)}</p><p>如果超过上限，页面会标明“超时并终止”，不会显示为成功。</p></div>` : ""}
+      ${failed ? `<div class="remedy"><p>最后可核对的求解状态</p><p>${escapeHtml(solverDetail)}</p></div>` : ""}
       ${recordError ? `<div class="remedy is-fail"><p>${escapeHtml(recordError)}</p></div>` : ""}
-      ${s.cfd_run.status === "failed" && s.cfd_run.message ? `<div class="remedy is-fail"><p>${escapeHtml(s.cfd_run.message)}</p></div>` : ""}
+      ${failureDetail}
       ${failedPostprocess ? `<div class="remedy"><p>可视化文件导出失败（退出码 ${exportStep.returncode}）；气流求解结果已保留。</p><p>查看转换日志，排查导出失败后再执行可视化转换。结果仍待网格敏感性检查与工程师复核。</p><a href="${exportLogUrl}">下载转换日志</a></div>` : ""}
       ${s.segment.data?.external_air_suspected ? `<div class="remedy"><p>当前候选掩膜待复核，已有算例不能继续求解。</p><ol><li>先修正并确认气道掩膜。</li><li>确认后重新生成 STL、几何质检和 CFD 算例。</li></ol></div>` : ""}
       ${viewResultsAction ? `<div class="step-actions">${viewResultsAction}</div>` : ""}
@@ -3375,6 +3602,10 @@ async function sendMaskOperations(operations, { recordHistory = true } = {}) {
   const editor = state.maskEditor;
   const capturedCaseId = state.caseId;
   if (!capturedCaseId || !operations?.length || editor.saving || editor.autoCleaning) return false;
+  window.WindcatcherMonitor?.record("viewer", "mask_edit", {
+    view: operations[0].view, index: operations[0].index, tool: editor.tool, radius: editor.radius,
+    operation_count: operations.length, point_count: operations.reduce((count, operation) => count + (operation.points?.length || 0), 0),
+  }, "mask-editor");
   const previousIndices = Object.fromEntries(CT_VIEWS.map((view) => [view, state.ctViewer.views[view].index]));
   editor.saving = true;
   editor.preview = operations.flatMap((operation) => (operation.points || []).map((point) => ({
@@ -3609,6 +3840,13 @@ function bindCtViewerControls() {
     const stage = document.querySelector(`.slice-panel[data-view="${view}"] .slice-stage`);
     range.addEventListener("input", (event) => loadCtSlice(view, Number(event.target.value)));
     let drag = null;
+    let monitorGestureTimer = null;
+    const recordView = (gesture) => {
+      const entry = state.ctViewer.views[view];
+      window.WindcatcherMonitor?.record("viewer", "ct_view_changed", {
+        view, gesture, index: entry.index, controls: [entry.zoom, entry.panX, entry.panY],
+      }, `ct-${view}`);
+    };
     stage.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
       const editor = state.maskEditor;
@@ -3662,7 +3900,10 @@ function bindCtViewerControls() {
         if (operations.length) sendMaskOperations(operations);
         return;
       }
-      if (drag?.pointerId === event.pointerId) drag = null;
+      if (drag?.pointerId === event.pointerId) {
+        drag = null;
+        recordView("pan");
+      }
     };
     stage.addEventListener("pointerup", stopDrag);
     stage.addEventListener("pointercancel", stopDrag);
@@ -3679,10 +3920,16 @@ function bindCtViewerControls() {
       entry.panX = 0;
       entry.panY = 0;
       drawCtSlice(view);
+      recordView("double_click");
     });
     stage.addEventListener("wheel", (event) => {
       event.preventDefault();
       const entry = state.ctViewer.views[view];
+      if (monitorGestureTimer !== null) window.clearTimeout(monitorGestureTimer);
+      monitorGestureTimer = window.setTimeout(() => {
+        monitorGestureTimer = null;
+        recordView(event.ctrlKey || event.metaKey ? "zoom" : "wheel");
+      }, 350);
       if (event.ctrlKey || event.metaKey) {
         entry.zoom = Math.max(.4, Math.min(6, entry.zoom * (event.deltaY > 0 ? .9 : 1.1)));
         drawCtSlice(view);
@@ -3729,6 +3976,7 @@ async function loadEnv() {
   const box = $("env-body");
   box.innerHTML = `<div class="skeleton" style="height:180px;"></div>`;
   const caps = await api("/api/capabilities");
+  state.computeCapabilities = caps.compute || state.computeCapabilities;
   const statusPill = (status) =>
     status === "available" ? `<span class="pill pill-ok"><i></i>可用</span>`
     : status === "unknown" ? `<span class="pill pill-warn"><i></i>未能探测</span>`

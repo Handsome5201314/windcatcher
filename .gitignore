@@ -14,6 +14,10 @@ tests/phantom_ct/
 *.jpeg
 *.bak
 .design-explore/
+.local-monitor/
+WORKSPACE_VERIFY_REPORT.md
+tests/cfd-source-baseline.json
+tests/results-ui-smoke.cjs
 tests/*real*.json
 tests/results-ui-smoke-report.json
 tests/results-ui-*.png

@@ -8,23 +8,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+import secrets
 import shutil
 import subprocess
 import threading
+import time
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
-from pipeline import ai_report, capabilities, cfd_postprocess_jobs, cfd_prep, dicom_qc, endplanes, geom_qc, installers, mask_review, openfoam_runner, preview, report, segmentation, selection_preview, slicer_review, surface
+from pipeline import activity_monitor, ai_report, capabilities, cfd_postprocess_jobs, cfd_prep, dicom_qc, endplanes, geom_qc, installers, mask_review, openfoam_runner, preview, report, segmentation, selection_preview, slicer_review, surface
 from pipeline.anonymize import anonymize_series
 from pipeline.cases import artifact_path, case_dir, create_case, delete_case, get_case, list_cases, recover_interrupted_cases, update_job, update_stage
-from pipeline.config import APP_DIR, PROJECT_ROOT
+from pipeline.config import APP_DIR, PROJECT_ROOT, detect_compute_capabilities
 from pipeline.errors import PipelineError
 from pipeline.fetch_direct import fetch_direct
 from pipeline.volume import load_series, save_volume
@@ -35,6 +39,20 @@ _DIRECTORY_PICKER_TIMEOUT_SECONDS = 60
 _CFD_VALIDATION_CACHE: dict[str, tuple[tuple, dict]] = {}
 _CFD_SUMMARY_CACHE: dict[str, tuple[tuple, dict]] = {}
 _CFD_VALIDATION_LOCK = threading.Lock()
+_MONITOR_LOGGER = logging.getLogger("windcatcher.monitor")
+_MONITOR_FAILURE: str | None = None
+
+
+def _record_activity(event: dict) -> int | None:
+    global _MONITOR_FAILURE
+    try:
+        event_id = activity_monitor.record_event(event)
+    except Exception as exc:
+        _MONITOR_FAILURE = type(exc).__name__
+        _MONITOR_LOGGER.error("Activity monitor write failed: %s", _MONITOR_FAILURE)
+        return None
+    _MONITOR_FAILURE = None
+    return event_id
 
 @asynccontextmanager
 async def app_lifespan(application: FastAPI):
@@ -43,7 +61,11 @@ async def app_lifespan(application: FastAPI):
         recover_interrupted_cases()
         cfd_postprocess_jobs.recover_interrupted()
         application.state.interrupted_cases_recovered = True
-    yield
+    await run_in_threadpool(_record_activity, {"kind": "lifecycle", "action": "server_started"})
+    try:
+        yield
+    finally:
+        await run_in_threadpool(_record_activity, {"kind": "lifecycle", "action": "server_stopped"})
 
 
 app = FastAPI(title="风见 · 鼻腔气流工作台", docs_url=None, redoc_url=None, lifespan=app_lifespan)
@@ -74,6 +96,52 @@ async def local_only_headers(request, call_next):
     return response
 
 
+@app.middleware("http")
+async def activity_request_log(request: Request, call_next):
+    if not request.url.path.startswith("/api/") or request.url.path.startswith("/api/monitor/"):
+        return await call_next(request)
+    request_id = request.headers.get("X-Windcatcher-Request-Id", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", request_id):
+        request_id = secrets.token_hex(12)
+    session_id = request.headers.get("X-Windcatcher-Session", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", session_id):
+        session_id = None
+    # Only route templates are persisted, never raw URLs, query strings or bodies.
+    route = next((route for route in app.routes if hasattr(route, "path_regex") and route.path_regex.fullmatch(request.url.path)), None)
+    template = route.path if route else "/api/unknown"
+    case_match = re.match(r"/api/cases/(case-\d{8}-\d{6}-[0-9a-f]{4})(?:/|$)", request.url.path)
+    event = {
+        "kind": "request", "action": "started",
+        "request_id": request_id, "session_id": session_id,
+        "case_id": case_match.group(1) if case_match else None,
+        "target": re.sub(r"\{[^}]+\}", "item", template.removeprefix("/api/")).replace("/", ":"),
+        "details": {"method": request.method},
+    }
+    context = activity_monitor.CURRENT_CONTEXT.set({"request_id": request_id, "session_id": session_id})
+    started = time.perf_counter()
+    await run_in_threadpool(_record_activity, event)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        await run_in_threadpool(_record_activity, {**event, "action": "failed", "details": {
+            "method": request.method, "outcome": "error", "error_type": type(exc).__name__,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+        }})
+        raise
+    else:
+        await run_in_threadpool(_record_activity, {**event, "action": "finished", "details": {
+            "method": request.method, "status_code": response.status_code,
+            "outcome": "ok" if response.status_code < 400 else "failed",
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+        }})
+        response.headers["X-Windcatcher-Request-Id"] = request_id
+        if _MONITOR_FAILURE:
+            response.headers["X-Windcatcher-Monitor"] = "unavailable"
+        return response
+    finally:
+        activity_monitor.CURRENT_CONTEXT.reset(context)
+
+
 @app.exception_handler(PipelineError)
 async def pipeline_error_handler(_request, exc: PipelineError):
     return JSONResponse(status_code=400, content=exc.to_dict())
@@ -83,6 +151,64 @@ class NewCaseBody(BaseModel):
     path: str
     synthetic: bool = False
     anonymize: bool = False
+
+
+class ActivityBatchBody(BaseModel):
+    events: list[dict] = Field(min_length=1, max_length=50)
+
+
+def _monitor_local_request(request: Request) -> None:
+    if request.client and request.client.host not in {"127.0.0.1", "::1", "testclient"}:
+        raise HTTPException(403, detail={"reason": "操作监控仅供本机查询"})
+    origin = request.headers.get("origin")
+    if origin and origin != f"{request.url.scheme}://{request.url.netloc}":
+        raise HTTPException(403, detail={"reason": "操作监控不接受其他站点的请求"})
+
+
+@app.post("/api/monitor/events")
+def api_record_activity(body: ActivityBatchBody, request: Request):
+    _monitor_local_request(request)
+    if any(event.get("kind") not in {"lifecycle", "ui", "navigation", "viewer", "request", "error", "stage"}
+           or not isinstance(event.get("action"), str)
+           or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_:.-]{0,99}", event["action"])
+           for event in body.events):
+        raise HTTPException(422, detail={"reason": "操作事件格式无效"})
+    ids = []
+    for event in body.events:
+        event_id = _record_activity(event)
+        if event_id is None:
+            raise HTTPException(503, detail={"reason": "操作日志暂时无法写入，请检查本机磁盘后重试"})
+        ids.append(event_id)
+    return {"accepted": len(ids), "last_event_id": ids[-1]}
+
+
+@app.get("/api/monitor/status")
+def api_activity_status(request: Request):
+    _monitor_local_request(request)
+    try:
+        status = activity_monitor.get_status()
+    except Exception as exc:
+        _MONITOR_LOGGER.error("Activity monitor query failed: %s", type(exc).__name__)
+        raise HTTPException(503, detail={"reason": "操作日志暂时不可读取，请检查本机磁盘"}) from exc
+    if _MONITOR_FAILURE:
+        status.update(status="unavailable", error_type=_MONITOR_FAILURE)
+    return status
+
+
+@app.get("/api/monitor/events")
+def api_activity_events(
+    request: Request, after: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500),
+    case_id: str | None = None, kind: str | None = None, session_id: str | None = None,
+    errors_only: bool = False, latest: bool = False,
+):
+    _monitor_local_request(request)
+    try:
+        return activity_monitor.query_events(after, limit, case_id, kind, session_id, errors_only, latest)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"reason": "操作日志查询条件无效"}) from exc
+    except Exception as exc:
+        _MONITOR_LOGGER.error("Activity monitor query failed: %s", type(exc).__name__)
+        raise HTTPException(503, detail={"reason": "操作日志暂时不可读取，请检查本机磁盘"}) from exc
 
 
 class StageBody(BaseModel):
@@ -193,6 +319,59 @@ def _cfd_summary(case_id: str) -> dict:
     return summary
 
 
+def _explain_legacy_run_status(run_status: dict, cfd_dir: Path | None = None) -> dict:
+    """从退出码与真实日志解释旧失败记录，不写回病例或运行产物。"""
+    if run_status.get("status") != "failed":
+        return run_status
+    steps = run_status.get("steps") if isinstance(run_status.get("steps"), list) else []
+    failed_step = run_status.get("failed_step")
+    failed = next((item for item in steps if item.get("name") == failed_step), None)
+    returncode = run_status.get("returncode")
+    if returncode is None and isinstance(failed, dict):
+        returncode = failed.get("returncode")
+    timed_out = bool(run_status.get("timed_out") or (returncode == 124))
+    if not timed_out:
+        # 旧版只显示退出码；有日志证据时才补充 MPI 启动原因。
+        # 已有具体原因优先，不能用残留日志改写另一次失败或超时。
+        generic_message = f"{failed_step} 退出码 {returncode}"
+        if (cfd_dir is None or failed_step not in {"simpleFoam", "mpiPreflight"}
+                or run_status.get("message") not in {None, "", generic_message}):
+            return run_status
+        log_path = cfd_dir / "logs" / f"{failed_step}.log"
+        if not log_path.is_file():
+            return run_status
+        try:
+            with log_path.open("rb") as stream:
+                stream.seek(0, 2)
+                stream.seek(max(0, stream.tell() - 65536))
+                output = stream.read().decode("utf-8", errors="replace")
+        except OSError as exc:
+            _MONITOR_LOGGER.warning("无法读取 CFD 失败诊断日志：%s", exc)
+            return run_status
+        if re.search(r"not enough slots", output, flags=re.I):
+            timeout = run_status.get("timeout_seconds") or 7200
+            message, remediation = openfoam_runner._error_diagnosis(
+                failed_step, {"returncode": returncode}, output, timeout,
+            )
+            return {**run_status, "message": message, "remediation": remediation}
+        return run_status
+    timeout = run_status.get("timeout_seconds")
+    limit = f"超过 {timeout} 秒" if isinstance(timeout, (int, float)) else "达到运行超时上限"
+    enriched = dict(run_status)
+    enriched["returncode"] = returncode
+    enriched["timed_out"] = True
+    enriched.setdefault(
+        "message",
+        f"{failed_step or 'OpenFOAM 求解器'} {limit}，旧版记录为超时；旧版未记录容器停止结果，无法据此确认后台当时是否停止",
+    )
+    if not run_status.get("run_id"):
+        enriched["remediation"] = [
+        "先查看最后一次外层迭代和残差，确认求解是否仍在推进",
+        "重试将采用新版实时日志、容器停止检查和 CPU 并行配置；旧记录不能证明已收敛",
+        ]
+    return enriched
+
+
 def _cfd_validation(case_id: str) -> dict:
     signature = _cfd_signature(case_id)
     with _CFD_VALIDATION_LOCK:
@@ -243,13 +422,25 @@ def _require_case(case_id: str) -> dict:
         cfd_run_data.pop("run_status", None)
         cfd_run_data.pop("run_status_error", None)
         run_status_path = case_dir(case_id) / "cfd" / "run_status.json"
-        if cfd_run.get("status") in {"ok", "warn", "failed", "blocked"}:
-            if run_status_path.exists():
+        run_status_allowed = cfd_run.get("status") in {"ok", "warn", "failed", "blocked"}
+        if cfd_run.get("status") == "running" and openfoam_runner.status_exists(run_status_path):
+            # 运行中记录只有在 run_id 与当前阶段一致时才暴露，避免刷新时显示上一次求解。
+            try:
+                    live_status = openfoam_runner.read_latest_status(run_status_path)
+                    run_status_allowed = (
+                    isinstance(live_status, dict)
+                    and live_status.get("status") == "running"
+                    and live_status.get("run_id") == cfd_run_data.get("run_id")
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                run_status_allowed = False
+        if run_status_allowed:
+            if openfoam_runner.status_exists(run_status_path):
                 try:
-                    run_status = json.loads(run_status_path.read_text(encoding="utf-8"))
+                    run_status = openfoam_runner.read_latest_status(run_status_path)
                     if not isinstance(run_status, dict):
                         raise ValueError("顶层内容不是 JSON 对象")
-                    cfd_run_data["run_status"] = run_status
+                    cfd_run_data["run_status"] = _explain_legacy_run_status(run_status, run_status_path.parent)
                     cfd_run_data.update(_cfd_summary(case_id))
                 except UnicodeDecodeError as exc:
                     cfd_run_data["run_status_error"] = f"无法读取 cfd/run_status.json：文件编码错误（{exc}）"
@@ -539,6 +730,9 @@ async def index():
 @app.get("/api/capabilities")
 async def api_capabilities():
     result = capabilities.probe_capabilities()
+    # Keep environment detection (installed tools) separate from compute
+    # detection (what the local machine can actually run in parallel).
+    result["compute"] = detect_compute_capabilities()
     result["ai_interpretation"] = ai_report.get_config()
     return result
 
@@ -877,6 +1071,8 @@ async def api_surface(case_id: str, body: StageBody):
 async def api_cfd_prep(case_id: str, body: StageBody):
     _require_case(case_id)
     _require_confirmed_mask(case_id)
+    if get_case(case_id).get("stages", {}).get("cfd_prep", {}).get("status") == "running":
+        raise HTTPException(status_code=409, detail={"status": "blocked", "reason": "该病例正在生成 CFD 算例，请等待当前任务结束"})
     update_stage(case_id, "cfd_prep", "running", message="正在生成 CFD 算例与边界条件，请保持页面打开查看进度")
     try:
         return await asyncio.to_thread(cfd_prep.prepare_case, case_id, body.params or {})
@@ -892,6 +1088,8 @@ async def api_cfd_prep(case_id: str, body: StageBody):
 async def api_cfd_run(case_id: str, body: StageBody):
     _require_case(case_id)
     _require_confirmed_mask(case_id)
+    if get_case(case_id).get("stages", {}).get("cfd_run", {}).get("status") == "running":
+        raise HTTPException(status_code=409, detail={"status": "blocked", "reason": "该病例已有气流求解在运行，请查看当前进度"})
     update_stage(case_id, "cfd_run", "running", message="正在准备气流求解，请保持页面打开查看进度")
     try:
         result = await asyncio.to_thread(openfoam_runner.run_case, case_id, backend=body.backend)
@@ -930,17 +1128,45 @@ async def api_cancel_cfd_postprocess(case_id: str):
 @app.get("/api/cases/{case_id}/cfd-results")
 async def api_cfd_results(case_id: str):
     from pipeline import cfd_results
-    _require_case(case_id)
+    case = _require_case(case_id)
     _require_confirmed_mask(case_id)
     result = await asyncio.to_thread(cfd_results.get_results, case_id)
     task = cfd_postprocess_jobs.get_task(case_id)
     result["task"] = task
-    if task and task.get("status") == "running":
-        result["status"] = "running"
+    if task and task.get("status") in {"running", "queued"}:
+        result["status"] = task["status"]
     elif result["status"] != "ready" and task and task.get("status") in {"failed", "cancelled"}:
         result.update(status=task["status"], reason=task["message"])
     if result["status"] == "ready":
         result["viewer_url"] = f"/api/cases/{case_id}/cfd-results/viewer"
+    # 浏览器后处理读取最终 U/p 与网格，既不依赖附加 VTK 导出，
+    # 也不把数值/工程复核当作观察真实场的前置条件。
+    upstream_running = case.get("job", {}).get("status") == "running" or any(
+        stage.get("status") == "running" for stage in case.get("stages", {}).values()
+    )
+    if (task and task.get("status") in {"running", "queued"}) or upstream_running:
+        result["generation"] = {
+            "can_generate": False,
+            "reason": "该病例正在处理，请等待当前任务完成或先取消后处理",
+        }
+    else:
+        try:
+            _foam, _signature, time_name = await asyncio.to_thread(cfd_results._source, case_dir(case_id))
+            result["generation"] = {
+                "can_generate": True,
+                "timestep": time_name,
+                "reason": f"最终时间步 {time_name} 的求解场已存在，可直接生成浏览器流场，无需重新求解",
+            }
+        except PipelineError as exc:
+            result["generation"] = {
+                "can_generate": False, "reason": exc.reason, "remediation": exc.remediation,
+            }
+        except (OSError, UnicodeError, ValueError) as exc:
+            result["generation"] = {
+                "can_generate": False,
+                "reason": f"无法核对最终求解场：{exc}",
+                "remediation": ["检查最终时间步与网格文件是否可读取后刷新"],
+            }
     result["validation"] = await asyncio.to_thread(_cfd_validation, case_id)
     return result
 

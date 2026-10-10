@@ -530,6 +530,22 @@ a { color: var(--accent-ink); }
   .viewer-canvas { height: 320px; }
 }
 
+.activity-monitor { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--line); min-width: 0; }
+.monitor-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.monitor-heading h2 { margin: 0; font-size: 16px; font-weight: 600; }
+#monitor-status { color: var(--ink-2); font-size: 14px; }
+.monitor-heading .button { margin-left: auto; }
+#monitor-summary { color: var(--ink-2); font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; }
+#monitor-error { color: var(--danger); line-height: 1.7; }
+.monitor-events { margin: 16px 0 0; padding: 0; list-style: none; max-height: 440px; overflow: auto; scrollbar-color: var(--line-strong) var(--bg-soft); }
+.monitor-events li { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); font-size: 14px; line-height: 1.7; }
+.monitor-events time { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.monitor-events span { overflow-wrap: anywhere; min-width: 0; }
+@media (max-width: 600px) {
+  .monitor-events li { grid-template-columns: 1fr; gap: 2px; }
+  .monitor-heading .button { margin-left: 0; }
+}
+
 /* Current-case CFD results use the same instrument surface as the CT workbench. */
 .cfd-results-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .cfd-results-heading { align-items: flex-start; }
@@ -540,6 +556,16 @@ a { color: var(--accent-ink); }
 .cfd-results-state p { margin: 4px 0; max-width: 75ch; }
 .cfd-results-state.is-failed { color: var(--danger); }
 .cfd-result-progress { width: min(100%, 420px); height: 8px; accent-color: var(--accent); display: block; margin-top: 12px; }
+.cfd-live-progress { margin-top: 14px; padding: 12px; border: 1px solid var(--line); background: var(--bg-soft); }
+.cfd-live-progress .progress-copy { min-height: 20px; flex-wrap: wrap; }
+.cfd-live-progress .progress-copy strong { font-size: 12px; }
+.cfd-live-progress .progress-copy span { white-space: normal; overflow: visible; }
+.cfd-live-progress .cfd-result-progress { width: 100%; margin-top: 8px; }
+.cfd-live-progress .cfd-step-count { margin-top: 14px; }
+.cfd-live-progress.is-failed { background: var(--danger-soft); border-color: var(--danger); }
+.cfd-live-progress.is-failed .progress-copy b { color: var(--danger); }
+.cfd-live-progress.is-failed .cfd-result-progress { accent-color: var(--danger); }
+.cfd-live-progress p { margin: 8px 0 0; color: var(--ink-2); font-size: 12px; }
 .cfd-results-layout { display: grid; grid-template-columns: minmax(0, 1fr) 220px; align-items: stretch; border-top: 1px solid var(--line); }
 .cfd-flow-surface { min-width: 0; background: var(--view-bg); color: var(--view-text); position: relative; }
 .cfd-flow-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-height: 48px; padding: 8px 12px; border-bottom: 1px solid var(--view-line); }
@@ -564,6 +590,23 @@ a { color: var(--accent-ink); }
 .cfd-setting select { width: 100%; min-height: 34px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--bg); }
 .cfd-setting input[type="range"] { width: 100%; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .cfd-setting output { color: var(--ink); font-variant-numeric: tabular-nums; }
+.cfd-resource-card { width: 100%; margin-bottom: 12px; padding: 14px; border: 1px solid var(--line); background: var(--bg-soft); text-align: left; }
+.cfd-resource-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.cfd-resource-head strong { font-size: 13px; color: var(--ink); }
+.cfd-resource-head p { margin: 4px 0 0; color: var(--ink-2); font-size: 12px; line-height: 1.5; }
+.cfd-resource-current { margin-top: 10px; padding: 8px 10px; border-left: 3px solid var(--accent); background: var(--accent-soft); color: var(--ink-2); font-size: 12px; }
+.cfd-resource-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.cfd-resource-option { display: flex; align-items: flex-start; gap: 8px; min-height: 54px; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--bg); cursor: pointer; }
+.cfd-resource-option:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.cfd-resource-option input { margin-top: 3px; accent-color: var(--accent); }
+.cfd-resource-option span { display: grid; gap: 3px; }
+.cfd-resource-option b { color: var(--ink); font-size: 12px; }
+.cfd-resource-option small { color: var(--ink-2); font-size: 11px; line-height: 1.4; }
+.cfd-resource-custom { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; color: var(--ink-2); font-size: 12px; }
+.cfd-resource-custom input { width: 100px; min-height: 30px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--bg); color: var(--ink); }
+.cfd-resource-note { margin-top: 9px; color: var(--ink-3); font-size: 11px; line-height: 1.5; }
+.cfd-resource-change { margin-top: 10px; color: var(--warning, #9a6700); font-size: 12px; line-height: 1.5; }
+.cfd-resource-card > #act-cfd-rebuild { margin-top: 8px; }
 .cfd-patch-key { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; color: var(--ink-2); }
 .cfd-patch-key span { display: inline-flex; gap: 6px; align-items: center; }
 .cfd-patch-key i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
@@ -584,6 +627,7 @@ a { color: var(--accent-ink); }
   .cfd-flow-settings { padding: 16px 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
   .cfd-flow-settings h2, .cfd-patch-key { grid-column: 1 / -1; }
   .cfd-flow-canvas { height: 420px; }
+  .cfd-resource-options { grid-template-columns: 1fr; }
 }
 @media (max-width: 500px) {
   .cfd-results-actions { width: 100%; }

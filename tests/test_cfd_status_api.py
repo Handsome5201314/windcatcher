@@ -65,6 +65,100 @@ def test_nonterminal_status_hides_old_record_and_error(cfd_case, status):
     assert data["backend"] == "docker"
 
 
+def test_running_status_exposes_only_current_live_record(cfd_case):
+    case_id, root, _client = cfd_case
+    cases.update_stage(case_id, "cfd_run", "running", data={"run_id": "current-run", "backend": "docker"})
+    record = {"status": "running", "run_id": "current-run", "current_step": "simpleFoam", "solver": {"iteration": 7}}
+    (root / "cfd" / "run_status.json").write_text(json.dumps(record), encoding="utf-8")
+
+    data = _query_run_data(cfd_case)
+
+    assert data["run_status"] == record
+    assert data["run_status"]["solver"]["iteration"] == 7
+
+
+def test_legacy_timeout_record_is_explained_without_rewriting_file(cfd_case):
+    case_id, root, _client = cfd_case
+    record = {
+        "status": "failed",
+        "backend": "docker",
+        "failed_step": "simpleFoam",
+        "timeout_seconds": 7200,
+        "steps": [{"name": "simpleFoam", "returncode": 124}],
+    }
+    path = root / "cfd" / "run_status.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    cases.update_stage(case_id, "cfd_run", "failed", data={"solved": False})
+
+    data = _query_run_data(cfd_case)
+
+    status = data["run_status"]
+    assert status["timed_out"] is True
+    assert "超时" in status["message"]
+    assert status["returncode"] == 124
+    assert path.read_text(encoding="utf-8") == json.dumps(record)
+
+
+def test_mpi_slots_failure_uses_real_log_without_rewriting_artifacts(cfd_case):
+    case_id, root, _client = cfd_case
+    record = {
+        "status": "failed", "backend": "docker", "failed_step": "simpleFoam",
+        "returncode": 1, "message": "simpleFoam 退出码 1",
+        "steps": [{"name": "simpleFoam", "returncode": 1}],
+    }
+    record_path = root / "cfd" / "run_status.json"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    log_path = root / "cfd" / "logs" / "simpleFoam.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "There are not enough slots available in the system to satisfy the 16\n"
+        "slots that were requested by the application:\n  simpleFoam\n",
+        encoding="utf-8",
+    )
+    cases.update_stage(case_id, "cfd_run", "failed", data={"solved": False})
+    paths = (root / cases.CASE_FILE, record_path, log_path)
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+
+    status = _query_run_data(cfd_case)["run_status"]
+
+    assert "MPI" in status["message"] and "槽位" in status["message"]
+    assert status["message"] != record["message"]
+    assert status["remediation"]
+    assert status["returncode"] == 1
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths} == before
+
+
+@pytest.mark.parametrize("record_changes", [
+    {"message": "已确认的其他失败原因", "remediation": ["保留既有处理建议"]},
+    {"timed_out": True, "returncode": 124, "message": "已确认超时"},
+])
+def test_slots_log_does_not_override_explicit_failure_or_timeout(cfd_case, record_changes):
+    case_id, root, _client = cfd_case
+    record = {"status": "failed", "failed_step": "simpleFoam", "returncode": 1, **record_changes}
+    (root / "cfd" / "run_status.json").write_text(json.dumps(record), encoding="utf-8")
+    log = root / "cfd" / "logs" / "simpleFoam.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("There are not enough slots available", encoding="utf-8")
+    cases.update_stage(case_id, "cfd_run", "failed")
+
+    status = _query_run_data(cfd_case)["run_status"]
+
+    assert status["message"] == record["message"]
+    if record.get("timed_out"):
+        assert status["timed_out"] is True and status["returncode"] == 124
+    else:
+        assert status["remediation"] == record["remediation"]
+
+
+def test_generic_failure_without_mpi_log_remains_unchanged(cfd_case):
+    case_id, root, _client = cfd_case
+    record = {"status": "failed", "failed_step": "simpleFoam", "returncode": 1, "message": "simpleFoam 退出码 1"}
+    (root / "cfd" / "run_status.json").write_text(json.dumps(record), encoding="utf-8")
+    cases.update_stage(case_id, "cfd_run", "failed")
+
+    assert _query_run_data(cfd_case)["run_status"] == record
+
+
 @pytest.mark.parametrize("status", ["ok", "warn"])
 def test_completed_stage_without_record_reports_missing(cfd_case, status):
     case_id, _root, _client = cfd_case

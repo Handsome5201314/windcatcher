@@ -13,6 +13,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+from . import activity_monitor
 from .config import CASES_DIR, STAGES, ensure_dirs
 from .errors import PipelineError
 
@@ -20,6 +21,14 @@ CASE_FILE = "case.json"
 STAGE_STATUS = ("pending", "running", "ok", "warn", "failed", "blocked")
 LOGGER = logging.getLogger(__name__)
 INTERRUPTED_MESSAGE = "上次服务在处理期间中断，结果未完成；请检查已有日志后重新执行"
+
+
+def _record_activity(kind: str, action: str, case_id: str, *, target: str | None = None, details: dict | None = None) -> None:
+    try:
+        activity_monitor.record_event({"kind": kind, "action": action, "case_id": case_id, "target": target, "details": details or {}})
+    except Exception as exc:
+        # 病例写盘已经完成；日志故障不得把成功的业务操作报告为失败。
+        LOGGER.error("Activity monitor write failed: %s", type(exc).__name__)
 
 
 def _now() -> str:
@@ -62,6 +71,7 @@ def create_case(source_type: str, source_path: str, synthetic: bool = False) -> 
     data["stages"]["import"]["message"] = f"已登记输入来源：{source_type}"
     data["stages"]["import"]["updated_at"] = _now()
     _write_case(case_id, data)
+    _record_activity("lifecycle", "case_created", case_id)
     return case_id
 
 
@@ -110,6 +120,7 @@ def update_stage(
     entry["updated_at"] = _now()
     case["updated_at"] = _now()
     _write_case(case_id, case)
+    _record_activity("stage", "updated", case_id, target="stage", details={"stage": stage, "status": status})
     return entry
 
 
@@ -121,6 +132,7 @@ def invalidate_downstream(case_id: str, reason: str = "上游气道掩膜已变�
     """
     root = case_dir(case_id)
     case = get_case(case_id)
+    invalidated = []
     for stage in ("surface", "cfd_prep", "cfd_run", "report"):
         entry = case["stages"].get(stage)
         if not entry:
@@ -130,6 +142,7 @@ def invalidate_downstream(case_id: str, reason: str = "上游气道掩膜已变�
         entry["artifacts"] = []
         entry["data"] = {}
         entry["updated_at"] = _now()
+        invalidated.append(stage)
     for name in ("surface", "cfd", "report"):
         target = root / name
         if target.exists():
@@ -137,6 +150,8 @@ def invalidate_downstream(case_id: str, reason: str = "上游气道掩膜已变�
         target.mkdir(parents=True, exist_ok=True)
     case["updated_at"] = _now()
     _write_case(case_id, case)
+    for stage in invalidated:
+        _record_activity("stage", "invalidated", case_id, target="stage", details={"stage": stage, "status": "pending"})
 
 
 def update_job(
@@ -155,6 +170,7 @@ def update_job(
     job["updated_at"] = _now()
     case["updated_at"] = _now()
     _write_case(case_id, case)
+    _record_activity("stage", "updated", case_id, target="job", details={"stage": stage, "status": status})
     return job
 
 
