@@ -75,6 +75,43 @@ def test_reset_restores_candidate_and_requires_review(edit_case):
     assert json.loads((cases.case_dir(case_id) / "segment" / "segmentation.json").read_text(encoding="utf-8"))["mask_source"] == "mask_candidate_reset"
 
 
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_mask_confirmation_guides_real_ct_to_manual_endplanes(edit_case, synthetic):
+    case_id, _original = edit_case
+    root = cases.case_dir(case_id)
+    case = cases.get_case(case_id)
+    case["synthetic"] = synthetic
+    cases._write_case(case_id, case)
+    # 使用封闭组织包络内的合成气道，让确认经过真实的体外空气校验。
+    hu = np.full((8, 24, 24), -1000.0, dtype=np.float32)
+    hu[:, 3:21, 3:21] = 0.0
+    mask = np.zeros(hu.shape, dtype=np.uint8)
+    mask[2:6, 10:14, 10:14] = 1
+    hu[mask.astype(bool)] = -1000.0
+    save_volume(
+        case_id,
+        Volume(
+            array=hu, spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0),
+            axis_dirs=((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, 1.0)),
+            meta={"shape": list(hu.shape)},
+        ),
+    )
+    np.save(root / "segment" / "mask.npy", mask)
+
+    result = mask_review.confirm_mask(case_id)
+    segment = cases.get_case(case_id)["stages"]["segment"]
+    assert result["status"] == "confirmed"
+    assert segment["status"] == "ok"
+    assert segment["data"]["need_human_confirm"] is False
+    assert not (root / "segment" / "endplanes.json").exists()
+    for message in (result["message"], segment["message"]):
+        if synthetic:
+            assert "可以生成 STL" in message
+        else:
+            assert "人工选择并保存鼻孔端和鼻咽端裁切面，再生成 STL" in message
+            assert "AI" not in message
+
+
 def test_edit_updates_full_candidate_but_preserves_original(edit_case):
     case_id, original = edit_case
     root = cases.case_dir(case_id)

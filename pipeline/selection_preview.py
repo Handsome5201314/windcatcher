@@ -1,14 +1,13 @@
-"""只读的端面选择用 3D 预览，来源始终是当前已确认的掩膜。
+"""按当前已确认掩膜的原始体素分辨率重建端面选择用 3D 模型。
 
-预览会降低横断面分辨率以限制内存和浏览器网格大小；其三角面不参与
-正式 STL、几何质检或 CFD。前后轴不降采样，便于把 3D 选点投回 CT 层号。
+所有轴均保留原始采样，不做降采样、网格简化或几何平滑。仅裁去外围
+空白以节省内存；选端模型不修改掩膜或正式 STL、几何质检和 CFD 阶段。
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import secrets
 import threading
 from pathlib import Path
@@ -24,9 +23,7 @@ from .surface import voxel_to_mm, write_binary_stl
 from .volume import load_volume
 
 _GENERATE_LOCK = threading.Lock()
-_TARGET_VOXELS = 6_000_000
-_MAX_FACES = 500_000
-_MAX_INPLANE_FACTOR = 12
+_MODEL_RESOLUTION = "native_voxel_v1"
 
 
 def _bbox(mask: np.ndarray) -> tuple[slice, slice, slice]:
@@ -39,50 +36,31 @@ def _bbox(mask: np.ndarray) -> tuple[slice, slice, slice]:
     return tuple(bounds)
 
 
-def _pooled(mask: np.ndarray, bounds: tuple[slice, slice, slice], ap_axis: int, factor: int) -> np.ndarray:
-    """仅对非前后轴做块最大值降采样，保留每一个 AP 层。"""
-    factors = [1 if axis == ap_axis else factor for axis in range(3)]
-    cropped = np.asarray(mask[bounds], dtype=np.uint8)
-    pads = [(0, (-cropped.shape[axis]) % factors[axis]) for axis in range(3)]
-    padded = np.pad(cropped, pads, mode="constant")
-    blocks = padded.reshape(
-        padded.shape[0] // factors[0], factors[0],
-        padded.shape[1] // factors[1], factors[1],
-        padded.shape[2] // factors[2], factors[2],
-    )
-    return blocks.max(axis=(1, 3, 5))
-
-
 def _preview_mesh(mask: np.ndarray, volume, ap_axis: int) -> tuple[np.ndarray, np.ndarray]:
     bounds = _bbox(mask)
-    size = math.prod(part.stop - part.start for part in bounds)
-    factor = max(2, math.ceil(math.sqrt(size / _TARGET_VOXELS)))
-    for factor in range(factor, _MAX_INPLANE_FACTOR + 1):
-        factors = np.asarray([1 if axis == ap_axis else factor for axis in range(3)], dtype=float)
-        pooled = _pooled(mask, bounds, ap_axis, factor)
-        padded = np.pad(pooled, [(1, 1)] * 3, mode="constant")
-        try:
-            vertices, faces, _, _ = measure.marching_cubes(padded, level=0.5, allow_degenerate=False)
-        except ValueError as exc:
-            raise PipelineError(
-                "blocked", "当前掩膜无法生成 3D 选择预览",
-                ["返回 CT 复核并修正掩膜"],
-            ) from exc
-        if len(faces) > _MAX_FACES:
-            continue
-        # pooled 体素中心对应原始块中心；最外一圈是补零层。
-        first_center = np.asarray([part.start for part in bounds], dtype=float) + (factors - 1) / 2
-        first_padded = first_center - factors
+    try:
+        cropped = np.asarray(mask[bounds], dtype=np.uint8)
+        padded = np.pad(cropped, [(1, 1)] * 3, mode="constant")
+        vertices, faces, _, _ = measure.marching_cubes(
+            padded, level=0.5, step_size=1, allow_degenerate=False,
+        )
+        # 裁去的仅是空白体素，补零层和裁剪偏移均还原到原始患者坐标。
+        offsets = np.asarray([part.start - 1 for part in bounds], dtype=float)
         dirs = np.asarray(volume.axis_dirs, dtype=float)
         spacing = np.asarray(volume.spacing, dtype=float)
-        origin = np.asarray(volume.origin, dtype=float) + (first_padded * spacing) @ dirs
-        points_lps_mm = voxel_to_mm(vertices, spacing * factors, origin, volume.axis_dirs)
+        origin = np.asarray(volume.origin, dtype=float) + (offsets * spacing) @ dirs
+        points_lps_mm = voxel_to_mm(vertices, spacing, origin, volume.axis_dirs)
         return points_lps_mm, faces
-    raise PipelineError(
-        "blocked", "3D 选择预览超出本机网格大小限制",
-        ["先在 CT 中缩小或修正气道候选范围，再重试 3D 预览"],
-        {"max_faces": _MAX_FACES},
-    )
+    except MemoryError as exc:
+        raise PipelineError(
+            "failed", "本机内存不足，无法生成原始分辨率 3D 气道；未降低模型精度",
+            ["关闭其他占用内存的程序后重试"],
+        ) from exc
+    except ValueError as exc:
+        raise PipelineError(
+            "blocked", "当前掩膜无法生成原始分辨率 3D 气道",
+            ["返回 CT 复核并修正掩膜"],
+        ) from exc
 
 
 def _state(case_id: str, scope: str, requested_version: int | None) -> tuple[Path, object, np.ndarray, int, int, tuple]:
@@ -113,10 +91,10 @@ def _state(case_id: str, scope: str, requested_version: int | None) -> tuple[Pat
 
 
 def selection_model(case_id: str, scope: str = "main_airway", mask_version: int | None = None) -> tuple[Path, int]:
-    """返回当前掩膜的低分辨率预览 STL 路径及其版本，不改正式阶段。"""
+    """返回原始体素分辨率的选端 STL 路径及掩膜版本，不改正式阶段。"""
     with _GENERATE_LOCK:
         root, volume, mask, ap_axis, version, stamp = _state(case_id, scope, mask_version)
-        fingerprint = hashlib.sha256(json.dumps((scope, version, stamp), separators=(",", ":")).encode()).hexdigest()[:16]
+        fingerprint = hashlib.sha256(json.dumps((_MODEL_RESOLUTION, scope, version, stamp), separators=(",", ":")).encode()).hexdigest()[:16]
         path = root / "preview" / f"selection-model-{scope}-{version}-{fingerprint}.stl"
         if path.exists() and path.stat().st_size >= 84:
             return path, version

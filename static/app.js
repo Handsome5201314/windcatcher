@@ -981,7 +981,7 @@ async function loadEndplaneSelectionModel(context = endplaneContext()) {
   e.viewer.setProfile(e.profile);
   e.viewer.clear();
   const overlay = $("endplane-3d-overlay");
-  if (overlay) { overlay.hidden = false; overlay.textContent = "正在生成当前掩膜的临时 3D 选择模型…"; }
+  if (overlay) { overlay.hidden = false; overlay.textContent = "正在按原始体素分辨率重建 3D 气道，请稍候…"; }
   renderEndplaneUi();
   try {
     const query = new URLSearchParams({ scope: context.scope, mask_version: String(context.version) });
@@ -3307,8 +3307,11 @@ function updateCtViewerGuide() {
     if (cleanupButton && state.maskEditor.active) cleanupButton.hidden = false;
     updateMaskFlow(state.maskEditor.dirty ? "edit" : "edit");
   } else {
-    title.textContent = "气道掩膜已确认，可以导出或继续建模";
-    text.textContent = "当前候选掩膜已通过人工确认。可以导出完整候选 NRRD 保存，也可以生成 STL 与几何质检进入下一步。";
+    const needsEndplanes = Boolean(endplaneContext()) && !endplaneSaved();
+    title.textContent = needsEndplanes ? "气道掩膜已确认，下一步选择两端裁切面" : "气道掩膜已确认，可以导出或继续建模";
+    text.textContent = needsEndplanes
+      ? "下一步请人工选择并保存鼻孔端和鼻咽端裁切面，再生成 STL 与几何质检。软件不会自动识别解剖端面；也可先导出完整候选 NRRD 保存。"
+      : "当前候选掩膜已通过人工确认。可以导出完整候选 NRRD 保存，也可以生成 STL 与几何质检进入下一步。";
     status.textContent = "已确认";
     if (exportButton) exportButton.hidden = false;
     updateMaskFlow("export");
@@ -4210,8 +4213,13 @@ async function refreshAfterMaskReview(button, path, successMessage) {
   if (button && path === "/segment/confirm") button.textContent = "正在逐层核查 CT…";
   try {
     const result = await api(`/api/cases/${encodeURIComponent(capturedCaseId)}${path}`, { method: "POST" });
-    await selectCase(capturedCaseId);
+    if (state.caseId !== capturedCaseId) return;
+    const selected = await selectCase(capturedCaseId);
+    if (selected === false || state.caseId !== capturedCaseId) return;
     toast(result.message || successMessage);
+    if (path === "/segment/confirm" && endplaneContext() && !state.endplanes.open) {
+      $("btn-endplanes").click();
+    }
   } catch (error) {
     toast(error.detail?.reason || error.message || "复核操作失败", true);
   } finally {
@@ -4220,7 +4228,7 @@ async function refreshAfterMaskReview(button, path, successMessage) {
   }
 }
 $("btn-confirm-mask").addEventListener("click", (event) => {
-  refreshAfterMaskReview(event.currentTarget, "/segment/confirm", "气道范围已确认，可以生成 STL 与几何质检");
+  refreshAfterMaskReview(event.currentTarget, "/segment/confirm", "气道范围已确认，下一步请人工选择鼻孔端和鼻咽端裁切面");
 });
 $("btn-export-mask").addEventListener("click", () => {
   if (!state.caseId) return;
@@ -4258,6 +4266,7 @@ $("newcase-form").addEventListener("submit", async (event) => {
       body: { path, synthetic: $("newcase-synthetic").checked, anonymize: $("newcase-anonymize").checked },
     });
     $("newcase-path").value = "";
+    $("newcase-synthetic").checked = false;
     $("selected-source").textContent = "正在准备病例…";
     $("selected-source").classList.remove("is-selected");
     await loadCases();

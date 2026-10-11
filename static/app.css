@@ -591,7 +591,12 @@ a { color: var(--accent-ink); }
 .cfd-setting input[type="range"] { width: 100%; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .cfd-setting output { color: var(--ink); font-variant-numeric: tabular-nums; }
 .cfd-resource-card { width: 100%; margin-bottom: 12px; padding: 14px; border: 1px solid var(--line); background: var(--bg-soft); text-align: left; }
-.cfd-resource-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.step-row:has(.cfd-resource-card) { flex-direction: column; }
+#case-actions:has(.cfd-resource-card) { display: grid; grid-template-columns: minmax(0, 1fr) auto; min-width: 0; }
+#case-actions > .cfd-resource-card { grid-column: 1 / -1; min-width: 0; margin-bottom: 0; }
+.cfd-resource-head { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.cfd-resource-head > div { flex: 1 1 320px; min-width: 0; }
+.cfd-resource-head > .pill { flex: 0 0 auto; }
 .cfd-resource-head strong { font-size: 13px; color: var(--ink); }
 .cfd-resource-head p { margin: 4px 0 0; color: var(--ink-2); font-size: 12px; line-height: 1.5; }
 .cfd-resource-current { margin-top: 10px; padding: 8px 10px; border-left: 3px solid var(--accent); background: var(--accent-soft); color: var(--ink-2); font-size: 12px; }
@@ -636,4 +641,7 @@ a { color: var(--accent-ink); }
   #cfd-flow-kind { flex: 1 1 100%; margin-left: 0; }
   .cfd-validation .kv, .cfd-check-list li { grid-template-columns: 1fr; gap: 4px; }
   .cfd-results-heading h1 { font-size: 20px; letter-spacing: 0; }
+}
+@media (max-width: 700px) {
+  #case-actions:has(.cfd-resource-card) { grid-template-columns: minmax(0, 1fr); }
 }

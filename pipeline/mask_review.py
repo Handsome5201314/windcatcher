@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 from scipy import ndimage
 
-from .cases import case_dir, invalidate_downstream, update_stage
+from .cases import case_dir, get_case, invalidate_downstream, update_stage
 from .errors import PipelineError
 from .volume import anterior_sign, load_volume
 
@@ -1245,11 +1245,16 @@ def confirm_mask(case_id: str) -> dict:
         tmp_json.replace(seg_path)
     finally:
         tmp_json.unlink(missing_ok=True)
+    next_step = (
+        "可以生成 STL 与几何质检"
+        if get_case(case_id).get("synthetic", False)
+        else "下一步请人工选择并保存鼻孔端和鼻咽端裁切面，再生成 STL 与几何质检"
+    )
     update_stage(
         case_id,
         "segment",
         "ok",
-        message="气道掩膜已人工确认，可以生成 STL 与几何质检",
+        message=f"气道掩膜已人工确认，{next_step}",
         artifacts=["segment/mask.npy", "segment/segmentation.json"],
         data={
             "need_human_confirm": False,
@@ -1259,4 +1264,4 @@ def confirm_mask(case_id: str) -> dict:
             "human_review_status": "已确认",
         },
     )
-    return {"status": "confirmed", "message": "气道掩膜已确认，可以生成 STL 与几何质检"}
+    return {"status": "confirmed", "message": f"气道掩膜已确认，{next_step}"}

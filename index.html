@@ -112,7 +112,7 @@
             <div class="endplane-heading">
               <div>
                 <h2 id="endplane-title">选择鼻孔侧与鼻咽侧裁切面</h2>
-                <p>先在临时 3D 气道上点选两端，再拖动或旋转裁切面并回到 CT 核对。保存后会按两个平面裁掉外侧模型，形成新的鼻孔侧与咽喉侧开口；流量和压力仍在后续 CFD 阶段设置。</p>
+                <p>先查看按原始体素分辨率重建的 3D 气道，再点选鼻孔端和鼻咽端，拖动或旋转裁切面。CT 切片可用于辅助核对位置。保存后按两个平面裁掉外侧模型，形成新的两端开口；流量和压力仍在后续 CFD 阶段设置。</p>
               </div>
               <span id="endplane-status" class="pill pill-mute" aria-live="polite"><i></i>等待读取</span>
             </div>
@@ -133,7 +133,7 @@
               </div>
               <div class="endplane-3d-stage" id="endplane-3d-stage" aria-label="三维气道端面选择视图">
                 <div id="endplane-3d" class="endplane-3d-host"></div>
-                <div id="endplane-3d-overlay" class="endplane-3d-overlay" role="status" aria-live="polite">正在准备临时 3D 气道…</div>
+                <div id="endplane-3d-overlay" class="endplane-3d-overlay" role="status" aria-live="polite">正在按原始体素分辨率重建 3D 气道…</div>
               </div>
               <p id="endplane-orientation" class="endplane-orientation"></p>
               <p class="endplane-3d-help">蓝色＝鼻孔端，橙色＝咽喉端；亮色是拟保留的气道，灰淡部分将移除。生成 STL 后显示精确裁切并封盖的模型，以几何质检结果为准。</p>
@@ -271,7 +271,8 @@
                   <button id="btn-edit-path" class="text-button" type="button" aria-pressed="false">手动输入路径（高级）</button>
                   <p id="source-help" class="field-help">请选择包含同一套 DICOM 序列的具体文件夹，例如 ISO_Soft 或 ISO_Bone 的序列目录。数据不会上传。</p>
                 </div>
-                <label class="check"><input id="newcase-synthetic" type="checkbox" />标记为合成 / 公开测试数据</label>
+                <label class="check"><input id="newcase-synthetic" type="checkbox" aria-describedby="synthetic-help" />仅用于人工生成的合成测试 CT</label>
+                <p id="synthetic-help" class="field-help">合成测试模式会跳过人工端面选择。真实人体 CT，包括公开或已脱敏的数据，请不要勾选。</p>
                 <label class="check"><input id="newcase-anonymize" type="checkbox" checked />导入时生成本地匿名化副本</label>
                 <button id="btn-newcase" class="button button-primary" type="submit">导入并质控</button>
                 <p style="margin:0;color:var(--ink-3);font-size:11.5px;line-height:1.6;">如果拿到的是 .7z 分卷或压缩包，请先在本机解压，再选择里面的一套 DICOM 序列。</p>

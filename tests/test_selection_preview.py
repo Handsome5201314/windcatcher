@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import struct
 
 import numpy as np
 import pytest
 from fastapi import HTTPException
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from skimage import measure
 
 from pipeline import cases, endplanes, selection_preview
 from pipeline.errors import PipelineError
-from pipeline.volume import Volume, save_volume
+from pipeline.surface import write_binary_stl
+from pipeline.volume import Volume, load_volume, save_volume
 from server import EndplanesBody, api_preview_oblique_endplanes, api_save_endplanes, api_selection_model
 
 
@@ -58,6 +63,84 @@ def _stl_faces(path):
     count = struct.unpack_from("<I", data, 80)[0]
     assert len(data) == 84 + 50 * count
     return count
+
+
+def _sorted_rows(values):
+    keys = np.round(values, decimals=6)
+    return values[np.lexsort(tuple(keys[:, axis] for axis in reversed(range(values.shape[1]))))]
+
+
+def _triangle_coordinates(vertices, faces):
+    triangles = np.asarray([_sorted_rows(triangle) for triangle in vertices[faces]])
+    return _sorted_rows(triangles.reshape(len(triangles), 9))
+
+
+@pytest.mark.parametrize("ap_axis", [0, 1, 2])
+def test_selection_mesh_matches_native_voxels_and_rotated_lps_coordinates(ap_axis):
+    mask = np.zeros((16, 20, 18), dtype=np.uint8)
+    mask[3:12, 4:15, 5:12] = 1
+    # A one-voxel branch and an indentation must keep their original boundaries.
+    mask[7, 9, 12:16] = 1
+    mask[3:7, 8, 5] = 0
+    angle = np.deg2rad(31.0)
+    volume = Volume(
+        array=np.zeros_like(mask, dtype=np.float32),
+        spacing=(0.625, 0.488, 1.1),
+        origin=(-21.25, 18.5, 73.0),
+        axis_dirs=((0.0, 0.0, -1.0), (np.cos(angle), np.sin(angle), 0.0),
+                   (-np.sin(angle), np.cos(angle), 0.0)),
+        meta={},
+    )
+    reference_vertices, reference_faces, _, _ = measure.marching_cubes(
+        np.pad(mask, 1), level=0.5, allow_degenerate=False,
+    )
+    # The reference uses the full original array, independent of bbox cropping.
+    expected = np.asarray(volume.origin) + ((reference_vertices - 1) * volume.spacing) @ np.asarray(volume.axis_dirs)
+
+    vertices, faces = selection_preview._preview_mesh(mask, volume, ap_axis)
+
+    assert vertices.shape == expected.shape
+    assert faces.shape == reference_faces.shape
+    np.testing.assert_allclose(_sorted_rows(vertices), _sorted_rows(expected), atol=1e-6, rtol=0)
+    np.testing.assert_allclose(
+        _triangle_coordinates(vertices, faces), _triangle_coordinates(expected, reference_faces),
+        atol=1e-6, rtol=0,
+    )
+
+
+def test_selection_mesh_does_not_bridge_one_voxel_gap(confirmed_case):
+    case_id, _root, _seg = confirmed_case
+    volume = load_volume(case_id)
+    mask = np.zeros(volume.shape, dtype=np.uint8)
+    mask[2:10, 5:26, 4:7] = 1
+    mask[2:10, 5:26, 8:11] = 1
+
+    vertices, faces = selection_preview._preview_mesh(mask, volume, 1)
+    edges = np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    adjacency = coo_matrix((np.ones(len(edges)), (edges[:, 0], edges[:, 1])), shape=(len(vertices), len(vertices)))
+
+    assert connected_components(adjacency, directed=False, return_labels=False) == 2
+
+
+def test_selection_model_does_not_reuse_legacy_downsampled_cache(confirmed_case):
+    case_id, root, _seg = confirmed_case
+    stamp = tuple((path.stat().st_size, path.stat().st_mtime_ns) for path in (
+        root / "segment" / "mask.npy", root / "segment" / "segmentation.json", root / "volume" / "meta.json",
+    ))
+    legacy_fingerprint = hashlib.sha256(json.dumps(("main_airway", 3, stamp), separators=(",", ":")).encode()).hexdigest()[:16]
+    legacy_path = root / "preview" / f"selection-model-main_airway-3-{legacy_fingerprint}.stl"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    coarse_mask = np.load(root / "segment" / "mask.npy")[::2, :, ::2]
+    legacy_vertices, legacy_faces, _, _ = measure.marching_cubes(np.pad(coarse_mask, 1), level=0.5)
+    write_binary_stl(legacy_path, legacy_vertices, legacy_faces)
+    legacy_bytes = legacy_path.read_bytes()
+
+    path, version = selection_preview.selection_model(case_id, "main_airway", 3)
+
+    assert version == 3
+    assert path != legacy_path
+    assert _stl_faces(path) > _stl_faces(legacy_path)
+    assert legacy_path.read_bytes() == legacy_bytes
 
 
 def test_preview_without_formal_stl_is_cached_and_does_not_change_stages(confirmed_case, monkeypatch):
@@ -141,6 +224,32 @@ def test_selection_model_api_reports_binary_and_readable_errors(confirmed_case):
         asyncio.run(api_selection_model(case_id, "invalid", 3))
     assert caught.value.status_code == 400
     assert "建模范围无效" in caught.value.detail["reason"]
+
+
+def test_selection_model_memory_failure_is_readable_and_can_retry_without_coarsening(confirmed_case, monkeypatch):
+    case_id, root, _seg = confirmed_case
+    before = cases.get_case(case_id)
+
+    def out_of_memory(*_args, **_kwargs):
+        raise MemoryError("native mesh allocation failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(selection_preview.measure, "marching_cubes", out_of_memory)
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(api_selection_model(case_id, "main_airway", 3))
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail["status"] == "failed"
+    assert "内存不足" in caught.value.detail["reason"]
+    assert "未降低模型精度" in caught.value.detail["reason"]
+    assert caught.value.detail["remediation"]
+    assert not list((root / "preview").glob("*.stl"))
+    assert cases.get_case(case_id) == before
+
+    response = asyncio.run(api_selection_model(case_id, "main_airway", 3))
+    assert response.media_type == "model/stl"
+    assert _stl_faces(response.path) > 0
+    assert cases.get_case(case_id) == before
 
 
 def _sample_planes():
