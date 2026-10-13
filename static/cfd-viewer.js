@@ -2,6 +2,7 @@
 
 (function () {
   const COLOR_STOPS = [[0, 0.16, 0.38, 0.78], [0.25, 0.1, 0.72, 0.8], [0.5, 0.32, 0.83, 0.52], [0.75, 0.98, 0.79, 0.2], [1, 0.91, 0.23, 0.16]];
+  const REGION_COLORS = { "left-upper": 0x978de0, "left-middle": 0x4fb5ce, "left-lower": 0x60b992, "right-upper": 0xd59ac4, "right-middle": 0xe2ab66, "right-lower": 0xcf866e };
 
   function colorAt(value, range) {
     const t = Math.max(0, Math.min(1, (value - range[0]) / (range[1] - range[0] || 1)));
@@ -88,6 +89,31 @@
       this.renderer.domElement.addEventListener("webglcontextlost", this.onContextLost);
       this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
       this.controls.enableDamping = true;
+      this.analysisGroup = new THREE.Group();
+      this.scene.add(this.analysisGroup);
+      this.analysisVisible = true;
+      this.analysisMeshes = [];
+      this.analysisRaycaster = new THREE.Raycaster();
+      this.onAnalysisPointerDown = (event) => {
+        this.analysisPointer = event.isPrimary !== false && event.button === 0
+          ? { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false } : null;
+      };
+      this.onAnalysisPointerMove = (event) => {
+        const start = this.analysisPointer;
+        if (start && start.id === event.pointerId && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5) start.moved = true;
+      };
+      this.onAnalysisPointerUp = (event) => {
+        const start = this.analysisPointer;
+        this.analysisPointer = null;
+        if (!start || start.id !== event.pointerId || start.moved || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5 || !this.analysisGroup.visible || !this.onAnalysisSelect) return;
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        this.analysisRaycaster.setFromCamera(new THREE.Vector2((event.clientX - rect.left) / rect.width * 2 - 1, -(event.clientY - rect.top) / rect.height * 2 + 1), this.camera);
+        const hit = this.analysisRaycaster.intersectObjects(this.analysisMeshes, false)[0];
+        if (hit) this.onAnalysisSelect(hit.object.userData.regionId);
+      };
+      this.onAnalysisPointerCancel = () => { this.analysisPointer = null; };
+      for (const [name, handler] of [["pointerdown", this.onAnalysisPointerDown], ["pointermove", this.onAnalysisPointerMove], ["pointerup", this.onAnalysisPointerUp], ["pointercancel", this.onAnalysisPointerCancel]]) this.renderer.domElement.addEventListener(name, handler);
       this.scene.add(new THREE.HemisphereLight(0xd7f2ee, 0x29343c, 0.85));
       const light = new THREE.DirectionalLight(0xffffff, 0.65);
       light.position.set(this.size, -this.size, this.size * 2);
@@ -208,6 +234,49 @@
     setSpeed(value) { this.speed = value; }
     setPlaying(value) { this.playing = value; this.lastTime = null; }
 
+    clearAnalysisSection() {
+      while (this.analysisGroup.children.length) {
+        const object = this.analysisGroup.children[0];
+        this.analysisGroup.remove(object);
+        object.geometry?.dispose();
+        object.material?.dispose();
+      }
+      this.analysisMeshes = [];
+      this.onAnalysisSelect = null;
+      this.render();
+    }
+
+    setAnalysisSection(result, onSelect) {
+      this.clearAnalysisSection();
+      if (!result) return;
+      const regions = (result.region_meshes || []).filter((mesh) => mesh.positions?.length >= 9);
+      for (const mesh of regions) validateMesh(mesh, mesh.label || "分析区域");
+      if (result.section_mesh?.positions?.length >= 9) {
+        validateMesh(result.section_mesh, "分析截面");
+        const base = this.makeMesh(result.section_mesh, new THREE.MeshBasicMaterial({ color: 0xb5c7c5, side: THREE.DoubleSide, transparent: true, opacity: regions.length ? 0.2 : 0.72, depthWrite: false }), this.analysisGroup);
+        base.renderOrder = 4;
+      }
+      for (const mesh of regions) {
+        const object = this.makeMesh(mesh, new THREE.MeshBasicMaterial({ color: REGION_COLORS[mesh.id] || 0xb5c7c5, side: THREE.DoubleSide, transparent: true, opacity: 0.75, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }), this.analysisGroup);
+        object.userData.regionId = mesh.id;
+        object.renderOrder = 5;
+        this.analysisMeshes.push(object);
+      }
+      this.onAnalysisSelect = onSelect;
+      this.analysisGroup.visible = this.analysisVisible;
+      this.render();
+    }
+
+    setAnalysisVisible(visible) { this.analysisVisible = visible; this.analysisGroup.visible = visible; this.render(); }
+
+    selectAnalysisRegion(id) {
+      for (const object of this.analysisMeshes) {
+        object.material.opacity = object.userData.regionId === id ? 1 : 0.5;
+        object.renderOrder = object.userData.regionId === id ? 6 : 5;
+      }
+      this.render();
+    }
+
     setDensity(count) {
       this.density = count;
       if (this.particles) {
@@ -303,6 +372,7 @@
         else object.material?.dispose();
       });
       this.renderer.domElement.removeEventListener("webglcontextlost", this.onContextLost);
+      for (const [name, handler] of [["pointerdown", this.onAnalysisPointerDown], ["pointermove", this.onAnalysisPointerMove], ["pointerup", this.onAnalysisPointerUp], ["pointercancel", this.onAnalysisPointerCancel]]) this.renderer.domElement.removeEventListener(name, handler);
       this.renderer.dispose();
       this.renderer.forceContextLoss();
       this.container.replaceChildren();

@@ -43,9 +43,11 @@ def _load_path(path: Path) -> dict | None:
 
 
 def _number(value) -> float | None:
+    if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
+        return None
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return result if math.isfinite(result) else None
 
@@ -59,7 +61,8 @@ def _display(value, digits: int = 3) -> str:
 
 def _flow_lpm(value_m3s: float | None) -> float | None:
     value = _number(value_m3s)
-    return abs(value) * 60000 if value is not None else None
+    # 正值表示穿出边界，不能通过 abs 把反向入口流量伪装为吸气。
+    return _number(-value * 60000) if value is not None and value < -1e-12 else None
 
 
 def _result_payload(case_id: str) -> tuple[dict | None, str]:
@@ -104,7 +107,13 @@ def _distribution(payload: dict | None) -> dict:
         values = sorted(values)
         if not values:
             fallback_values = [value for value in (_number(item) for item in (fallback or [])) if value is not None]
-            values = sorted(fallback_values)
+            if fallback_values:
+                return {
+                    "status": "range_only", "unit": unit,
+                    "min": min(fallback_values), "max": max(fallback_values),
+                    "mean": None, "p95": None, "sample_count": 0,
+                    "reason": "只有场值范围，没有可计算均值与 P95 的可视化采样",
+                }
         if not values:
             return {"status": "missing", "unit": unit, "reason": "流场中没有可用的有限采样值"}
         index = min(len(values) - 1, int(round(0.95 * (len(values) - 1))))
@@ -123,60 +132,140 @@ def _distribution(payload: dict | None) -> dict:
         "status": "checked",
         "velocity": summary(speeds, ranges.get("velocity"), units.get("velocity", "m/s")),
         "pressure": summary(pressures, ranges.get("pressure"), units.get("pressure", "unknown")),
+        "description": "流线与显示截面上的可视化采样摘要；不是全鼻腔体积加权统计",
         "source": "cfd/results/manifest.json 对应的已发布 payload",
     }
 
 
-def _flow_split(cfd_meta: dict | None, gate: dict, eligible: bool) -> dict:
-    """提取左右鼻孔流量；旧算例只有 aggregate inlet 时明确标记不可用。"""
-    metrics = gate.get("metrics", {}) if isinstance(gate.get("metrics"), dict) else {}
-    left = metrics.get("left_inlet_flow_m3s")
-    right = metrics.get("right_inlet_flow_m3s")
-    split = (cfd_meta or {}).get("inlet_split") if isinstance(cfd_meta, dict) else None
-    if isinstance(split, dict):
-        left = split.get("left_flow_m3s", split.get("left_lpm", left))
-        right = split.get("right_flow_m3s", split.get("right_lpm", right))
-        if _number(split.get("left_lpm")) is not None:
-            left = _number(split.get("left_lpm")) / 60000
-        if _number(split.get("right_lpm")) is not None:
-            right = _number(split.get("right_lpm")) / 60000
-    left_lpm, right_lpm = _flow_lpm(left), _flow_lpm(right)
+def _sample_provenance(gate: dict, names: tuple[str, ...]) -> dict:
+    post = gate.get("postprocessing") or {}
+    times = post.get("sample_times") or {}
+    sources = post.get("sources") or {}
+    final_time = _number((gate.get("fields") or {}).get("latest_time"))
+    sampled = {name: _number(times.get(name)) for name in names}
+    result = {
+        "source": {name: sources.get(name) for name in names},
+        "sample_times": sampled, "final_time": final_time,
+        "sample_time": next(iter(sampled.values()), None),
+    }
+    if final_time is None or any(time is None or not sources.get(name) for name, time in sampled.items()):
+        return {**result, "status": "missing", "reason": "缺少采样来源、采样时间或最终求解时间，不能确认指标来自最终场"}
+    if any(time != final_time for time in sampled.values()):
+        return {**result, "status": "stale", "reason": "指标采样时间与最终求解时间不一致，需要重新后处理"}
+    return {**result, "status": "checked", "reason": None}
+
+
+def _flow_measurement(gate: dict) -> dict:
+    post = gate.get("postprocessing") or {}
+    raw = _number(post.get("inlet_flow_m3s"))
+    provenance = _sample_provenance(gate, ("inlet_flow_m3s",))
+    measurement = {**provenance, "value": None, "unit": "L/min", "raw_boundary_flow_m3s": raw, "inhalation_flow_m3s": None}
+    if raw is None:
+        return {**measurement, "status": "missing", "direction": "unknown", "reason": "没有有限的实际入口流量采样"}
+    if abs(raw) <= 1e-12:
+        return {**measurement, "status": "invalid", "direction": "near_zero", "reason": "实际入口流量接近零，无法计算模拟鼻阻力"}
+    if raw > 0:
+        return {**measurement, "status": "invalid", "direction": "outward", "reason": "入口净流量方向为向外，不能作为吸气流量或吸气鼻阻力"}
+    measurement["direction"] = "inward"
+    if provenance["status"] != "checked":
+        return measurement
+    value = _flow_lpm(raw)
+    if value is None:
+        return {**measurement, "status": "invalid", "reason": "实际入口流量换算超出有限数值范围"}
+    return {**measurement, "value": value, "inhalation_flow_m3s": -raw}
+
+
+def _pressure_drop(gate: dict) -> dict:
+    post = gate.get("postprocessing") or {}
+    pressure = post.get("pressure") or {}
+    field_unit = pressure.get("field_unit")
+    density = _number(pressure.get("rho_kg_m3"))
+    if density is not None and density <= 0:
+        density = None
+    unit = "Pa" if field_unit == "Pa" or (field_unit == "m2/s2" and density is not None) else field_unit
+    provenance = _sample_provenance(gate, ("inlet_pressure_field", "outlet_pressure_field"))
+    result = {**provenance, "value": None, "unit": unit, "field_unit": field_unit, "rho_kg_m3": density}
+    inlet, outlet = _number(post.get("inlet_pressure_field")), _number(post.get("outlet_pressure_field"))
+    if inlet is None or outlet is None:
+        return {**result, "status": "missing", "reason": "入口或出口压力采样缺失，不能计算压降"}
+    if pressure.get("status") != "checked" or field_unit not in {"Pa", "m2/s2"}:
+        return {**result, "status": "invalid", "reason": "压力场维度或单位未确认，不能计算压降"}
+    if provenance["status"] != "checked":
+        return result
+    delta = inlet - outlet
+    if delta < 0:
+        return {**result, "status": "invalid", "raw_delta_field": delta, "reason": "入口至出口压降为负，需要复核流向、边界条件和压力采样"}
+    value = delta * density if field_unit == "m2/s2" and density is not None else delta
+    if _number(value) is None:
+        return {**result, "status": "invalid", "reason": "压降换算超出有限数值范围"}
+    return {**result, "value": value, "reason": "旧算例未记录空气密度，压降只能以运动学压力表示" if unit == "m2/s2" else None}
+
+
+def _resistance(flow: dict, pressure: dict) -> dict:
+    result = {
+        "status": "not_available", "value": None, "unit": "Pa·s/mL",
+        "source": {"flow": flow.get("source"), "pressure": pressure.get("source")},
+        "sample_time": pressure.get("sample_time"), "final_time": pressure.get("final_time"),
+        "description": "当前模拟工况下入口至出口压降除以实际吸气流量；不是临床测量值",
+    }
+    if flow.get("status") != "checked":
+        return {**result, "reason": flow.get("reason") or "实际吸气流量不可用"}
+    if pressure.get("status") != "checked":
+        return {**result, "reason": pressure.get("reason") or "入口至出口压降不可用"}
+    if pressure.get("unit") != "Pa":
+        return {**result, "reason": "压降不能换算为 Pa，缺少有效的空气密度记录，无法计算模拟鼻阻力"}
+    q_ml_s = flow["inhalation_flow_m3s"] * 1e6
+    value = _number(pressure["value"] / q_ml_s) if _number(q_ml_s) is not None else None
+    if value is None:
+        return {**result, "reason": "模拟鼻阻力换算超出有限数值范围"}
+    return {**result, "status": "checked", "value": value, "reason": None}
+
+
+def _region_flow(case_root: Path) -> dict:
+    # 分区标注独立于分割；读取器会校验场、网格、CT 几何和标注签名。
+    from .cfd_sections import get_sections
+
+    sections = get_sections(case_root)
+    if sections.get("status") != "ready":
+        return {"status": sections.get("status", "missing"), "reason": sections.get("reason") or "尚未确认分析截面和区域标注", "regions": [], "sides": []}
+    return {key: sections.get(key) for key in (
+        "status", "totals", "regions", "sides", "plane", "validation", "analysis_signature",
+        "source_signature", "geometry_signature", "inlet_condition", "unassigned", "coverage_complete",
+    )}
+
+
+def _flow_split(region_flow: dict, eligible: bool) -> dict:
+    """只从经签名核对的截面积分读取左右分配，不接受手填 inlet_split。"""
+    result = {"status": "not_available", "left_lpm": None, "right_lpm": None, "left_fraction": None, "right_fraction": None}
+    if region_flow.get("status") != "ready":
+        return {**result, "reason": region_flow.get("reason") or "尚未计算有效截面的左右分区流量"}
+    sides = {side.get("id"): side for side in region_flow.get("sides") or [] if isinstance(side, dict)}
+    left, right = sides.get("left", {}), sides.get("right", {})
+    left_lpm, right_lpm = _number(left.get("forward_lpm")), _number(right.get("forward_lpm"))
     if left_lpm is None or right_lpm is None:
-        return {
-            "status": "not_available",
-            "left_lpm": None,
-            "right_lpm": None,
-            "reason": "当前算例只输出 inlet 汇总流量，未建立左右鼻孔独立边界或采样",
-        }
-    total = left_lpm + right_lpm
+        return {**result, "reason": "分析截面没有完整的左右侧正向通量"}
+    left_percent, right_percent = _number(left.get("percent_of_section")), _number(right.get("percent_of_section"))
     return {
-        "status": "checked" if eligible else "available_pending_validation",
-        "left_lpm": left_lpm,
-        "right_lpm": right_lpm,
-        "total_lpm": total,
-        "left_fraction": left_lpm / total if total else None,
-        "right_fraction": right_lpm / total if total else None,
+        **result, "status": "checked" if eligible else "available_pending_validation",
+        "left_lpm": left_lpm, "right_lpm": right_lpm,
+        "left_fraction": left_percent / 100 if left_percent is not None else None,
+        "right_fraction": right_percent / 100 if right_percent is not None else None,
+        "total_lpm": _number((region_flow.get("totals") or {}).get("forward_lpm")),
+        "source": "analysis_section_U_dot_n", "analysis_signature": region_flow.get("analysis_signature"),
+        "description": "该分析截面的正向穿越通量；包含未标注区域时不重新归一化",
+        "inlet_condition": region_flow.get("inlet_condition"),
     }
 
 
-def _baseline_flow_report(cfd_meta: dict | None, run_status: dict | None, gate: dict, payload: dict | None, payload_status: str) -> dict:
+def _baseline_flow_report(cfd_meta: dict | None, run_status: dict | None, gate: dict, payload: dict | None, payload_status: str, region_flow: dict | None = None) -> dict:
     eligible = bool(gate.get("eligible"))
-    metrics = gate.get("metrics", {}) if isinstance(gate.get("metrics"), dict) else {}
-    flow_m3s = metrics.get("inlet_flow_m3s")
-    # 旧算例可能没有记录 pressure_unit；优先使用明确单位，否则根据已有字段推断，
-    # 避免把运动学压力误标为 Pa 或静默显示为空。
-    pressure_unit = metrics.get("pressure_unit")
-    if pressure_unit not in {"Pa", "m2/s2"}:
-        if _number(metrics.get("delta_p_pa")) is not None:
-            pressure_unit = "Pa"
-        elif _number(metrics.get("delta_p_m2s2")) is not None:
-            pressure_unit = "m2/s2"
-        else:
-            pressure_unit = "Pa"
-    pressure_value = metrics.get("delta_p_pa") if pressure_unit == "Pa" else metrics.get("delta_p_m2s2")
+    flow = _flow_measurement(gate)
+    pressure = _pressure_drop(gate)
+    resistance = _resistance(flow, pressure)
+    region_flow = region_flow or {"status": "missing", "reason": "尚未确认分析截面和区域标注"}
     distribution = _distribution(payload)
-    has_numeric_data = _number(flow_m3s) is not None or _number(pressure_value) is not None
-    has_data = has_numeric_data or payload is not None
+    has_numeric_data = flow.get("raw_boundary_flow_m3s") is not None or pressure.get("value") is not None
+    has_data = has_numeric_data or payload is not None or region_flow.get("status") == "ready"
     has_run = bool(run_status and run_status.get("status") == "ran")
     data_status = "available" if has_data else "missing"
     validation_status = "passed" if eligible else ("pending" if has_run else "not_run")
@@ -191,12 +280,19 @@ def _baseline_flow_report(cfd_meta: dict | None, run_status: dict | None, gate: 
         "data_status": data_status,
         "validation_status": validation_status,
         "validation_reasons": gate.get("reasons", []),
-        "requested_flow_lpm": _number((cfd_meta or {}).get("total_flow_lpm")),
-        "flow_lpm": _flow_lpm(flow_m3s),
-        "flow_m3s": _number(flow_m3s),
-        "pressure_drop": {"value": _number(pressure_value), "unit": pressure_unit},
+        "requested_flow_lpm": _number((cfd_meta or {}).get("total_flow_lpm")) if (cfd_meta or {}).get("inlet_mode", "flowRate") == "flowRate" else None,
+        "flow_lpm": flow.get("value"),
+        "flow_m3s": flow.get("raw_boundary_flow_m3s"),
+        "flow_measurement": flow,
+        "pressure_drop": pressure,
+        "resistance": resistance,
         "velocity_distribution": distribution,
-        "left_right_flow": _flow_split(cfd_meta, gate, eligible),
+        "region_flow": region_flow,
+        "left_right_flow": _flow_split(region_flow, eligible),
+        "wall_shear_stress": {
+            "status": "not_available", "value": None, "unit": "Pa",
+            "reason": "当前算例未输出经单位与壁面位置核对的壁面剪切应力，不能从速度着色推算",
+        },
         "narrow_regions": {
             "status": "not_available",
             "reason": "当前算例未输出沿程截面积曲线；速度 p95 只能提示高速区，不能替代狭窄解剖定位",
@@ -240,8 +336,9 @@ def _obstruction_comparison(case_id: str, baseline: dict) -> dict:
         flow = item["flow_report"]
         dp = _number((flow.get("pressure_drop") or {}).get("value"))
         flow_lpm = _number(flow.get("flow_lpm"))
+        same_pressure_unit = (flow.get("pressure_drop") or {}).get("unit") == (baseline.get("pressure_drop") or {}).get("unit")
         item["comparison"] = {
-            "delta_pressure_percent": ((dp - base_dp) / base_dp * 100) if dp is not None and base_dp not in (None, 0) else None,
+            "delta_pressure_percent": ((dp - base_dp) / base_dp * 100) if same_pressure_unit and dp is not None and base_dp not in (None, 0) else None,
             "delta_flow_percent": ((flow_lpm - base_flow) / base_flow * 100) if flow_lpm is not None and base_flow not in (None, 0) else None,
         }
     return {"status": "checked", "items": items, "scenario_directory": "cfd/scenarios/<方案>/report.json"}
@@ -268,7 +365,7 @@ def _design_reference(baseline: dict, comparison: dict) -> dict:
             "status": "baseline_only",
             "conclusions": ["已具备基准鼻腔流场数据；尚未完成鼻塞前后对比，因此不输出改善或推荐结论。"],
             "uncertainty": [
-                "当前算例未输出左右鼻孔独立流量。",
+                "左右与上中下比例描述所选分析截面上的正向穿越通量，不能解释为整个鼻腔体积的气流比例。",
                 "当前算例未输出沿程截面积曲线，不能仅凭局部速度把区域判定为解剖狭窄。",
                 "固定流量入口工况下，流量本身被指定，设计比较应优先观察压降和高速区。",
             ],
@@ -321,7 +418,7 @@ def _design_reference(baseline: dict, comparison: dict) -> dict:
             suffix = f"，较基准 P95 {_number(delta):+.1f}%" if delta is not None else ""
         else:
             suffix = "，基准 P95 尚未记录"
-        conclusions.append(f"局部高速区提示：方案“{label}”的速度 P95 最高，为 {p95:.3g} m/s{suffix}；需要结合位置和截面积复核其解剖意义。")
+        conclusions.append(f"局部高速区提示：方案“{label}”的可视化采样速度 P95 最高，为 {p95:.3g} m/s{suffix}；需要结合位置和截面积复核其解剖意义。")
     else:
         conclusions.append("各鼻塞方案尚未提供速度 P95，暂不判断局部高速区变化。")
 
@@ -353,7 +450,8 @@ def build_report(case_id: str) -> dict:
     gate = check_result_gate(case_id)
     caps = _load(case_id, "capabilities.json") or {}
     result_payload, payload_status = _result_payload(case_id)
-    baseline_flow = _baseline_flow_report(cfd_meta, run_status, gate, result_payload, payload_status)
+    region_flow = _region_flow(root)
+    baseline_flow = _baseline_flow_report(cfd_meta, run_status, gate, result_payload, payload_status, region_flow)
     obstruction_comparison = _obstruction_comparison(case_id, baseline_flow)
     design_reference = _design_reference(baseline_flow, obstruction_comparison)
 
@@ -431,8 +529,14 @@ def build_report(case_id: str) -> dict:
     if cfd_meta:
         lines.append(f"- 求解器：{cfd_meta.get('solver')}（OpenFOAM 分支：{cfd_meta.get('openfoam_flavour')}，"
                      f"湍流模型：{cfd_meta.get('turbulence_model')}）")
-        lines.append(f"- 工况：双侧合计 {_display(cfd_meta.get('total_flow_lpm'))} L/min；"
-                     f"入口面积 {_display(cfd_meta.get('inlet_area_mm2'))} mm²；平均入口速度 {_display(cfd_meta.get('mean_inlet_velocity_mps'))} m/s")
+        mode = cfd_meta.get("inlet_mode")
+        if mode == "pressure":
+            condition = f"压力入口 {_display(cfd_meta.get('inlet_pressure_pa'))} Pa（不预设流量）"
+        elif mode == "flowRate":
+            condition = f"双侧合计设定流量 {_display(cfd_meta.get('total_flow_lpm'))} L/min"
+        else:
+            condition = "入口工况未记录，不能解释为设定流量"
+        lines.append(f"- 工况：{condition}；入口面积 {_display(cfd_meta.get('inlet_area_mm2'))} mm²；平均入口速度 {_display(cfd_meta.get('mean_inlet_velocity_mps'))} m/s")
         lines.append(f"- 物性：ν = {cfd_meta.get('nu')} m²/s；背景网格单元 {cfd_meta.get('background_cell_mm')} mm")
         lines.append(f"- 算例状态：{cfd_meta.get('validation', {}).get('status')} —— {cfd_meta.get('validation', {}).get('note', '')}")
     else:
@@ -459,10 +563,7 @@ def build_report(case_id: str) -> dict:
         lines.append(f"- 后端：{run_status.get('backend')}")
         lines.append(f"- 复核状态：{run_status.get('validation', {}).get('status')}")
         if gate.get("eligible"):
-            metrics = gate.get("metrics", {})
             lines.append("- 已通过的闸门项：残差收敛、质量守恒、场文件完整")
-            if metrics.get("delta_p_pa") is not None:
-                lines.append(f"- 入口与出口压差 ΔP：{metrics.get('delta_p_pa')} Pa")
         else:
             lines.append("- 未进入指标区：以下闸门项尚未全部通过")
             for check in gate.get("checks", []):
@@ -480,23 +581,54 @@ def build_report(case_id: str) -> dict:
         else:
             status_text = "已读取真实 CFD 结果，待数值与工程复核"
         lines.append(f"- 状态：{status_text}")
-        lines.append(f"- 实际入口流量：{_display(baseline_flow.get('flow_lpm'))} L/min（{_display(baseline_flow.get('flow_m3s'), 7)} m³/s）")
+        lines.append(f"- 入口设定流量：{_display(baseline_flow.get('requested_flow_lpm'))} L/min（不代替实际流量采样）")
+        flow = baseline_flow.get("flow_measurement", {})
+        if flow.get("status") == "checked":
+            lines.append(f"- 实际入口流量：{_display(flow.get('value'))} L/min（吸气；边界带符号流量 {_display(flow.get('raw_boundary_flow_m3s'), 7)} m³/s）")
+        else:
+            lines.append(f"- 实际入口流量：不可用；{flow.get('reason') or '采样尚未核对'}")
         pressure = baseline_flow.get("pressure_drop", {})
-        lines.append(f"- 入口至出口压降：{_display(pressure.get('value'))} {pressure.get('unit') or '—'}")
+        if pressure.get("status") == "checked":
+            lines.append(f"- 入口至出口压降：{_display(pressure.get('value'))} {pressure.get('unit') or '—'}")
+            if pressure.get("reason"):
+                lines.append(f"  - {pressure['reason']}")
+        else:
+            lines.append(f"- 入口至出口压降：不可用；{pressure.get('reason') or '采样尚未核对'}")
+        resistance = baseline_flow.get("resistance", {})
+        if resistance.get("status") == "checked":
+            lines.append(f"- 模拟鼻阻力：{_display(resistance.get('value'), 5)} {resistance['unit']}（当前工况；非临床测量值）")
+        else:
+            lines.append(f"- 模拟鼻阻力：不可用；{resistance.get('reason')}")
         velocity = baseline_flow.get("velocity_distribution", {}).get("velocity", {})
         if velocity.get("status") == "checked":
-            lines.append(f"- 速度分布（真实采样）：最小 {_display(velocity.get('min'))}、平均 {_display(velocity.get('mean'))}、P95 {_display(velocity.get('p95'))}、最大 {_display(velocity.get('max'))} {velocity.get('unit', 'm/s')}（{velocity.get('sample_count')} 个采样值）")
+            lines.append(f"- 速度分布（可视化采样摘要）：最小 {_display(velocity.get('min'))}、采样平均 {_display(velocity.get('mean'))}、P95 {_display(velocity.get('p95'))}、最大 {_display(velocity.get('max'))} {velocity.get('unit', 'm/s')}（{velocity.get('sample_count')} 个采样值；非全鼻腔体积加权统计）")
         else:
-            lines.append(f"- 速度分布：{baseline_flow.get('velocity_distribution', {}).get('reason', '未生成')}")
+            lines.append(f"- 速度分布：{velocity.get('reason') or baseline_flow.get('velocity_distribution', {}).get('reason', '未生成')}")
         split = baseline_flow.get("left_right_flow", {})
-        if split.get("status") == "checked":
+        if split.get("status") in {"checked", "available_pending_validation"}:
             left_fraction = _number(split.get("left_fraction"))
             right_fraction = _number(split.get("right_fraction"))
             left_percent = left_fraction * 100 if left_fraction is not None else None
             right_percent = right_fraction * 100 if right_fraction is not None else None
-            lines.append(f"- 左右侧流量分配：左 {_display(split.get('left_lpm'))} L/min（{_display(left_percent, 1)}%），右 {_display(split.get('right_lpm'))} L/min（{_display(right_percent, 1)}%）")
+            lines.append(f"- 截面左右侧正向通量：左 {_display(split.get('left_lpm'))} L/min（{_display(left_percent, 1)}%），右 {_display(split.get('right_lpm'))} L/min（{_display(right_percent, 1)}%）")
         else:
             lines.append(f"- 左右侧流量分配：{split.get('reason', '未生成')}")
+        regions = baseline_flow.get("region_flow", {})
+        if regions.get("status") == "ready":
+            lines.append("- 上／中／下分区结果：比例按所在侧的正向穿越通量计算；漏标时不补齐或重新归一化。")
+            for region in regions.get("regions") or []:
+                percent = _number(region.get("percent_of_side"))
+                lines.append(f"  - {region.get('label', region.get('id', '区域'))}：正向 {_display(region.get('forward_lpm'))}、反向 {_display(region.get('reverse_lpm'))}、净通量 {_display(region.get('net_lpm'))} L/min；本侧占比 {_display(percent, 1)}%")
+            unassigned = regions.get("unassigned") or {}
+            lines.append(f"  - 未标注区域：正向 {_display(unassigned.get('forward_lpm'))}、反向 {_display(unassigned.get('reverse_lpm'))}、净通量 {_display(unassigned.get('net_lpm'))} L/min；占整个截面 {_display(unassigned.get('percent_of_section'), 1)}%")
+            if not regions.get("coverage_complete"):
+                lines.append("  - 截面标注覆盖不完整，上／中／下的本侧占比暂不可用。")
+            inlet_condition = regions.get("inlet_condition") or {}
+            if inlet_condition.get("description"):
+                lines.append(f"  - 入口工况：{inlet_condition['description']}")
+        else:
+            lines.append(f"- 上／中／下分区结果：{regions.get('reason') or '尚未计算'}")
+        lines.append(f"- 壁面剪切应力：{baseline_flow['wall_shear_stress']['reason']}")
         lines.append(f"- 狭窄区域：{baseline_flow.get('narrow_regions', {}).get('reason', '未生成')}")
         if baseline_flow.get("validation_reasons"):
             lines.append("- 待复核项：" + "；".join(str(item) for item in baseline_flow["validation_reasons"]))

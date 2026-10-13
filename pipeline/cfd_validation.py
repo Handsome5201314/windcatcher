@@ -121,11 +121,13 @@ def read_json(path: Path) -> dict:
 
 def pressure_metadata(dimensions: list[int] | None, case_meta: dict) -> dict:
     density = case_meta.get("rho_kg_m3")
-    if density is not None:
+    if density is not None and not isinstance(density, bool) and not (isinstance(density, str) and not density.strip()):
         try:
             density = float(density)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             density = None
+    else:
+        density = None
     if density is not None and (not math.isfinite(density) or density <= 0):
         density = None
     if dimensions == KINEMATIC_PRESSURE_DIMENSIONS:

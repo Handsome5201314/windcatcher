@@ -260,6 +260,19 @@ class EndplanesBody(BaseModel):
     posterior_plane: dict | None = None
 
 
+class CfdSectionPreviewBody(BaseModel):
+    position_fraction: float = Field(gt=0, lt=1, allow_inf_nan=False)
+
+
+class CfdSectionBody(BaseModel):
+    # 完整几何校验交给截面模块；标注独立保存，不进入气道掩膜。
+    plane: dict
+    regions: list[dict] = Field(min_length=1, max_length=6)
+    confirmed: bool
+    source_signature: str = Field(min_length=1, max_length=128)
+    geometry_signature: str = Field(min_length=1, max_length=128)
+
+
 class AiReportConfigBody(BaseModel):
     """AI 配置提交地址、模型和密钥；密钥只保存在当前服务进程内存。"""
 
@@ -1198,6 +1211,40 @@ async def api_cfd_results_viewer(case_id: str):
             "remediation": ["重新生成可视化结果"],
         })
     return FileResponse(path, media_type="application/json")
+
+
+def _require_section_idle(case_id: str) -> None:
+    case = _require_case(case_id)
+    _require_confirmed_mask(case_id)
+    task = cfd_postprocess_jobs.get_task(case_id)
+    if (case.get("job", {}).get("status") == "running" or any(
+        stage.get("status") == "running" for stage in case.get("stages", {}).values()
+    ) or task and task.get("status") in {"running", "queued"}):
+        raise HTTPException(409, detail={
+            "reason": "病例正在处理，完成后再读取分析截面",
+            "remediation": ["等待当前任务完成后刷新"],
+        })
+
+
+@app.get("/api/cases/{case_id}/cfd-sections")
+async def api_cfd_sections(case_id: str):
+    from pipeline import cfd_sections
+    _require_section_idle(case_id)
+    return await asyncio.to_thread(cfd_sections.get_sections, case_dir(case_id))
+
+
+@app.post("/api/cases/{case_id}/cfd-sections/preview")
+async def api_cfd_section_preview(case_id: str, body: CfdSectionPreviewBody):
+    from pipeline import cfd_sections
+    _require_section_idle(case_id)
+    return await asyncio.to_thread(cfd_sections.preview_section, case_dir(case_id), body.position_fraction)
+
+
+@app.post("/api/cases/{case_id}/cfd-sections")
+async def api_compute_cfd_sections(case_id: str, body: CfdSectionBody):
+    from pipeline import cfd_sections
+    _require_section_idle(case_id)
+    return await asyncio.to_thread(cfd_sections.compute_sections, case_dir(case_id), body.model_dump())
 
 
 @app.get("/api/cases/{case_id}/report")

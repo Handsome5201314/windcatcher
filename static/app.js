@@ -78,7 +78,7 @@ const state = {
   },
   installJobs: new Map(),
   computeCapabilities: null,
-  cfdResults: { viewer: null, caseId: null, requestId: 0, controller: null, pollTimer: null, status: null, result: null, payloadKey: null, actionPending: false },
+  cfdResults: { viewer: null, sections: null, caseId: null, requestId: 0, controller: null, pollTimer: null, status: null, result: null, payloadKey: null, actionPending: false },
 };
 window.WindcatcherMonitor?.setContextProvider(() => ({
   case_id: window.location.hash === "#results" ? state.cfdResults.caseId : state.caseId,
@@ -1340,8 +1340,9 @@ function renderCfdValidation(validation) {
     return `<li><b>${escapeHtml(check.name || "检查")}</b><span>${escapeHtml(statusText[status] || status)}${detail ? ` · ${escapeHtml(detail)}` : ""}</span></li>`;
   }).join("");
   const metrics = validation?.metrics || {};
-  const flow = Number.isFinite(Number(metrics.mass_conservation_error_percent))
-    ? `质量守恒误差 ${Number(metrics.mass_conservation_error_percent).toFixed(4)}%` : "质量守恒尚无记录";
+  const conservationError = reportNumber(metrics.mass_conservation_error_percent);
+  const flow = conservationError !== null
+    ? `质量守恒误差 ${conservationError.toFixed(4)}%` : "质量守恒尚无记录";
   const pressure = metrics.pressure_unit ? `复核统计压力单位为 ${metrics.pressure_unit === "m2/s2" ? "m²/s²（运动学压力）" : metrics.pressure_unit}；流场色标单位见图例` : "复核统计压力单位尚未确认；流场色标单位见图例";
   box.innerHTML = `<div class="kv"><dt>数值闸门</dt><dd>${validation?.eligible ? "可进入工程复核" : "尚未整体通过，当前仅用于真实场可视化"}</dd><dt>复核说明</dt><dd>${escapeHtml(flow)}；${escapeHtml(pressure)}</dd></div>${rows ? `<ul class="cfd-check-list">${rows}</ul>` : ""}`;
 }
@@ -1352,6 +1353,7 @@ function disposeCfdResults() {
   result.pollTimer = null;
   result.controller?.abort();
   result.controller = null;
+  result.sections?.clear();
   result.viewer?.dispose();
   result.viewer = null;
   result.payloadKey = null;
@@ -1471,11 +1473,16 @@ async function loadCfdResults(caseId = null) {
       if (resultState.payloadKey !== payloadKey) {
         const payload = await api(result.viewer_url || `/api/cases/${encodeURIComponent(selected)}/cfd-results/viewer`, { signal: controller.signal });
         if (!isCurrentRequest()) return;
+        resultState.sections?.clear();
         resultState.viewer?.dispose();
         resultState.viewer = new CfdViewer($("cfd-flow-canvas"), payload, { onLegend: updateCfdLegend, onError: (message) => renderCfdResultsError(message) });
         syncCfdResultsControls();
         resultState.payloadKey = payloadKey;
         $("cfd-results-ready").hidden = false;
+      }
+      if (window.CfdSections) {
+        resultState.sections ||= new window.CfdSections();
+        await resultState.sections.load(selected, resultState.viewer);
       }
     }
     if (result.status === "running" || result.task?.status === "running" || result.task?.status === "queued") {
@@ -2728,6 +2735,9 @@ function renderAIReport(result) {
 }
 
 function reportNumber(value) {
+  if (value === null || value === undefined || typeof value === "boolean" ||
+      (typeof value === "string" && !value.trim()) ||
+      !["number", "string"].includes(typeof value)) return null;
   const number = typeof value === "number" ? value : Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -2781,17 +2791,19 @@ function renderReportSummary(report, flowPayload, cfdResult) {
   }[baselineFlow.status] || "未记录";
   const statusTone = baselineFlow.status === "ready" ? "ok" : baselineFlow.status === "numeric_only" ? "warn" : "warn";
   const baselineStatus = reportStatus(statusText, statusTone);
-  const pressureUnit = pressure.unit || baselineFlow.pressure_drop?.unit || null;
+  const pressureUnit = baselineFlow.pressure_drop?.unit || null;
   const pressureLabel = pressureUnit === "m2/s2" || pressureUnit === "m²/s²" ? "m²/s²（运动学压力）" : pressureUnit || "未确认";
   const pressureDrop = baselineObserved
     ? reportMetricValue(baselineFlow.pressure_drop?.value, pressureUnit ? ` ${pressureUnit}` : "")
     : "未生成";
-  const flowValue = baselineFlow.flow_lpm ?? baselineFlow.requested_flow_lpm ?? cfd.total_flow_lpm;
-  const flowDetail = reportNumber(baselineFlow.flow_lpm) !== null
-    ? "已记录的实际入口流量"
-    : reportNumber(baselineFlow.requested_flow_lpm) !== null
-      ? "算例设定值；实际值待数值闸门复核"
-      : "当前算例入口工况";
+  const flowValue = baselineFlow.flow_lpm;
+  // 压力入口没有“设定流量”；不要从旧病例元数据回填，避免把压力工况误标成流量工况。
+  const requestedFlow = baselineFlow.requested_flow_lpm;
+  const flowDetail = baselineFlow.flow_measurement?.reason || (reportNumber(flowValue) !== null
+    ? "当前时间步入口净通量，吸气方向已核对"
+    : "实际入口流量尚不可用");
+  const resistance = baselineFlow.resistance || {};
+  const regionFlow = baselineFlow.region_flow || {};
   const solverState = run.status === "ran" ? "已执行" : run.status === "failed" ? "求解失败" : "尚未执行";
   const gateText = gate.eligible ? "已通过结果闸门，可进入工程复核。" : "尚未通过全部结果闸门；以下已显示的值仅作观测，需复核。";
   const metricSummary = (value, unit, digits = 3) => reportNumber(value) === null ? "未记录" : escapeHtml(fmt(value, unit));
@@ -2811,17 +2823,32 @@ function renderReportSummary(report, flowPayload, cfdResult) {
     ? `左 ${metricSummary(leftRight.left_lpm, " L/min")}（${metricSummary(leftRight.left_fraction == null ? null : leftRight.left_fraction * 100, " %", 1)}），右 ${metricSummary(leftRight.right_lpm, " L/min")}（${metricSummary(leftRight.right_fraction == null ? null : leftRight.right_fraction * 100, " %", 1)}）${leftRight.status === "available_pending_validation" ? "（待复核）" : ""}`
     : escapeHtml(leftRight.reason || "未生成");
   const baseline = `<section class="report-section" aria-labelledby="report-baseline-title">
-    <div class="report-section-head"><div><h3 id="report-baseline-title">1. 基准鼻腔流场报告</h3><p>指标来自当前病例已发布的 CFD 结果和流场采样。</p></div>${baselineStatus}</div>
+    <div class="report-section-head"><div><h3 id="report-baseline-title">本次气流计算</h3><p>稳态吸气；指标描述当前模型和呼吸条件，仍需数值与工程复核。</p></div>${baselineStatus}</div>
     <div class="report-metric-grid">
+      ${reportMetric("设定入口流量", metricSummary(requestedFlow, " L/min"), "计算条件；与实际求得流量分开记录")}
       ${reportMetric("实际入口流量", baselineObserved ? metricSummary(flowValue, " L/min") : "未生成", flowDetail)}
-      ${reportMetric("入口至出口压降", pressureDrop, pressureLabel)}
-      ${reportMetric("速度分布", baselineObserved ? distributionText(velocity, ` ${velocity.unit || "m/s"}`) : "未生成", "最小 / 平均 / P95 / 最大")}
-      ${reportMetric("压力分布", baselineObserved ? distributionText(pressure, ` ${pressure.unit || pressureUnit || ""}`) : "未生成", "真实采样摘要")}
-      ${reportMetric("左右侧流量分配", baselineObserved ? splitText : "未生成", "仅在独立左右入口存在时展示")}
+      ${reportMetric("入口至出口压降", pressureDrop, baselineFlow.pressure_drop?.reason || pressureLabel)}
+      ${reportMetric("模拟鼻阻力", resistance.status === "checked" ? metricSummary(resistance.value, " Pa·s/mL") : "未计算", resistance.reason || "当前模型压降 ÷ 实际吸气流量；数值小不代表一定更舒服")}
+      ${reportMetric("速度采样摘要", baselineObserved ? distributionText(velocity, ` ${velocity.unit || "m/s"}`) : "未生成", "流线与切片采样，不能代表全鼻腔体积平均")}
+      ${reportMetric("压力采样摘要", baselineObserved ? distributionText(pressure, ` ${pressure.unit || ""}`) : "未生成", "可视化采样摘要；单位独立于压降")}
+      ${reportMetric("截面左右侧正向流量", baselineObserved ? splitText : "未生成", leftRight.description || leftRight.reason || "所选截面分配，受入口边界条件约束")}
       ${reportMetric("狭窄区域", baselineObserved ? narrowText : "未生成", narrow.status === "not_available" ? "当前算例未输出沿程截面积曲线" : "")}
     </div>
     <div class="report-note"><b>当前计算状态：</b>${escapeHtml(solverState)}；${escapeHtml(gateText)}</div>
   </section>`;
+
+  const regionalRecords = regionFlow.status === "ready" && Array.isArray(regionFlow.regions)
+    ? [...regionFlow.regions, ...(regionFlow.unassigned ? [regionFlow.unassigned] : [])] : [];
+  const regionalRows = regionalRecords.map((region) => {
+    const sidePercent = region.id === "unassigned" ? "—" : reportNumber(region.percent_of_side) === null
+      ? (regionFlow.coverage_complete === false ? "待补齐分区" : "占比不可用") : metricSummary(region.percent_of_side, " %");
+    return `<tr><th scope="row">${escapeHtml(region.label || region.id)}</th><td>${metricSummary(region.forward_lpm, " L/min")}</td><td>${metricSummary(region.percent_of_section, " %")}</td><td>${sidePercent}</td></tr>`;
+  }).join("");
+  const regionalSection = `<section class="report-section" aria-labelledby="report-region-title"><div class="report-section-head"><div><h3 id="report-region-title">气流经过哪里</h3><p>比例属于三维界面标出的分析截面，按正向穿越流量计算。</p></div>${reportStatus(regionFlow.status === "ready" ? "已计算 · 待复核" : "未计算", "warn")}</div>
+    ${regionalRows ? `<div class="report-region-scroll"><table class="report-region-table"><thead><tr><th scope="col">区域</th><th scope="col">正向流量</th><th scope="col">占整截面</th><th scope="col">占该侧</th></tr></thead><tbody>${regionalRows}</tbody></table></div><p>整截面正向流量 ${metricSummary(regionFlow.totals?.forward_lpm, " L/min")}；回流 ${metricSummary(regionFlow.totals?.reverse_lpm, " L/min")}；净流量 ${metricSummary(regionFlow.totals?.net_lpm, " L/min")}。未标注区保留在整截面分母中。</p>` : `<p>${escapeHtml(regionFlow.reason || "在病例流场页选择截面，人工标注左右及上／中／下区域后计算。")}</p>`}
+    <p>${escapeHtml(typeof regionFlow.inlet_condition === "string" ? regionFlow.inlet_condition : regionFlow.inlet_condition?.description || "当前左右分配受算例入口设定约束，不能直接解释为自然呼吸分配。")}</p>
+  </section>`;
+  const interpretation = `<section class="report-section"><h3>这些结果说明到哪一步</h3><p>流线只追踪部分气流，没有画线的位置也可能有气流。区域比例不代表鼻甲感觉或黏膜功能；当前模型不能据此判断治疗效果。</p><p>${escapeHtml(baselineFlow.wall_shear_stress?.reason || "壁面剪切应力 WSS 尚未形成可验证的生产结果，本轮保持缺项。")}</p><p>${escapeHtml(gateText)}</p></section>`;
 
   const scenarios = Array.isArray(comparisonData.items) ? comparisonData.items : [];
   const comparison = scenarios.length
@@ -2855,7 +2882,8 @@ function renderReportSummary(report, flowPayload, cfdResult) {
     ${conclusionBody}
     ${uncertaintyBody}
   </section>`;
-  return `<div class="report-summary-head"><div><strong>报告摘要</strong><span>真实数据、方案对比和不确定性分开显示</span></div></div>${baseline}${comparisonSection}${conclusionSection}`;
+  const comparisonDetails = scenarios.length ? `${comparisonSection}${conclusionSection}` : `<details class="report-section"><summary>后续结构方案与设计参考</summary>${comparisonSection}${conclusionSection}</details>`;
+  return `<div class="report-summary-head"><div><strong>报告摘要</strong><span>当前呼吸条件、区域流量及解释范围</span></div></div>${baseline}${regionalSection}${interpretation}${comparisonDetails}`;
 }
 
 function miniMarkdown(text) {

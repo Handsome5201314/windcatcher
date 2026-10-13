@@ -626,6 +626,54 @@ a { color: var(--accent-ink); }
 .cfd-check-list span { color: var(--ink-2); overflow-wrap: anywhere; }
 .cfd-card-results { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
 .cfd-card-results-status { flex: 1 1 100%; color: var(--ink-2); font-size: 12px; }
+.cfd-sections { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
+.cfd-section-heading { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px; }
+.cfd-section-heading h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.cfd-section-heading p, .cfd-section-help, .cfd-section-note { color: var(--ink-2); font-size: 12px; line-height: 1.7; max-width: 75ch; margin: 6px 0 12px; }
+.cfd-section-heading .check { flex: 0 0 auto; margin-top: 2px; }
+.cfd-section-status { margin: 10px 0 14px; color: var(--ink-2); font-size: 13px; line-height: 1.6; }
+.cfd-section-status.is-error { color: var(--danger); }
+.cfd-section-regions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 16px 0; }
+.cfd-section-regions > div { display: grid; gap: 5px; min-width: 0; }
+.cfd-section-regions strong { font-size: 12px; color: var(--ink-2); margin-bottom: 2px; }
+.cfd-region-button { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--bg); text-align: left; font-size: 12px; cursor: pointer; }
+.cfd-region-button:hover:not(:disabled) { background: var(--bg-soft); }
+.cfd-region-button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.cfd-region-button:disabled { opacity: .5; cursor: not-allowed; }
+.cfd-region-button i { flex: 0 0 10px; width: 10px; height: 10px; border-radius: 2px; }
+.cfd-region-value { margin-left: auto; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.cfd-region-unassigned { grid-column: 1 / -1; }
+.cfd-section-result { padding: 0 0 4px; }
+.cfd-section-result:empty { display: none; }
+.cfd-section-metrics { grid-template-columns: 140px minmax(0, 1fr); margin: 14px 0; }
+.cfd-section-summary { font-size: 13px; line-height: 1.7; font-variant-numeric: tabular-nums; margin: 12px 0; }
+.cfd-section-note { margin: 6px 0; overflow-wrap: anywhere; }
+#cfd-section-editor { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
+#cfd-section-editor > summary { cursor: pointer; font-size: 13px; font-weight: 600; padding: 4px 0; }
+.cfd-section-position { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 16px 0 8px; }
+.cfd-section-position label { min-width: 105px; font-size: 12px; }
+.cfd-section-position output { font-variant-numeric: tabular-nums; }
+.cfd-section-position input { flex: 1 1 160px; accent-color: var(--accent); min-width: 0; }
+.cfd-section-edit-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 280px); gap: 20px; }
+.cfd-section-canvas-wrap { min-width: 0; }
+#cfd-section-canvas { display: block; width: 100%; height: 330px; border: 1px solid var(--view-line); touch-action: none; background: var(--view-bg); cursor: crosshair; }
+#cfd-section-canvas:focus-visible { outline-color: var(--accent); outline-offset: 3px; }
+#cfd-section-keyboard { margin: 8px 0 0; font-size: 12px; color: var(--ink-2); line-height: 1.6; }
+.cfd-section-edit-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; min-width: 0; }
+.cfd-section-edit-controls strong { font-size: 13px; }
+.cfd-section-edit-controls > p { margin: 0; font-size: 12px; color: var(--ink-2); line-height: 1.6; }
+.cfd-section-coordinate { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; width: 100%; }
+.cfd-section-coordinate label { font-size: 12px; color: var(--ink-2); }
+.cfd-section-coordinate input { display: block; width: 100%; min-height: 36px; margin-top: 5px; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--bg); font-variant-numeric: tabular-nums; }
+.cfd-section-coordinate input:disabled { opacity: .5; }
+.cfd-section-edit-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.cfd-section-edit-actions span { font-size: 12px; color: var(--ink-2); }
+.cfd-section-confirm { margin: 18px 0 12px; align-items: flex-start; max-width: 75ch; line-height: 1.6; }
+.cfd-section-confirm input { flex: 0 0 auto; margin-top: 4px; }
+.report-region-scroll { overflow-x: auto; max-width: 100%; }
+.report-region-table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+.report-region-table th, .report-region-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.report-region-table th { font-weight: 600; color: var(--ink-2); }
 @media (max-width: 850px) {
   .cfd-results-heading { flex-direction: column; }
   .cfd-results-layout { grid-template-columns: 1fr; }
@@ -633,6 +681,9 @@ a { color: var(--accent-ink); }
   .cfd-flow-settings h2, .cfd-patch-key { grid-column: 1 / -1; }
   .cfd-flow-canvas { height: 420px; }
   .cfd-resource-options { grid-template-columns: 1fr; }
+  .cfd-section-edit-layout { grid-template-columns: 1fr; gap: 16px; }
+  .cfd-section-edit-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+  .cfd-section-edit-controls > strong, .cfd-section-edit-controls > p, .cfd-section-edit-controls > .cfd-section-coordinate, .cfd-section-edit-controls > .cfd-section-edit-actions { grid-column: 1 / -1; }
 }
 @media (max-width: 500px) {
   .cfd-results-actions { width: 100%; }
@@ -641,6 +692,15 @@ a { color: var(--accent-ink); }
   #cfd-flow-kind { flex: 1 1 100%; margin-left: 0; }
   .cfd-validation .kv, .cfd-check-list li { grid-template-columns: 1fr; gap: 4px; }
   .cfd-results-heading h1 { font-size: 20px; letter-spacing: 0; }
+  .cfd-section-regions { gap: 10px; }
+  .cfd-region-button { align-items: flex-start; flex-wrap: wrap; padding: 8px; }
+  .cfd-region-button i { margin-top: 3px; }
+  .cfd-region-value { flex-basis: 100%; margin-left: 18px; }
+  .cfd-section-metrics { grid-template-columns: 1fr; gap: 3px; }
+  .cfd-section-metrics dd { margin-bottom: 6px; }
+  #cfd-section-canvas { height: 300px; }
+  .cfd-section-position { gap: 8px; }
+  .cfd-section-position input { flex-basis: 100%; order: 3; }
 }
 @media (max-width: 700px) {
   #case-actions:has(.cfd-resource-card) { grid-template-columns: minmax(0, 1fr); }

@@ -344,6 +344,30 @@
               <div class="cfd-patch-key"><span><i class="cfd-inlet-swatch"></i>鼻孔端入口</span><span><i class="cfd-outlet-swatch"></i>咽喉端出口</span></div>
             </aside>
           </div>
+          <section id="cfd-sections" class="cfd-sections" aria-labelledby="cfd-sections-title" hidden>
+            <div class="cfd-section-heading"><div><h2 id="cfd-sections-title">截面气流分布</h2><p>在选定截面统计穿过各区域的气流。点击三维模型中的颜色区域或下方区域按钮查看。</p></div><label class="check"><input id="cfd-section-visible" type="checkbox" checked />显示分析截面</label></div>
+            <p id="cfd-section-status" class="cfd-section-status" role="status" aria-live="polite"></p>
+            <div id="cfd-section-regions" class="cfd-section-regions" role="group" aria-label="选择患者侧别及分析区域"></div>
+            <div id="cfd-section-result" class="cfd-section-result" aria-live="polite"></div>
+            <details id="cfd-section-editor" open>
+              <summary>选择截面并标注区域</summary>
+              <div class="cfd-section-position"><label for="cfd-section-position">前后位置 <output id="cfd-section-position-value">50%</output></label><input id="cfd-section-position" type="range" min="5" max="95" step="1" value="50" /><button id="cfd-section-preview" class="button button-quiet button-compact" type="button">刷新截面</button></div>
+              <p class="cfd-section-help">截面是一张穿过鼻腔的薄切面。这里显示真实气道网格；标注只影响统计。先选区域，再依次点下边界顶点，闭合为凸多边形。边界应由熟悉解剖的人核对，不按高度自动三等分。</p>
+              <div class="cfd-section-edit-layout">
+                <div class="cfd-section-canvas-wrap"><canvas id="cfd-section-canvas" tabindex="0" aria-label="气道截面区域标注" aria-describedby="cfd-section-keyboard"></canvas><p id="cfd-section-keyboard">方向键移动光标，Shift 加大步长，Enter 添加顶点，Backspace 撤销，Escape 清空草稿。横向向患者左，纵向向上。</p></div>
+                <div class="cfd-section-edit-controls">
+                  <strong id="cfd-section-selected">左侧上部区域</strong>
+                  <p id="cfd-section-draft-info">尚未添加顶点</p>
+                  <div class="cfd-section-coordinate"><label for="cfd-section-u">横向 (mm)<input id="cfd-section-u" type="number" step="0.1" value="0" /></label><label for="cfd-section-v">纵向 (mm)<input id="cfd-section-v" type="number" step="0.1" value="0" /></label></div>
+                  <button id="cfd-section-add-point" class="button button-quiet button-compact" type="button">按坐标添加顶点</button>
+                  <div class="cfd-section-edit-actions"><button id="cfd-section-close" class="button button-quiet button-compact" type="button" disabled>闭合并标注</button><button id="cfd-section-undo" class="button button-quiet button-compact" type="button" disabled>撤销顶点</button><button id="cfd-section-clear-region" class="button button-quiet button-compact" type="button" disabled>清除此区域</button></div>
+                  <p class="cfd-section-help">每个区域可标一个凸多边形。多边形超出气道的部分不计入流量；区域之间不可重叠。未覆盖部分保留为未标注区。</p>
+                </div>
+              </div>
+              <label class="check cfd-section-confirm"><input id="cfd-section-confirm" type="checkbox" />我已核对患者左右与区域边界，并确认截面覆盖从鼻孔到咽喉的主通路。</label>
+              <div class="cfd-section-edit-actions"><button id="cfd-section-compute" class="button button-primary" type="button" disabled>计算并保存分布</button><span>复用已有流场，无需重新求解。</span></div>
+            </details>
+          </section>
           <section class="cfd-validation" aria-labelledby="cfd-validation-title"><h2 id="cfd-validation-title">计算记录与复核</h2><div id="cfd-results-validation"></div></section>
         </div>
       </section>
@@ -366,7 +390,8 @@
   <script src="/static/vendor/OrbitControls.js"></script>
   <!-- Three.js r128 examples/js/controls/TransformControls.js; MIT license in static/vendor/LICENSE-three-r128.txt -->
   <script src="/static/vendor/TransformControls.js"></script>
-  <script src="/static/cfd-viewer.js?v=20261004-real-results1"></script>
+  <script src="/static/cfd-viewer.js?v=20261012-sections1"></script>
+  <script src="/static/cfd-sections.js?v=20261012-sections1"></script>
   <script src="/static/app.js?v=20261010-results-recovery2"></script>
 </body>
 </html>
