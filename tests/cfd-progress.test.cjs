@@ -165,7 +165,7 @@ function renderCfdDetailFixture(runStatus) {
     effectiveStageStatus: (_stage, status) => status,
     fmt: (value, suffix = "") => value == null ? null : `${value}${suffix}`,
   });
-  vm.runInContext(["escapeHtml", "kvList", "renderCfdProgress", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdMeshRows", "renderDetails"].map(productionFunction).join("\n"), detailContext);
+  vm.runInContext(["escapeHtml", "kvList", "renderCfdProgress", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdMeshRows", "renderScenarioPanel", "renderDetails"].map(productionFunction).join("\n"), detailContext);
   const stages = Object.fromEntries(["qc", "anonymize", "segment", "surface", "report"].map((key) => [key, { status: "pending" }]));
   stages.cfd_prep = { status: "ok", data: { parallel: { profile: "balanced", requested_subdomains: 12 } } };
   stages.cfd_run = { status: "running", data: { run_status: runStatus } };
@@ -210,7 +210,7 @@ test("CFD details use the same prepared profile and show the log-based failure a
     effectiveStageStatus: (_stage, status) => status,
     fmt: (value, suffix = "") => value == null ? null : `${value}${suffix}`,
   });
-  vm.runInContext(["escapeHtml", "kvList", "renderCfdProgress", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdMeshRows", "renderDetails"].map(productionFunction).join("\n"), detailContext);
+  vm.runInContext(["escapeHtml", "kvList", "renderCfdProgress", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdMeshRows", "renderScenarioPanel", "renderDetails"].map(productionFunction).join("\n"), detailContext);
   const stages = Object.fromEntries(["qc", "anonymize", "segment", "surface", "report"].map((key) => [key, { status: "pending" }]));
   stages.cfd_prep = { status: "ok", data: { parallel: { profile: "strongest", requested_subdomains: 16 } } };
   stages.cfd_run = { status: "failed", data: { run_status: {

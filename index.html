@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>风见 · 鼻腔气流工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20261009-cfd-progress2" />
+  <link rel="stylesheet" href="/static/app.css?v=20261017-scenario-loop1" />
 </head>
 <body>
   <div class="shell">
@@ -121,13 +121,13 @@
             <div id="endplane-controls" hidden>
               <div class="endplane-mode-bar" role="group" aria-label="选择要放置的裁切面">
                 <button id="endplane-mode-anterior" class="button button-quiet button-compact" type="button" aria-pressed="true">1 选鼻孔端</button>
-                <button id="endplane-mode-posterior" class="button button-quiet button-compact" type="button" aria-pressed="false">2 选咽喉端</button>
+                <button id="endplane-mode-posterior" class="button button-quiet button-compact" type="button" aria-pressed="false">2 选鼻咽端</button>
                 <span id="endplane-placement-status" aria-live="polite">点击模型放置蓝色鼻孔端面</span>
               </div>
               <div class="endplane-3d-tools" role="group" aria-label="裁切面操作">
                 <button id="endplane-tool-translate" class="vt-btn is-on" type="button" aria-pressed="true">移动切面</button>
                 <button id="endplane-tool-rotate" class="vt-btn" type="button" aria-pressed="false">旋转切面</button>
-                <button id="endplane-flip-normal" class="vt-btn" type="button" title="不改变切面位置，翻转当前切面的保留方向" disabled>翻转当前端面方向</button>
+                <button id="endplane-flip-normal" class="vt-btn" type="button" title="不改变切面位置，翻转用于裁切的外侧法向；气流箭头仍按端面类型表示流向" disabled>翻转裁切法向</button>
                 <button id="endplane-reset-camera" class="vt-btn" type="button">复位视角</button>
                 <span>拖动空白处旋转模型；选中彩色手柄可移动或旋转端面。</span>
               </div>
@@ -136,8 +136,18 @@
                 <div id="endplane-3d-overlay" class="endplane-3d-overlay" role="status" aria-live="polite">正在按原始体素分辨率重建 3D 气道…</div>
               </div>
               <p id="endplane-orientation" class="endplane-orientation"></p>
-              <p class="endplane-3d-help">蓝色＝鼻孔端，橙色＝咽喉端；亮色是拟保留的气道，灰淡部分将移除。生成 STL 后显示精确裁切并封盖的模型，以几何质检结果为准。</p>
+              <p class="endplane-3d-help">蓝色鼻孔端箭头表示吸气，指向气道内部；橙色鼻咽端箭头表示负压驱动的流向，指向肺侧。端面法向用于裁切外侧，实际开口以 STL 几何质检为准。</p>
               <p id="endplane-preview-status" class="endplane-preview-status" role="status" aria-live="polite">请先放置两端裁切面，再检查几何预检结果。</p>
+              <div class="endplane-save-bar" role="group" aria-label="保存端面位置">
+                <div class="endplane-save-actions" role="group" aria-label="鼻孔端保存操作">
+                  <button id="endplane-anterior-save" class="button button-primary button-compact" type="button" disabled>保存鼻孔端</button>
+                  <button id="endplane-anterior-discard" class="button button-quiet button-compact" type="button" disabled>放弃鼻孔端更改</button>
+                </div>
+                <div class="endplane-save-actions" role="group" aria-label="鼻咽端保存操作">
+                  <button id="endplane-posterior-save" class="button button-primary button-compact" type="button" disabled>保存鼻咽端</button>
+                  <button id="endplane-posterior-discard" class="button button-quiet button-compact" type="button" disabled>放弃鼻咽端更改</button>
+                </div>
+              </div>
               <details class="endplane-precise" id="endplane-precise">
                 <summary>精确调整 CT 层号（仅正交裁切）</summary>
                 <p>层号只用于沿原始 CT 前后方向的正交裁切。若在 3D 中旋转过平面，以下逐层面积不代表倾斜面面积。</p>
@@ -166,9 +176,7 @@
               </details>
               <p class="endplane-caution">精确调整区的逐层截面积只适用于正交参考层；倾斜端面的面积以几何预检为准。1 mm² 只是程序过滤毛刺的最低技术阈值，不代表解剖位置正确。完整候选中断开的鼻窦、旁支仍须单独复核。</p>
               <div class="endplane-actions">
-                <button id="endplane-save" class="button button-primary button-compact" type="button" disabled>保存两个 3D 裁切面并作废旧模型</button>
-                <button id="endplane-discard" class="button button-quiet button-compact" type="button" disabled>放弃未保存更改</button>
-                <span>保存后旧 STL / CFD 算例失效，需要重新生成。</span>
+                <span>两端分别保存；只有两端均已保存且联合预检通过后，才能生成 STL。每次保存都会使旧 STL / CFD 算例失效。</span>
               </div>
             </div>
           </section>
@@ -265,6 +273,7 @@
                       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 5.5h5l1.5 1.8h8.5v8.2a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M2.5 5.5v-1a1 1 0 0 1 1-1h3.7l1.4 1.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
                       选择 DICOM 文件夹
                     </button>
+                    <input id="newcase-upload" type="file" multiple webkitdirectory directory hidden aria-hidden="true" />
                     <span id="selected-source" class="source-status">尚未选择</span>
                   </div>
                   <input id="newcase-path" type="text" placeholder="选择后会自动填入本机目录" autocomplete="off" readonly aria-describedby="source-help" />
@@ -345,27 +354,14 @@
             </aside>
           </div>
           <section id="cfd-sections" class="cfd-sections" aria-labelledby="cfd-sections-title" hidden>
-            <div class="cfd-section-heading"><div><h2 id="cfd-sections-title">截面气流分布</h2><p>在选定截面统计穿过各区域的气流。点击三维模型中的颜色区域或下方区域按钮查看。</p></div><label class="check"><input id="cfd-section-visible" type="checkbox" checked />显示分析截面</label></div>
+            <div class="cfd-section-heading"><div><h2 id="cfd-sections-title">截面气流分布</h2><p>在三维模型上直接拖动橙色截面，松开鼠标后按当前位置重新切片并统计整截面的气流。</p></div><label class="check"><input id="cfd-section-visible" type="checkbox" checked />显示分析截面</label></div>
             <p id="cfd-section-status" class="cfd-section-status" role="status" aria-live="polite"></p>
-            <div id="cfd-section-regions" class="cfd-section-regions" role="group" aria-label="选择患者侧别及分析区域"></div>
             <div id="cfd-section-result" class="cfd-section-result" aria-live="polite"></div>
             <details id="cfd-section-editor" open>
-              <summary>选择截面并标注区域</summary>
-              <div class="cfd-section-position"><label for="cfd-section-position">前后位置 <output id="cfd-section-position-value">50%</output></label><input id="cfd-section-position" type="range" min="5" max="95" step="1" value="50" /><button id="cfd-section-preview" class="button button-quiet button-compact" type="button">刷新截面</button></div>
-              <p class="cfd-section-help">截面是一张穿过鼻腔的薄切面。这里显示真实气道网格；标注只影响统计。先选区域，再依次点下边界顶点，闭合为凸多边形。边界应由熟悉解剖的人核对，不按高度自动三等分。</p>
-              <div class="cfd-section-edit-layout">
-                <div class="cfd-section-canvas-wrap"><canvas id="cfd-section-canvas" tabindex="0" aria-label="气道截面区域标注" aria-describedby="cfd-section-keyboard"></canvas><p id="cfd-section-keyboard">方向键移动光标，Shift 加大步长，Enter 添加顶点，Backspace 撤销，Escape 清空草稿。横向向患者左，纵向向上。</p></div>
-                <div class="cfd-section-edit-controls">
-                  <strong id="cfd-section-selected">左侧上部区域</strong>
-                  <p id="cfd-section-draft-info">尚未添加顶点</p>
-                  <div class="cfd-section-coordinate"><label for="cfd-section-u">横向 (mm)<input id="cfd-section-u" type="number" step="0.1" value="0" /></label><label for="cfd-section-v">纵向 (mm)<input id="cfd-section-v" type="number" step="0.1" value="0" /></label></div>
-                  <button id="cfd-section-add-point" class="button button-quiet button-compact" type="button">按坐标添加顶点</button>
-                  <div class="cfd-section-edit-actions"><button id="cfd-section-close" class="button button-quiet button-compact" type="button" disabled>闭合并标注</button><button id="cfd-section-undo" class="button button-quiet button-compact" type="button" disabled>撤销顶点</button><button id="cfd-section-clear-region" class="button button-quiet button-compact" type="button" disabled>清除此区域</button></div>
-                  <p class="cfd-section-help">每个区域可标一个凸多边形。多边形超出气道的部分不计入流量；区域之间不可重叠。未覆盖部分保留为未标注区。</p>
-                </div>
-              </div>
-              <label class="check cfd-section-confirm"><input id="cfd-section-confirm" type="checkbox" />我已核对患者左右与区域边界，并确认截面覆盖从鼻孔到咽喉的主通路。</label>
-              <div class="cfd-section-edit-actions"><button id="cfd-section-compute" class="button button-primary" type="button" disabled>计算并保存分布</button><span>复用已有流场，无需重新求解。</span></div>
+              <summary>选择截面位置</summary>
+              <div class="cfd-section-position"><label for="cfd-section-position">前后位置 <output id="cfd-section-position-value">50%</output></label><input id="cfd-section-position" type="range" min="5" max="95" step="1" value="50" /><button id="cfd-section-preview" class="button button-quiet button-compact" type="button">读取当前位置</button></div>
+              <p id="cfd-section-drag-hint" class="cfd-section-help" hidden>拖动三维模型上的橙色截面移动位置；松开鼠标后会重新切片并计算整截面流量、面积和速度统计。滑杆与“按当前位置重新计算”按钮可作为备用操作。</p>
+              <div class="cfd-section-edit-actions"><button id="cfd-section-compute" class="button button-primary" type="button" disabled>按当前位置重新计算</button><span>复用已有最终流场，无需重新运行 CFD 求解器。</span></div>
             </details>
           </section>
           <section class="cfd-validation" aria-labelledby="cfd-validation-title"><h2 id="cfd-validation-title">计算记录与复核</h2><div id="cfd-results-validation"></div></section>
@@ -384,14 +380,15 @@
 
   <div class="toast-wrap" id="toasts"></div>
 
-  <script src="/static/activity-monitor.js?v=20261009-monitor1"></script>
+  <script src="/static/access-context.js?v=20261017-upload1"></script>
+  <script src="/static/activity-monitor.js?v=20261014-public1"></script>
   <script src="/static/vendor/three.min.js"></script>
   <script src="/static/vendor/STLLoader.js"></script>
   <script src="/static/vendor/OrbitControls.js"></script>
   <!-- Three.js r128 examples/js/controls/TransformControls.js; MIT license in static/vendor/LICENSE-three-r128.txt -->
   <script src="/static/vendor/TransformControls.js"></script>
-  <script src="/static/cfd-viewer.js?v=20261012-sections1"></script>
-  <script src="/static/cfd-sections.js?v=20261012-sections1"></script>
-  <script src="/static/app.js?v=20261010-results-recovery2"></script>
+  <script src="/static/cfd-viewer.js?v=20261017-section-drag1"></script>
+  <script src="/static/cfd-sections.js?v=20261017-section-drag1"></script>
+  <script src="/static/app.js?v=20261017-scenario-loop1"></script>
 </body>
 </html>

@@ -337,6 +337,23 @@ def _call_model(config: dict, messages: list[dict]) -> dict:
         raise AIReportError("AI 服务返回的不是 JSON", 502)
 
 
+def _provider_usage(response: dict) -> dict:
+    """Only retain reported token counters; never estimate a missing bill."""
+    raw = response.get("usage")
+    if not isinstance(raw, dict):
+        return {"available": False, "source": "provider_response"}
+    result = {key: value for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+              if type(value := raw.get(key)) is int and value >= 0}
+    for group, allowed in (("prompt_tokens_details", ("cached_tokens",)),
+                           ("completion_tokens_details", ("reasoning_tokens",))):
+        detail = raw.get(group)
+        if isinstance(detail, dict):
+            counters = {key: value for key in allowed if type(value := detail.get(key)) is int and value >= 0}
+            if counters:
+                result[group] = counters
+    return {"available": bool(result), "source": "provider_response", **result}
+
+
 def generate(case_id: str, report: dict, mode: str = "observations") -> dict:
     config = get_config()
     if not config["base_url"]:
@@ -344,13 +361,15 @@ def generate(case_id: str, report: dict, mode: str = "observations") -> dict:
     if not config["api_key_configured"]:
         raise AIReportError("未配置 AI API 密钥", 409, ["到环境页填写 API 密钥并点击获取模型或保存连接配置"])
     safe_payload = build_safe_payload(report)
-    interpretation = _parse_interpretation(_extract_content(_call_model(config, _prompt(safe_payload, mode))), not bool(safe_payload["gate"]["eligible"]))
+    response = _call_model(config, _prompt(safe_payload, mode))
+    interpretation = _parse_interpretation(_extract_content(response), not bool(safe_payload["gate"]["eligible"]))
     result = {
         "case_id": case_id,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "provider": config["provider"],
         "model": config["model"],
         "mode": mode,
+        "usage": _provider_usage(response),
         "source": {"report_generated_at": safe_payload["report_generated_at"], "fields": safe_payload},
         "interpretation": interpretation,
         "disclaimer": "AI 解读仅基于本页脱敏统计，不能替代 CFD 工程复核或医学判断。",

@@ -186,6 +186,26 @@ def test_report_renders_left_right_flow_fractions_as_percentages(report_case, mo
     assert "截面左右侧正向通量：左 9.000 L/min（60.0%），右 6.000 L/min（40.0%）" in markdown
 
 
+def test_report_renders_whole_section_metrics_without_manual_regions(report_case, monkeypatch):
+    case_id, root = report_case
+    cfd = root / "cfd"
+    (cfd / "case_meta.json").write_text(json.dumps({"total_flow_lpm": 15.0}), encoding="utf-8")
+    (cfd / "run_status.json").write_text(json.dumps({"status": "ran"}), encoding="utf-8")
+    monkeypatch.setattr(report, "_region_flow", lambda _root: {
+        "status": "ready", "analysis_type": "whole_section", "analysis_signature": "whole-analysis",
+        "totals": {"area_mm2": 42.0, "forward_lpm": 12.0, "reverse_lpm": .5, "net_lpm": 11.5},
+        "velocity": {"mean_mps": 1.2, "p95_mps": 2.1, "max_mps": 3.0},
+        "plane": {"position_fraction": .62, "position_coordinate_mm": 18.0},
+        "validation": {"status": "pending", "reasons": []},
+    })
+    monkeypatch.setattr(report, "check_result_gate", lambda _case_id: _gate({"inlet_flow_m3s": -0.00025, "delta_p_pa": 34.0, "pressure_unit": "Pa"}, eligible=True))
+    report.build_report(case_id)
+    markdown = (root / "report" / "report.md").read_text(encoding="utf-8")
+    assert "整截面分析" in markdown
+    assert "面积 42.000 mm²" in markdown
+    assert "上／中／下分区结果" not in markdown
+
+
 def test_report_derives_design_conclusions_from_independent_scenario(report_case, monkeypatch):
     case_id, root = report_case
     cfd = root / "cfd"

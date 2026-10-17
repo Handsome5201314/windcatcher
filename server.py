@@ -9,26 +9,29 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
 
-from pipeline import activity_monitor, ai_report, capabilities, cfd_postprocess_jobs, cfd_prep, dicom_qc, endplanes, geom_qc, installers, mask_review, openfoam_runner, preview, report, segmentation, selection_preview, slicer_review, surface
+from pipeline import activity_monitor, ai_report, automation, batch_jobs, capabilities, cfd_postprocess_jobs, cfd_prep, dicom_qc, endplanes, geom_qc, installers, mask_review, openfoam_runner, plug_models, preview, report, scenario_cfd, scenario_jobs, scenarios, segmentation, selection_preview, slicer_review, surface
 from pipeline.anonymize import anonymize_series
 from pipeline.cases import artifact_path, case_dir, create_case, delete_case, get_case, list_cases, recover_interrupted_cases, update_job, update_stage
-from pipeline.config import APP_DIR, PROJECT_ROOT, detect_compute_capabilities
+from pipeline.config import APP_DIR, CASES_DIR, PROJECT_ROOT, detect_compute_capabilities
 from pipeline.errors import PipelineError
 from pipeline.fetch_direct import fetch_direct
 from pipeline.volume import load_series, save_volume
@@ -36,11 +39,26 @@ from pipeline.volume import load_series, save_volume
 REFERENCE_HTML = PROJECT_ROOT / "原始资料" / "原始鼻腔CFD_交互查看_v3.html"
 _DIRECTORY_PICKER_LOCK = threading.Lock()
 _DIRECTORY_PICKER_TIMEOUT_SECONDS = 60
+_UPLOAD_MAX_FILES = 5000
+_UPLOAD_MAX_FILE_BYTES = 128 * 1024 * 1024
+_UPLOAD_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+_UPLOAD_MAX_PATH_CHARS = 240
 _CFD_VALIDATION_CACHE: dict[str, tuple[tuple, dict]] = {}
 _CFD_SUMMARY_CACHE: dict[str, tuple[tuple, dict]] = {}
 _CFD_VALIDATION_LOCK = threading.Lock()
 _MONITOR_LOGGER = logging.getLogger("windcatcher.monitor")
 _MONITOR_FAILURE: str | None = None
+
+
+def _cleanup_upload_staging() -> None:
+    """Remove incomplete browser uploads left by a stopped server."""
+    try:
+        CASES_DIR.mkdir(parents=True, exist_ok=True)
+        for staging in CASES_DIR.glob(".windcatcher-upload-*"):
+            if staging.is_dir() and not staging.is_symlink():
+                shutil.rmtree(staging, ignore_errors=True)
+    except OSError as exc:
+        _MONITOR_LOGGER.warning("无法清理中断的 DICOM 上传暂存：%s", type(exc).__name__)
 
 
 def _record_activity(event: dict) -> int | None:
@@ -58,13 +76,20 @@ def _record_activity(event: dict) -> int | None:
 async def app_lifespan(application: FastAPI):
     # 只在本进程首次启动、开始接收请求前恢复。重复进入 lifespan 时不能改写本进程正在执行的任务。
     if not getattr(application.state, "interrupted_cases_recovered", False):
+        _cleanup_upload_staging()
         recover_interrupted_cases()
         cfd_postprocess_jobs.recover_interrupted()
+        scenario_jobs.recover_interrupted()
         application.state.interrupted_cases_recovered = True
     await run_in_threadpool(_record_activity, {"kind": "lifecycle", "action": "server_started"})
+    queue = batch_jobs.BatchQueue(Path(os.environ.get("WINDCATCHER_AUTOMATION_DIR", str(APP_DIR / ".local-automation"))) / "jobs.sqlite3", automation.preflight, automation.execute)
+    application.state.batch_queue = queue
+    queue.start()
     try:
         yield
     finally:
+        queue.stop()
+        application.state.batch_queue = None
         await run_in_threadpool(_record_activity, {"kind": "lifecycle", "action": "server_stopped"})
 
 
@@ -75,21 +100,43 @@ app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 @app.middleware("http")
 async def local_only_headers(request, call_next):
     mutation_case = None
-    match = re.fullmatch(r"/api/cases/([^/]+)(/.*)?", request.url.path)
+    scenario_mutation_case = None
+    batch_reservation = ExitStack()
+    # Only a real case id participates in the per-case mutation lock;
+    # collection routes such as /api/cases/upload must not share a fake id.
+    match = re.fullmatch(r"/api/cases/(case-\d{8}-\d{6}-[0-9a-f]{4})(/.*)?", request.url.path)
     suffix = match.group(2) or "" if match else ""
-    if match and request.method in {"POST", "DELETE"} and suffix not in {
+    if match and request.method in {"POST", "PUT", "DELETE"} and suffix not in {
         "/cfd-postprocess", "/cfd-postprocess/cancel", "/segment/endplanes/preview",
     }:
         mutation_case = match.group(1)
         try:
+            queue = getattr(app.state, "batch_queue", None)
+            if queue:
+                batch_reservation.enter_context(queue.mutation(mutation_case))
             cfd_postprocess_jobs.reserve_mutation(mutation_case)
         except PipelineError as exc:
+            batch_reservation.close()
             return JSONResponse(status_code=409, content=exc.to_dict())
+        # The long-running scenario solver owns its own lock.  All other case
+        # mutations must wait for it, otherwise a new placement could race the
+        # version that the solver is reading.
+        if not re.fullmatch(r"/scenarios/[^/]+/cfd-run", suffix):
+            try:
+                scenario_jobs.reserve_mutation(mutation_case)
+                scenario_mutation_case = mutation_case
+            except PipelineError as exc:
+                cfd_postprocess_jobs.release_mutation(mutation_case)
+                batch_reservation.close()
+                return JSONResponse(status_code=409, content=exc.to_dict())
     try:
         response = await call_next(request)
     finally:
         if mutation_case:
             cfd_postprocess_jobs.release_mutation(mutation_case)
+        if scenario_mutation_case:
+            scenario_jobs.release_mutation(scenario_mutation_case)
+        batch_reservation.close()
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -153,6 +200,16 @@ class NewCaseBody(BaseModel):
     anonymize: bool = False
 
 
+class _UploadRejected(Exception):
+    """Rejected browser upload with a user-facing reason and HTTP status."""
+
+    def __init__(self, reason: str, remediation: list[str], status_code: int = 400):
+        super().__init__(reason)
+        self.reason = reason
+        self.remediation = remediation
+        self.status_code = status_code
+
+
 class ActivityBatchBody(BaseModel):
     events: list[dict] = Field(min_length=1, max_length=50)
 
@@ -211,6 +268,55 @@ def api_activity_events(
         raise HTTPException(503, detail={"reason": "操作日志暂时不可读取，请检查本机磁盘"}) from exc
 
 
+def _automation_queue(request: Request):
+    _monitor_local_request(request)
+    if request.url.hostname not in {"127.0.0.1", "localhost", "::1", "testserver"} or any(
+        name in request.headers for name in ("x-forwarded-for", "forwarded", "cf-connecting-ip")
+    ):
+        raise HTTPException(403, detail={"reason": "自动化接口仅供本机 MCP 调用"})
+    queue = getattr(app.state, "batch_queue", None)
+    if not queue or not queue.health()["worker_alive"]:
+        raise HTTPException(503, detail={"reason": "批量队列未运行，请检查服务日志并重启服务"})
+    return queue
+
+
+@app.get("/api/automation/status")
+def api_automation_status(request: Request):
+    queue = _automation_queue(request)
+    return {"status": "ready", **queue.health(), "llm_tokens": None,
+            "usage_source": "Codex/WorkBuddy 宿主 usage；本机 CFD 计算不调用大模型"}
+
+
+@app.get("/api/automation/cases")
+def api_automation_cases(request: Request, offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=50)):
+    _automation_queue(request)
+    rows = list_cases()
+    return {"cases": [{k: row[k] for k in ("case_id", "synthetic", "stages")} for row in rows[offset:offset + limit]],
+            "total": len(rows), "next_offset": offset + limit if offset + limit < len(rows) else None}
+
+
+@app.get("/api/automation/cases/{case_id}")
+def api_automation_case(case_id: str, request: Request):
+    _automation_queue(request)
+    return automation.inspect_case(case_id)
+
+
+@app.post("/api/automation/batches", status_code=202)
+def api_automation_submit(body: automation.BatchBody, request: Request):
+    queue = _automation_queue(request)
+    return queue.submit(body.request_key, [item.model_dump() for item in body.items])
+
+
+@app.get("/api/automation/batches/{batch_id}")
+def api_automation_batch(batch_id: str, request: Request):
+    return _automation_queue(request).get(batch_id)
+
+
+@app.post("/api/automation/batches/{batch_id}/cancel")
+def api_automation_cancel(batch_id: str, request: Request):
+    return _automation_queue(request).cancel(batch_id)
+
+
 class StageBody(BaseModel):
     path: str | None = None
     params: dict | None = None
@@ -260,15 +366,27 @@ class EndplanesBody(BaseModel):
     posterior_plane: dict | None = None
 
 
+class SingleEndplaneBody(BaseModel):
+    scope: str
+    mask_version: int
+    plane: dict
+
+
 class CfdSectionPreviewBody(BaseModel):
     position_fraction: float = Field(gt=0, lt=1, allow_inf_nan=False)
 
 
 class CfdSectionBody(BaseModel):
-    # 完整几何校验交给截面模块；标注独立保存，不进入气道掩膜。
+    # 仅用于校验历史请求体；新流程不再接受六区人工标注写入。
     plane: dict
     regions: list[dict] = Field(min_length=1, max_length=6)
     confirmed: bool
+    source_signature: str = Field(min_length=1, max_length=128)
+    geometry_signature: str = Field(min_length=1, max_length=128)
+
+
+class CfdSectionAnalysisBody(BaseModel):
+    position_fraction: float = Field(gt=0, lt=1, allow_inf_nan=False)
     source_signature: str = Field(min_length=1, max_length=128)
     geometry_signature: str = Field(min_length=1, max_length=128)
 
@@ -286,6 +404,32 @@ class AiReportModelsBody(BaseModel):
 
     base_url: str
     api_key: str
+
+
+class ScenarioPlacementBody(BaseModel):
+    """鼻塞模型在病例坐标系中的人工摆位，长度单位固定为毫米。"""
+
+    translation_mm: list[float] = Field(min_length=3, max_length=3)
+    rotation_deg: list[float] = Field(min_length=3, max_length=3)
+    scale: list[float] = Field(min_length=3, max_length=3)
+    expected_version: int = Field(ge=1)
+
+
+class ScenarioReviewBody(BaseModel):
+    """人工复核记录；角色和备注不应包含患者直接标识符。"""
+
+    approved: bool
+    reviewer_role: str = Field(min_length=1, max_length=80)
+    notes: str = Field(default="", max_length=2000)
+    expected_version: int = Field(ge=1)
+
+
+class ScenarioCfdBody(BaseModel):
+    """独立鼻塞算例的准备/求解参数；版本默认取当前已审核版本。"""
+
+    version: int | None = Field(default=None, ge=1)
+    backend: str | None = Field(default=None, max_length=32)
+    timeout_s: int = Field(default=7200, ge=60, le=86400)
 
 
 def _cfd_signature(case_id: str) -> tuple:
@@ -646,6 +790,144 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     return {"status": "ok", "path": str(path)}
 
 
+def _safe_upload_path(raw: str | None) -> Path:
+    """Resolve a browser-supplied relative path without allowing traversal."""
+    value = str(raw or "").replace("\\", "/")
+    if not value or "\x00" in value or value.startswith("/") or re.match(r"^[A-Za-z]:/", value):
+        raise _UploadRejected(
+            "上传文件名无效，不能使用绝对路径",
+            ["重新选择 DICOM 序列文件夹", "不要把本机路径粘贴到上传文件名中"],
+        )
+    parts = [part for part in value.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." or ":" in part for part in parts):
+        raise _UploadRejected(
+            "上传文件名包含非法目录跳转或盘符",
+            ["重新选择 DICOM 序列文件夹"],
+        )
+    normalized = PurePosixPath(*parts)
+    if len(normalized.as_posix()) > _UPLOAD_MAX_PATH_CHARS:
+        raise _UploadRejected(
+            "上传文件名过长",
+            [f"请把 DICOM 序列放在较短的文件夹路径下（最多 {_UPLOAD_MAX_PATH_CHARS} 个字符）"],
+        )
+    # Path() is deliberately created only after the POSIX path has been checked;
+    # this keeps browser paths stable on both Windows and Linux hosts.
+    return Path(*normalized.parts)
+
+
+def _store_uploaded_files(files: list[UploadFile], relative_paths: list[str] | None) -> Path:
+    """Stream one multipart request into an isolated staging directory."""
+    if not files:
+        raise _UploadRejected(
+            "没有收到 DICOM 文件",
+            ["点击选择按钮，选择包含同一套 DICOM 序列的文件夹"],
+        )
+    if len(files) > _UPLOAD_MAX_FILES:
+        raise _UploadRejected(
+            f"一次最多上传 {_UPLOAD_MAX_FILES} 个文件",
+            ["只选择一套 DICOM 序列，不要选择整个检查目录"],
+            status_code=413,
+        )
+    if relative_paths is not None and len(relative_paths) != len(files):
+        raise _UploadRejected(
+            "上传文件清单与文件数量不一致",
+            ["重新选择 DICOM 序列文件夹后重试"],
+        )
+
+    from pipeline.config import ensure_dirs
+
+    ensure_dirs()
+    staging = Path(tempfile.mkdtemp(prefix=".windcatcher-upload-", dir=CASES_DIR))
+    seen: set[str] = set()
+    total_bytes = 0
+    try:
+        for index, upload in enumerate(files):
+            candidate = relative_paths[index] if relative_paths is not None else upload.filename
+            relative = _safe_upload_path(candidate)
+            key = relative.as_posix().casefold()
+            if key in seen:
+                raise _UploadRejected(
+                    f"上传文件名重复：{relative.as_posix()}",
+                    ["请只选择一套 DICOM 序列，避免同名文件重复"],
+                )
+            seen.add(key)
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            file_bytes = 0
+            with target.open("xb") as output:
+                while True:
+                    chunk = upload.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    file_bytes += len(chunk)
+                    total_bytes += len(chunk)
+                    if file_bytes > _UPLOAD_MAX_FILE_BYTES:
+                        raise _UploadRejected(
+                            f"单个上传文件超过 {_UPLOAD_MAX_FILE_BYTES // (1024 * 1024)} MB",
+                            ["确认选择的是 DICOM 切片，而不是整个压缩包或其他大文件"],
+                            status_code=413,
+                        )
+                    if total_bytes > _UPLOAD_MAX_TOTAL_BYTES:
+                        raise _UploadRejected(
+                            f"本次上传超过 {_UPLOAD_MAX_TOTAL_BYTES // (1024 * 1024 * 1024)} GB",
+                            ["只选择一套 DICOM 序列，或分批处理"],
+                            status_code=413,
+                        )
+                    output.write(chunk)
+            if file_bytes == 0:
+                raise _UploadRejected(
+                    f"上传文件为空：{relative.as_posix()}",
+                    ["确认 DICOM 序列文件可正常读取后重试"],
+                )
+        _collapse_upload_root(staging)
+        return staging
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _parse_upload_paths(raw: object, count: int) -> list[str] | None:
+    """Parse the browser's relative path sidecar, keeping names out of logs."""
+    if raw in (None, ""):
+        return None
+    try:
+        paths = json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise _UploadRejected("上传文件清单格式无效", ["重新选择 DICOM 序列文件夹后重试"]) from exc
+    if not isinstance(paths, list) or len(paths) != count or not all(isinstance(path, str) for path in paths):
+        raise _UploadRejected("上传文件清单格式无效", ["重新选择 DICOM 序列文件夹后重试"])
+    return paths
+
+
+def _parse_upload_bool(raw: object, name: str) -> bool:
+    if raw in (None, ""):
+        return False
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise _UploadRejected(f"上传选项 {name} 无效", ["刷新页面后重新提交"])
+
+
+def _collapse_upload_root(staging: Path) -> None:
+    """Drop the synthetic folder component added by directory pickers."""
+    entries = list(staging.iterdir())
+    if len(entries) != 1 or not entries[0].is_dir():
+        return
+    selected_root = entries[0]
+    children = list(selected_root.iterdir())
+    for child in children:
+        target = staging / child.name
+        if target.exists():
+            raise _UploadRejected(
+                f"上传目录中存在重复文件名：{child.name}",
+                ["请只选择一个 DICOM 序列文件夹"],
+            )
+        shutil.move(str(child), str(target))
+    selected_root.rmdir()
+
+
 def _prepare_case(case_id: str, source: Path, anonymize: bool) -> None:
     """后台执行导入质控；每个可观察阶段都实时落盘。"""
     active_stage: str | None = "import"
@@ -790,6 +1072,91 @@ async def api_pick_directory():
     return await asyncio.to_thread(_pick_directory)
 
 
+@app.post("/api/cases/upload")
+async def api_upload_case(request: Request, background_tasks: BackgroundTasks):
+    """接收公网浏览器选中的 DICOM 序列并在服务主机上启动导入。"""
+    content_type = request.headers.get("content-type", "").lower()
+    if not content_type.startswith("multipart/form-data"):
+        raise HTTPException(status_code=415, detail={
+            "error": True,
+            "status": "failed",
+            "reason": "上传请求必须使用 multipart/form-data",
+            "remediation": ["回到病例页重新选择 DICOM 文件夹"],
+        })
+    content_length = request.headers.get("content-length")
+    try:
+        declared_length = int(content_length) if content_length else None
+    except ValueError:
+        declared_length = None
+    # Allow multipart field overhead while rejecting an obviously oversized body
+    # before Starlette allocates its parser buffers.
+    if declared_length is not None and declared_length > _UPLOAD_MAX_TOTAL_BYTES + 128 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail={
+            "error": True,
+            "status": "failed",
+            "reason": f"本次上传超过 {_UPLOAD_MAX_TOTAL_BYTES // (1024 * 1024 * 1024)} GB",
+            "remediation": ["只选择一套 DICOM 序列，或分批处理"],
+        })
+
+    staging: Path | None = None
+    try:
+        # FastAPI's UploadFile dependency uses the default 1000-file parser cap;
+        # the explicit form parser keeps large CT series usable without exposing
+        # arbitrary form fields.
+        async with request.form(max_files=_UPLOAD_MAX_FILES, max_fields=8, max_part_size=_UPLOAD_MAX_FILE_BYTES) as form:
+            files = [item for item in form.getlist("files") if isinstance(item, UploadFile)]
+            raw_paths = form.get("relative_paths")
+            relative_paths = _parse_upload_paths(raw_paths, len(files))
+            synthetic = _parse_upload_bool(form.get("synthetic"), "synthetic")
+            anonymize = _parse_upload_bool(form.get("anonymize"), "anonymize")
+            staging = await asyncio.to_thread(_store_uploaded_files, files, relative_paths)
+    except _UploadRejected as exc:
+        raise HTTPException(status_code=exc.status_code, detail={
+            "error": True, "status": "failed", "reason": exc.reason, "remediation": exc.remediation,
+        }) from exc
+    except Exception as exc:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
+        raise HTTPException(status_code=400, detail={
+            "error": True,
+            "status": "failed",
+            "reason": "无法读取上传的 DICOM 文件",
+            "remediation": ["确认浏览器允许文件夹上传", "重新选择同一套 DICOM 序列后重试"],
+        }) from exc
+
+    if staging is None:
+        raise HTTPException(status_code=400, detail={
+            "error": True, "status": "failed", "reason": "没有收到 DICOM 文件",
+            "remediation": ["点击选择按钮，选择包含同一套 DICOM 序列的文件夹"],
+        })
+    case_id = None
+    try:
+        case_id = create_case("browser_upload", "<浏览器上传的 DICOM 文件夹>", synthetic=synthetic)
+        source = case_dir(case_id) / "import" / "dicom"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staging), str(source))
+        staging = None
+        update_stage(case_id, "import", "running", message="已接收上传文件，等待读取 DICOM")
+        update_job(case_id, "running", "import", "已接收上传文件，等待读取 DICOM")
+        background_tasks.add_task(_prepare_case, case_id, source, anonymize)
+    except Exception as exc:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
+        if case_id:
+            shutil.rmtree(case_dir(case_id), ignore_errors=True)
+        raise HTTPException(status_code=500, detail={
+            "error": True,
+            "status": "failed",
+            "reason": "服务端登记上传病例失败",
+            "remediation": ["检查服务主机磁盘空间后重试"],
+        }) from exc
+    return {
+        "case_id": case_id,
+        "status": "running",
+        "message": "已接收上传病例，正在执行输入质控；页面会持续更新阶段进度",
+    }
+
+
 @app.get("/api/cases")
 async def api_cases():
     return list_cases()
@@ -818,6 +1185,199 @@ async def api_create_case(body: NewCaseBody, background_tasks: BackgroundTasks):
 @app.get("/api/cases/{case_id}")
 async def api_case(case_id: str):
     return _require_case(case_id)
+
+
+def _scenario_http_error(exc: PipelineError) -> HTTPException:
+    """把方案的业务状态映射为可恢复的 HTTP 错误，不暴露本机路径。"""
+    if exc.status == "blocked":
+        status_code = 409
+    elif any(token in exc.reason for token in ("不存在", "缺失")):
+        status_code = 404
+    else:
+        status_code = 400
+    return HTTPException(status_code=status_code, detail=exc.to_dict())
+
+
+def _scenario_links(case_id: str, payload: dict) -> dict:
+    scenario_id = payload.get("scenario_id")
+    if isinstance(scenario_id, str):
+        payload = dict(payload)
+        payload["download_url"] = f"/api/cases/{case_id}/scenarios/{scenario_id}/download"
+    return payload
+
+
+@app.post("/api/cases/{case_id}/scenarios")
+async def api_create_scenario(case_id: str, request: Request):
+    """上传一个鼻塞 STL，生成原始/规范化/初始摆位版本。"""
+    _require_case(case_id)
+    content_type = request.headers.get("content-type", "").lower()
+    if not content_type.startswith("multipart/form-data"):
+        raise HTTPException(status_code=400, detail={
+            "error": True,
+            "status": "failed",
+            "reason": "鼻塞模型上传必须使用 multipart/form-data",
+            "remediation": ["选择 STL 文件并提交模型单位（mm、cm、m 或 inch）"],
+        })
+    try:
+        async with request.form(max_files=2, max_fields=4, max_part_size=plug_models.MODEL_MAX_BYTES) as form:
+            upload = form.get("model") or form.get("file")
+            unit = str(form.get("unit") or "").strip().lower()
+            if not isinstance(upload, UploadFile):
+                raise PipelineError("failed", "没有收到鼻塞 STL 文件", ["在 model 字段选择 STL 文件"])
+            if unit not in plug_models.UNIT_TO_MM:
+                raise PipelineError("failed", "鼻塞 STL 单位无效", [f"单位必须是：{', '.join(plug_models.UNIT_TO_MM)}"])
+            data = await asyncio.to_thread(upload.file.read, plug_models.MODEL_MAX_BYTES + 1)
+            if len(data) > plug_models.MODEL_MAX_BYTES:
+                raise PipelineError("failed", f"鼻塞 STL 超过 {plug_models.MODEL_MAX_BYTES // (1024 * 1024)} MB 限制", ["降低模型面数或导出较小的 STL"])
+            result = await asyncio.to_thread(scenarios.create_scenario, case_id, data, unit)
+            return _scenario_links(case_id, result)
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": True,
+            "status": "failed",
+            "reason": "读取鼻塞 STL 失败",
+            "remediation": ["确认文件未被占用且为标准三角面 STL", "重新上传后重试"],
+        }) from exc
+
+
+@app.get("/api/cases/{case_id}/scenarios")
+async def api_list_scenarios(case_id: str):
+    _require_case(case_id)
+    try:
+        return [_scenario_links(case_id, item) for item in await asyncio.to_thread(scenarios.list_scenarios, case_id)]
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+
+
+@app.get("/api/cases/{case_id}/scenarios/{scenario_id}")
+async def api_get_scenario(case_id: str, scenario_id: str):
+    _require_case(case_id)
+    try:
+        result = await asyncio.to_thread(scenarios.get_scenario, case_id, scenario_id)
+        return _scenario_links(case_id, result)
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+
+
+@app.put("/api/cases/{case_id}/scenarios/{scenario_id}/placement")
+async def api_update_scenario_placement(case_id: str, scenario_id: str, body: ScenarioPlacementBody):
+    _require_case(case_id)
+    try:
+        result = await asyncio.to_thread(
+            scenarios.update_placement,
+            case_id,
+            scenario_id,
+            body.model_dump(exclude={"expected_version"}),
+            expected_version=body.expected_version,
+        )
+        return _scenario_links(case_id, result)
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+
+
+@app.post("/api/cases/{case_id}/scenarios/{scenario_id}/review")
+async def api_review_scenario(case_id: str, scenario_id: str, body: ScenarioReviewBody):
+    _require_case(case_id)
+    try:
+        result = await asyncio.to_thread(
+            scenarios.record_review,
+            case_id,
+            scenario_id,
+            approved=body.approved,
+            reviewer_role=body.reviewer_role,
+            notes=body.notes,
+            expected_version=body.expected_version,
+        )
+        return _scenario_links(case_id, result)
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+
+
+@app.post("/api/cases/{case_id}/scenarios/{scenario_id}/cfd-prep")
+async def api_prepare_scenario_cfd(case_id: str, scenario_id: str, body: ScenarioCfdBody):
+    """为已审核摆位生成独立 CFD 算例；不覆盖基准病例算例。"""
+    _require_case(case_id)
+    try:
+        result = await asyncio.to_thread(
+            scenario_cfd.prepare_scenario, case_id, scenario_id, version=body.version,
+        )
+        return _scenario_links(case_id, result)
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+
+
+@app.post("/api/cases/{case_id}/scenarios/{scenario_id}/cfd-run")
+async def api_run_scenario_cfd(case_id: str, scenario_id: str, body: ScenarioCfdBody):
+    """提交独立鼻塞算例；求解在后台进行，避免公网请求等待 OpenFOAM。"""
+    _require_case(case_id)
+    try:
+        task = await asyncio.to_thread(
+            scenario_jobs.start,
+            case_id,
+            scenario_id,
+            backend=body.backend,
+            timeout_s=body.timeout_s,
+            version=body.version,
+        )
+        scenario_payload = await asyncio.to_thread(scenarios.get_scenario, case_id, scenario_id)
+        payload = {
+            "status": task.get("status", "queued"),
+            "task": task,
+            "scenario": _scenario_links(case_id, scenario_payload),
+        }
+        return JSONResponse(status_code=202, content=_scenario_links(case_id, payload))
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+
+
+@app.get("/api/cases/{case_id}/scenarios/{scenario_id}/cfd-status")
+async def api_scenario_cfd_status(case_id: str, scenario_id: str, version: int | None = Query(None, ge=1)):
+    _require_case(case_id)
+    try:
+        return _scenario_links(case_id, await asyncio.to_thread(scenario_cfd.get_status, case_id, scenario_id, version=version))
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+
+
+@app.get("/api/cases/{case_id}/scenarios/{scenario_id}/comparison")
+async def api_scenario_comparison(case_id: str, scenario_id: str, version: int | None = Query(None, ge=1)):
+    _require_case(case_id)
+    try:
+        result = await asyncio.to_thread(scenario_cfd.get_comparison, case_id, scenario_id, version=version)
+        selected_version = int(result.get("version")) if isinstance(result.get("version"), int) else version
+        await asyncio.to_thread(
+            scenarios.record_event,
+            case_id,
+            scenario_id,
+            "scenario_comparison_viewed",
+            {"version": selected_version, "status": result.get("status")},
+        )
+        return result
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
+
+
+@app.get("/api/cases/{case_id}/scenarios/{scenario_id}/download")
+async def api_download_scenario(
+    case_id: str,
+    scenario_id: str,
+    artifact: str = Query("bundle"),
+    version: int | None = Query(None, ge=1),
+):
+    _require_case(case_id)
+    try:
+        path, media_type, filename = await asyncio.to_thread(
+            scenarios.download_artifact,
+            case_id,
+            scenario_id,
+            artifact=artifact.strip().lower(),
+            version=version,
+        )
+        return FileResponse(path, media_type=media_type, filename=filename)
+    except PipelineError as exc:
+        raise _scenario_http_error(exc) from exc
 
 
 @app.delete("/api/cases/{case_id}")
@@ -1063,6 +1623,18 @@ async def api_save_endplanes(case_id: str, body: EndplanesBody):
         raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
 
 
+@app.post("/api/cases/{case_id}/segment/endplanes/{side}")
+async def api_save_single_endplane(case_id: str, side: str, body: SingleEndplaneBody):
+    """保存一侧端面；联合完整性在另一个端面保存后核验。"""
+    _require_case(case_id)
+    try:
+        return await asyncio.to_thread(
+            endplanes.save_single_endplane, case_id, body.scope, side, body.plane, body.mask_version,
+        )
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
+
+
 @app.post("/api/cases/{case_id}/surface")
 async def api_surface(case_id: str, body: StageBody):
     _require_case(case_id)
@@ -1240,11 +1812,20 @@ async def api_cfd_section_preview(case_id: str, body: CfdSectionPreviewBody):
     return await asyncio.to_thread(cfd_sections.preview_section, case_dir(case_id), body.position_fraction)
 
 
-@app.post("/api/cases/{case_id}/cfd-sections")
-async def api_compute_cfd_sections(case_id: str, body: CfdSectionBody):
+@app.post("/api/cases/{case_id}/cfd-sections/analyze")
+async def api_analyze_cfd_section(case_id: str, body: CfdSectionAnalysisBody):
     from pipeline import cfd_sections
     _require_section_idle(case_id)
-    return await asyncio.to_thread(cfd_sections.compute_sections, case_dir(case_id), body.model_dump())
+    return await asyncio.to_thread(cfd_sections.analyze_section, case_dir(case_id), body.position_fraction,
+                                   body.source_signature, body.geometry_signature)
+
+
+@app.post("/api/cases/{case_id}/cfd-sections")
+async def api_compute_cfd_sections(case_id: str, body: CfdSectionBody):
+    raise HTTPException(status_code=410, detail={
+        "reason": "旧版六区人工标注已停用，请使用整截面分析接口",
+        "remediation": ["拖动模型上的截面或调整滑杆，然后重新计算整截面气流"],
+    })
 
 
 @app.get("/api/cases/{case_id}/report")

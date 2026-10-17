@@ -20,6 +20,7 @@ from .cfd_validation import inspect_latest_fields, strip_comments
 from .errors import PipelineError
 
 VERSION = 1
+SECTION_ANALYSIS_VERSION = 2
 AREA_EPS_MM2 = 1e-9
 FLOW_EPS_LPM = 1e-9
 REGION_IDS = {f"{side}-{level}" for side in ("left", "right") for level in ("upper", "middle", "lower")}
@@ -130,10 +131,12 @@ def _plane(mesh, geometry: dict, fraction: float) -> dict:
     center = (points_mm.min(axis=0) + points_mm.max(axis=0)) / 2
     point = center + normal * (coordinate - center @ normal)
     return {"point_lps_mm": point.tolist(), "normal_lps": normal.tolist(), "u_lps": u.tolist(),
-            "v_lps": v.tolist(), "position_fraction": float(fraction)}
+            "v_lps": v.tolist(), "position_fraction": float(fraction),
+            "position_coordinate_mm": coordinate,
+            "position_bounds_mm": [float(projection.min()), float(projection.max())]}
 
 
-def _cut(mesh, plane: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+def _cut(mesh, plane: dict, include_vectors: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     vtk = cfd_results.vtk
     converter = vtk.vtkCellDataToPointData()
     converter.SetInputData(mesh)
@@ -165,7 +168,12 @@ def _cut(mesh, plane: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
                           for i in range(result.GetNumberOfCells()) if result.GetCell(i).GetNumberOfPoints() == 3], dtype=int)
     if not indices.size:
         raise PipelineError("failed", "截面未生成有效三角形")
-    return uv, scalar, indices, {"positions": positions.reshape(-1).tolist(), "indices": indices.reshape(-1).tolist(), "uv_mm": uv.reshape(-1).tolist()}
+    section_mesh = {"positions": positions.reshape(-1).tolist(), "indices": indices.reshape(-1).tolist(),
+                    "uv_mm": uv.reshape(-1).tolist(), "speeds": np.linalg.norm(vectors, axis=1).tolist(),
+                    "normal_velocity_mps": scalar.tolist()}
+    if include_vectors:
+        section_mesh["velocity_vectors"] = vectors.tolist()
+    return uv, scalar, indices, section_mesh
 
 
 def preview_section(case_root: Path, position_fraction: float) -> dict:
@@ -180,6 +188,100 @@ def preview_section(case_root: Path, position_fraction: float) -> dict:
     return {"status": "preview", "plane": plane, "section_mesh": section_mesh,
             "source_signature": signature, "geometry_signature": geometry_signature,
             "units": {"coordinates": "m", "uv": "mm", "flow": "L/min"}}
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float | None:
+    valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    if not valid.any():
+        return None
+    order = np.argsort(values[valid], kind="stable")
+    ordered_values = values[valid][order]
+    cumulative = np.cumsum(weights[valid][order])
+    index = int(np.searchsorted(cumulative, quantile * cumulative[-1], side="left"))
+    return float(ordered_values[min(index, len(ordered_values) - 1)])
+
+
+def _section_velocity_statistics(uv: np.ndarray, vectors: np.ndarray, indices: np.ndarray) -> dict:
+    point_speeds = np.linalg.norm(vectors, axis=1)
+    triangles = uv[indices]
+    twice_area = np.abs(
+        (triangles[:, 1, 0] - triangles[:, 0, 0]) * (triangles[:, 2, 1] - triangles[:, 0, 1])
+        - (triangles[:, 1, 1] - triangles[:, 0, 1]) * (triangles[:, 2, 0] - triangles[:, 0, 0])
+    )
+    area_mm2 = twice_area * 0.5
+    # Three symmetric barycentric samples per triangle give area-weighted estimates
+    # without treating densely tessellated regions as more important.
+    barycentric = np.asarray([[2 / 3, 1 / 6, 1 / 6], [1 / 6, 2 / 3, 1 / 6], [1 / 6, 1 / 6, 2 / 3]], dtype=float)
+    sampled_vectors = np.einsum("sc,tcd->tsd", barycentric, vectors[indices])
+    sampled_speeds = np.linalg.norm(sampled_vectors, axis=2).reshape(-1)
+    weights = np.repeat(area_mm2 / 3, 3)
+    total_area = float(area_mm2.sum())
+    mean = float(np.average(sampled_speeds, weights=weights)) if total_area > AREA_EPS_MM2 else None
+    return {
+        "min_mps": float(point_speeds.min()) if len(point_speeds) else None,
+        "mean_mps": mean,
+        "p95_mps": _weighted_quantile(sampled_speeds, weights, 0.95),
+        "max_mps": float(point_speeds.max()) if len(point_speeds) else None,
+        "sample_count": int(len(sampled_speeds)),
+        "method": "三角面内三点面积加权估计；U 由最终网格单元场插值至截面",
+    }
+
+
+def _analysis_signature(result: dict) -> str:
+    return _digest({key: value for key, value in result.items() if key != "analysis_signature"})
+
+
+def analyze_section(case_root: Path, position_fraction: float,
+                    expected_source_signature: str | None = None,
+                    expected_geometry_signature: str | None = None) -> dict:
+    """Compute and persist whole-section flux and speed statistics from the final CFD field."""
+    root = Path(case_root)
+    foam, signature, time_name = _source(root)
+    geometry, geometry_signature = _geometry(root)
+    if expected_source_signature and expected_source_signature != signature:
+        raise PipelineError("blocked", "截面位置对应的流场已更新，请重新读取后再计算")
+    if expected_geometry_signature and expected_geometry_signature != geometry_signature:
+        raise PipelineError("blocked", "截面位置对应的 CT 几何已更新，请重新读取后再计算")
+    mesh = _read_mesh(root, foam, time_name)
+    plane = _plane(mesh, geometry, position_fraction)
+    cut_uv, normal_velocity, indices, section_mesh = _cut(mesh, plane, include_vectors=True)
+    vectors = np.asarray(section_mesh.pop("velocity_vectors"), dtype=float)
+    if vectors.shape != (len(cut_uv), 3) or not np.isfinite(vectors).all():
+        raise PipelineError("failed", "截面速度向量缺失或无效，无法计算流速统计")
+    integrated = _integrate(cut_uv, normal_velocity, indices, [], plane)
+    velocity_summary = _section_velocity_statistics(cut_uv, vectors, indices)
+    reasons = ["截面位置可交互调整；速度场由单元 U 插值至切面，网格敏感性和 CFD 工程复核仍需单独完成"]
+    if integrated["totals"]["forward_lpm"] <= FLOW_EPS_LPM:
+        reasons.append("截面正向通量接近零，无法作为有效正向流量观测")
+    if integrated["totals"]["net_lpm"] <= FLOW_EPS_LPM:
+        reasons.append("截面净通量未沿 CT 前→后方向流动，请检查工况和截面方向")
+    result = {
+        "status": "ready", "analysis_type": "whole_section", "version": SECTION_ANALYSIS_VERSION,
+        "source_signature": signature, "geometry_signature": geometry_signature,
+        "plane": plane, "section_mesh": section_mesh,
+        "totals": integrated["totals"], "velocity": velocity_summary,
+        "units": {"coordinates": "m", "flow": "L/min", "area": "mm2", "velocity": "m/s"},
+        "validation": {"status": "pending", "reasons": reasons,
+                       "boundary_reference": _reference(root, integrated["totals"], time_name),
+                       "method": "cell_to_point_U; vtk_cut; triangle_area_weighted_velocity; exact_U_dot_n_flux",
+                       "timestep": time_name},
+        "inlet_condition": _inlet_condition(root),
+    }
+    result["analysis_signature"] = _analysis_signature(result)
+    if _source(root)[1] != signature or _geometry(root)[1] != geometry_signature:
+        raise PipelineError("blocked", "分析期间模型或场发生变化，结果未保存，请刷新重试")
+    folder = root / "cfd" / "sections"
+    folder.mkdir(parents=True, exist_ok=True)
+    temporary = folder / f".analysis-{secrets.token_hex(6)}.tmp"
+    target = folder / "analysis.json"
+    try:
+        temporary.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8")
+        if _source(root)[1] != signature or _geometry(root)[1] != geometry_signature:
+            raise PipelineError("blocked", "保存前模型或场发生变化，结果未发布，请刷新重试")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return result
 
 
 def _area(polygon: np.ndarray) -> float:
@@ -462,14 +564,26 @@ def get_sections(case_root: Path) -> dict:
                 "current_source_signature": source, "current_geometry_signature": geometry}
     try:
         result = _json(path)
-        annotation = result.get("annotation")
-        if (not isinstance(annotation, dict) or result.get("version") != VERSION
-                or result.get("analysis_signature") != _digest({"version": VERSION, "annotation": annotation})):
-            return {"status": "error", "reason": "已保存的截面标注与分析签名不一致，请重新计算"}
+        if result.get("analysis_type") == "whole_section":
+            if (result.get("version") != SECTION_ANALYSIS_VERSION
+                    or result.get("analysis_signature") != _analysis_signature(result)):
+                return {"status": "error", "reason": "已保存的截面统计与数据签名不一致，请重新计算"}
+        else:
+            # Keep old six-region files readable for old reports. The new UI
+            # detects the missing analysis_type and immediately replaces them
+            # with a whole-section result after the user releases the plane.
+            annotation = result.get("annotation")
+            if (not isinstance(annotation, dict) or result.get("version") != VERSION
+                    or result.get("analysis_signature") != _digest({"version": VERSION, "annotation": annotation})):
+                return {"status": "error", "reason": "已保存的截面标注与分析签名不一致，请重新计算"}
         source, geometry = _source(root)[1], _geometry(root)[1]
     except (PipelineError, OSError, ValueError, TypeError) as exc:
         return {"status": "error", "reason": str(exc)}
     if source != result.get("source_signature") or geometry != result.get("geometry_signature"):
-        return {"status": "stale", "stale": True, "reason": "求解场、网格、工况或 CT／掩膜版本变化，旧截面数值已停用", "annotation": annotation,
-                "current_source_signature": source, "current_geometry_signature": geometry}
+        return {"status": "stale", "stale": True, "reason": "求解场、网格、工况或 CT／掩膜版本变化，旧截面数值已停用",
+                "position_fraction": (result.get("plane") or {}).get("position_fraction", 0.5),
+                "current_source_signature": source, "current_geometry_signature": geometry,
+                # Preserve only the old annotation metadata for draft migration;
+                # numeric fields remain withheld until a fresh whole-section run.
+                **({"annotation": result["annotation"]} if isinstance(result.get("annotation"), dict) else {})}
     return {**result, "current_source_signature": source, "current_geometry_signature": geometry}

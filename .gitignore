@@ -1,5 +1,7 @@
 # 风见（Windcatcher）本地产物 —— 一律不入库、不外传
 .venv/
+.venv-mcp/
+.local-automation/
 __pycache__/
 *.py[cod]
 cases/
@@ -15,6 +17,7 @@ tests/phantom_ct/
 *.bak
 .design-explore/
 .local-monitor/
+.local-public/
 WORKSPACE_VERIFY_REPORT.md
 tests/cfd-source-baseline.json
 tests/results-ui-smoke.cjs

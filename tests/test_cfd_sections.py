@@ -207,6 +207,32 @@ def test_vtk_cut_uses_ct_direction_and_full_vector_dot_product(section_case):
     assert (root / "segment" / "mask.npy").read_bytes() == b"immutable mask"
 
 
+def test_whole_section_analysis_persists_flow_and_area_weighted_velocity(section_case):
+    root, _ = section_case
+    preview = cfd_sections.preview_section(root, .5)
+    result = cfd_sections.analyze_section(
+        root, .5, preview["source_signature"], preview["geometry_signature"]
+    )
+    assert result["analysis_type"] == "whole_section"
+    assert result["totals"]["area_mm2"] == pytest.approx(16)
+    assert result["totals"]["forward_lpm"] == pytest.approx(.192)
+    assert result["velocity"]["mean_mps"] == pytest.approx(np.sqrt(25.04))
+    assert result["velocity"]["p95_mps"] == pytest.approx(np.sqrt(25.04))
+    saved = cfd_sections.get_sections(root)
+    assert saved["status"] == "ready"
+    assert saved["analysis_type"] == "whole_section"
+    assert saved["analysis_signature"] == result["analysis_signature"]
+
+
+def test_whole_section_analysis_rejects_stale_source_before_cut(section_case):
+    root, _ = section_case
+    preview = cfd_sections.preview_section(root, .5)
+    with (root / "cfd" / "case_meta.json").open("a", encoding="utf-8") as handle:
+        handle.write(" ")
+    with pytest.raises(PipelineError, match="流场已更新"):
+        cfd_sections.analyze_section(root, .6, preview["source_signature"], preview["geometry_signature"])
+
+
 @pytest.mark.parametrize("relative", ["cfd/1000/U", "cfd/1000/p", "cfd/constant/polyMesh/points", "cfd/constant/polyMesh/faces", "cfd/case_meta.json"])
 def test_saved_section_becomes_stale_when_final_source_changes(section_case, relative):
     root, _ = section_case

@@ -1,0 +1,2 @@
+# Optional stdio client bridge; keep separate from the CFD runtime.
+mcp>=1.26,<2

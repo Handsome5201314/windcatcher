@@ -37,24 +37,29 @@ def test_nonfinite_and_out_of_range_section_position_rejected(value):
         server.CfdSectionPreviewBody(position_fraction=value)
 
 
-def test_sections_compute_keeps_segmentation_and_stage_untouched(result_case, monkeypatch):
-    case_id, root, _ = result_case
-    mask_before = (root / "segment/segmentation.json").read_bytes()
-    case_before = json.dumps(cases.get_case(case_id), sort_keys=True)
-    received = []
-
-    def compute(case_root, body):
-        received.append((case_root, body))
-        return {"status": "ready", "analysis_signature": "synthetic-analysis"}
-
-    monkeypatch.setattr(cfd_sections, "compute_sections", compute)
+def test_legacy_region_compute_endpoint_is_disabled(result_case):
+    case_id, _root, _ = result_case
     body = server.CfdSectionBody(plane={"position_fraction": .5}, regions=[{"id": "left-upper"}],
                                 confirmed=True, source_signature="synthetic-source", geometry_signature="synthetic-geometry")
-    result = asyncio.run(server.api_compute_cfd_sections(case_id, body))
-    assert result["status"] == "ready"
-    assert received == [(root, body.model_dump())]
-    assert (root / "segment/segmentation.json").read_bytes() == mask_before
-    assert json.dumps(cases.get_case(case_id), sort_keys=True) == case_before
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.api_compute_cfd_sections(case_id, body))
+    assert error.value.status_code == 410
+    assert "六区" in error.value.detail["reason"]
+
+
+def test_whole_section_analyze_endpoint_passes_position_and_source_signatures(result_case, monkeypatch):
+    case_id, root, _ = result_case
+    received = []
+
+    def analyze(case_root, position_fraction, source_signature, geometry_signature):
+        received.append((case_root, position_fraction, source_signature, geometry_signature))
+        return {"status": "ready", "analysis_type": "whole_section"}
+
+    monkeypatch.setattr(cfd_sections, "analyze_section", analyze)
+    body = server.CfdSectionAnalysisBody(position_fraction=.62, source_signature="source", geometry_signature="geometry")
+    result = asyncio.run(server.api_analyze_cfd_section(case_id, body))
+    assert result["analysis_type"] == "whole_section"
+    assert received == [(root, .62, "source", "geometry")]
 
 
 def test_conflicting_mutation_rejected_before_section_reader(result_case, monkeypatch):
@@ -69,13 +74,13 @@ def test_conflicting_mutation_rejected_before_section_reader(result_case, monkey
     assert "正在处理" in response.json()["reason"]
 
 
-def test_stale_preview_error_remains_observable(result_case, monkeypatch):
+def test_stale_analysis_error_remains_observable(result_case, monkeypatch):
     case_id, _root, _ = result_case
 
-    def compute(_root, _body):
+    def analyze(_root, _position, _source, _geometry):
         raise PipelineError("blocked", "截面预览已过期，请刷新")
 
-    monkeypatch.setattr(cfd_sections, "compute_sections", compute)
-    body = server.CfdSectionBody(plane={}, regions=[{}], confirmed=True, source_signature="old", geometry_signature="old")
+    monkeypatch.setattr(cfd_sections, "analyze_section", analyze)
+    body = server.CfdSectionAnalysisBody(position_fraction=.5, source_signature="old", geometry_signature="old")
     with pytest.raises(PipelineError, match="过期"):
-        asyncio.run(server.api_compute_cfd_sections(case_id, body))
+        asyncio.run(server.api_analyze_cfd_section(case_id, body))

@@ -31,6 +31,21 @@ def _plane(value: dict, name: str) -> dict:
     return {"point_lps_mm": point.tolist(), "normal_lps": normal.tolist()}
 
 
+def validate_plane_endpoint(plane: dict, side: str) -> dict:
+    """Validate one saved plane's outward direction before its peer exists."""
+    if side not in {"anterior", "posterior"}:
+        raise PipelineError("failed", "端面方向无效", ["分别选择鼻孔端或鼻咽端"])
+    name = "鼻孔端" if side == "anterior" else "鼻咽端"
+    normalized = _plane(plane, name)
+    alignment = float(np.dot(normalized["normal_lps"], ANTERIOR_LPS))
+    if (side == "anterior" and alignment <= 0.1) or (side == "posterior" and alignment >= -0.1):
+        raise PipelineError(
+            "blocked", f"{name}法向没有朝向解剖外侧",
+            ["在 3D 视窗选中当前端面并翻转或旋转方向"],
+        )
+    return normalized
+
+
 def _distance_coefficients(volume, plane: dict) -> tuple[float, np.ndarray]:
     normal = np.asarray(plane["normal_lps"], dtype=float)
     point = np.asarray(plane["point_lps_mm"], dtype=float)
@@ -64,10 +79,10 @@ def clip_mask_oblique(mask: np.ndarray, volume, anterior_plane: dict, posterior_
     return out
 
 
-def _area_estimate(mask: np.ndarray, volume, plane: dict, other: dict) -> float:
+def _area_estimate(mask: np.ndarray, volume, plane: dict, other: dict | None) -> float:
     """平面附近体素的线性加权截面积；只用于保存前技术初筛。"""
     offset, coefficients = _distance_coefficients(volume, plane)
-    other_offset, other_coefficients = _distance_coefficients(volume, other)
+    other_geometry = _distance_coefficients(volume, other) if other is not None else None
     width = float(np.abs(coefficients).sum())
     if width < 1e-8:
         raise PipelineError("failed", "CT 体素几何无效", ["核查 DICOM 几何方向与间距"])
@@ -82,8 +97,10 @@ def _area_estimate(mask: np.ndarray, volume, plane: dict, other: dict) -> float:
         near = chunk & (np.abs(distance) < width)
         if not near.any():
             continue
-        other_distance = _distances(other_offset, other_coefficients, start, stop, mask.shape)
-        near &= other_distance <= 1e-8
+        if other_geometry is not None:
+            other_offset, other_coefficients = other_geometry
+            other_distance = _distances(other_offset, other_coefficients, start, stop, mask.shape)
+            near &= other_distance <= 1e-8
         weighted_voxels += float(np.sum(np.maximum(0.0, 1.0 - np.abs(distance[near]) / width)))
     return weighted_voxels * voxel_volume / width
 
@@ -101,6 +118,39 @@ def _retained_component_touches_plane(mask: np.ndarray, volume, plane: dict) -> 
     return False
 
 
+def _planes_intersect_mask(mask: np.ndarray, volume, anterior: dict, posterior: dict) -> bool:
+    """Detect two planes crossing or getting too close inside the airway mask.
+
+    A voxel whose centre is close to both planes is a conservative indicator of
+    an internal plane intersection. The tolerance is tied to the voxel diagonal
+    so this check remains meaningful across CT resolutions.
+    """
+    source = np.asarray(mask, dtype=bool)
+    if not source.any():
+        return False
+    anterior_offset, anterior_coefficients = _distance_coefficients(volume, anterior)
+    posterior_offset, posterior_coefficients = _distance_coefficients(volume, posterior)
+    tolerance = 0.75 * float(np.linalg.norm(np.asarray(volume.spacing, dtype=float)))
+    for start in range(0, source.shape[0], 12):
+        stop = min(start + 12, source.shape[0])
+        chunk = source[start:stop]
+        if not chunk.any():
+            continue
+        anterior_distance = _distances(
+            anterior_offset, anterior_coefficients, start, stop, source.shape,
+        )
+        posterior_distance = _distances(
+            posterior_offset, posterior_coefficients, start, stop, source.shape,
+        )
+        if np.any(
+            chunk
+            & (np.abs(anterior_distance) <= tolerance)
+            & (np.abs(posterior_distance) <= tolerance)
+        ):
+            return True
+    return False
+
+
 def validate_plane_pair(
     mask: np.ndarray, volume, anterior_plane: dict, posterior_plane: dict, *, main_airway: bool,
 ) -> dict:
@@ -113,7 +163,7 @@ def validate_plane_pair(
     if anterior_alignment <= 0.1 or posterior_alignment >= -0.1:
         raise PipelineError(
             "blocked", "两张切面法向必须分别朝鼻孔外侧和鼻咽外侧",
-            ["在 3D 视窗翻转或旋转切面；箭头应指向准备删除的一侧"],
+            ["在 3D 视窗翻转或旋转切面；端面法向应指向准备删除的外侧，气流箭头仅表示进气和向肺侧流向"],
         )
     anterior_ap = float(np.dot(anterior["point_lps_mm"], forward))
     posterior_ap = float(np.dot(posterior["point_lps_mm"], forward))
@@ -128,6 +178,11 @@ def validate_plane_pair(
         working, _ = select_largest_component(source)
     else:
         working = source
+    if _planes_intersect_mask(working, volume, anterior, posterior):
+        raise PipelineError(
+            "blocked", "两张切面在气道内部相交或间距过小",
+            ["把鼻孔端和鼻咽端分别移到连续气道段后重试"],
+        )
     anterior_area = _area_estimate(working, volume, anterior, posterior)
     posterior_area = _area_estimate(working, volume, posterior, anterior)
     if anterior_area < MIN_OPENING_AREA_MM2 or posterior_area < MIN_OPENING_AREA_MM2:

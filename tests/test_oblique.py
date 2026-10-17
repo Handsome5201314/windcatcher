@@ -51,6 +51,27 @@ def test_oblique_pair_rejects_reversed_cut_normals(tube):
         oblique.validate_plane_pair(mask, volume, anterior, posterior, main_airway=True)
 
 
+@pytest.mark.parametrize("main_airway", [True, False])
+def test_oblique_pair_rejects_planes_crossing_inside_airway(tube, main_airway):
+    mask, volume, _, _ = tube
+    # Both normals point to their respective anatomical outside and the AP
+    # ordering is valid, but the two tilted planes meet inside the tube.
+    anterior = {"point_lps_mm": [9.6, 12.0, 9.6], "normal_lps": [0.4, -0.8, 0.4]}
+    posterior = {"point_lps_mm": [9.6, 15.2, 9.6], "normal_lps": [-0.4, 0.8, 0.4]}
+
+    with pytest.raises(PipelineError, match="相交|过近"):
+        oblique.validate_plane_pair(mask, volume, anterior, posterior, main_airway=main_airway)
+
+
+def test_oblique_pair_rejects_parallel_planes_with_unresolved_gap(tube):
+    mask, volume, _, _ = tube
+    anterior = {"point_lps_mm": [9.6, 12.0, 9.6], "normal_lps": [0.0, -1.0, 0.0]}
+    posterior = {"point_lps_mm": [9.6, 12.8, 9.6], "normal_lps": [0.0, 1.0, 0.0]}
+
+    with pytest.raises(PipelineError, match="间距过小"):
+        oblique.validate_plane_pair(mask, volume, anterior, posterior, main_airway=True)
+
+
 def test_oblique_surface_only_opens_at_user_planes_with_extreme_protrusion(tmp_path, monkeypatch):
     monkeypatch.setattr(cases, "CASES_DIR", tmp_path)
     case_id = cases.create_case("local_path", "<合成 CT 测试>", synthetic=False)

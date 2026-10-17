@@ -208,6 +208,23 @@ def test_region_report_keeps_unassigned_and_coverage_and_removes_stale_values(tm
     assert report._flow_split(result, False)["left_fraction"] is None
 
 
+def test_whole_section_report_exposes_area_and_velocity_without_manual_regions(tmp_path, monkeypatch):
+    from pipeline import cfd_sections
+
+    ready = {
+        "status": "ready", "analysis_type": "whole_section", "analysis_signature": "whole-analysis",
+        "totals": {"area_mm2": 42.0, "forward_lpm": 12.0, "reverse_lpm": .5, "net_lpm": 11.5},
+        "velocity": {"mean_mps": 1.2, "p95_mps": 2.1, "max_mps": 3.0},
+        "plane": {"position_fraction": .62, "position_coordinate_mm": 18.0},
+        "validation": {"status": "pending", "reasons": []}, "inlet_condition": {"description": "压力入口"},
+    }
+    monkeypatch.setattr(cfd_sections, "get_sections", lambda _root: ready)
+    result = report._region_flow(tmp_path)
+    assert result["analysis_type"] == "whole_section"
+    assert report._flow_split(result, False)["status"] == "not_available"
+    assert result["velocity"]["p95_mps"] == pytest.approx(2.1)
+
+
 def test_pressure_inlet_report_does_not_label_requested_flow(tmp_path, monkeypatch):
     from pipeline import cases
     monkeypatch.setattr("pipeline.config.CASES_DIR", tmp_path)

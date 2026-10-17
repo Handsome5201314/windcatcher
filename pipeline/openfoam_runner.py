@@ -705,12 +705,30 @@ def _read_postprocessing(case_dir: Path, fields: dict | None = None) -> dict:
     return result
 
 
-def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) -> dict:
+def run_case(
+    case_id: str,
+    backend: str | None = None,
+    timeout_s: int = 7200,
+    *,
+    cfd_dir_override: Path | None = None,
+) -> dict:
     """尝试运行求解；没有后端就返回 missing，不写任何结果文件。"""
     from .cases import case_dir, update_stage
 
     root = case_dir(case_id)
-    cfd_dir = root / "cfd"
+    cfd_dir = Path(cfd_dir_override) if cfd_dir_override is not None else root / "cfd"
+    if cfd_dir_override is not None:
+        try:
+            cfd_dir.resolve(strict=False).relative_to(root.resolve())
+        except ValueError as exc:
+            raise PipelineError("blocked", "鼻塞方案算例目录不在病例目录内", ["重新生成鼻塞方案 CFD 算例"]) from exc
+    stage_case_id = case_id if cfd_dir_override is None else None
+
+    def stage_update(status: str, *, message: str | None = None,
+                     artifacts: list[str] | None = None, data: dict | None = None) -> None:
+        if stage_case_id is None:
+            return
+        update_stage(stage_case_id, "cfd_run", status, message=message, artifacts=artifacts, data=data)
     seg_path = root / "segment" / "segmentation.json"
     if not seg_path.exists():
         raise PipelineError("blocked", "还没有分割记录，不能开始气流求解", ["先完成气道分割并人工确认"])
@@ -751,9 +769,7 @@ def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) ->
         (cfd_dir / "run_status.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        update_stage(
-            case_id,
-            "cfd_run",
+        stage_update(
             "blocked",
             message="未检测到 OpenFOAM 后端：未生成 CFD 结果",
             artifacts=["cfd/run_status.json"],
@@ -879,9 +895,7 @@ def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) ->
             payload["message"] = message
         return payload
 
-    update_stage(
-        case_id,
-        "cfd_run",
+    stage_update(
         "running",
         message=f"已选择 {chosen} 后端，准备执行 CFD 求解" + (f"（{requested_procs} 核并行）" if parallel_active else "（单进程）"),
         data={"solved": False, "backend": chosen, "current_step": None, "run_id": run_id},
@@ -943,9 +957,7 @@ def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) ->
             payload["step_elapsed_seconds"] = round(elapsed, 1)
             payload["last_output_at"] = last_output_at
             _write_status(status_path, payload)
-        update_stage(
-            case_id,
-            "cfd_run",
+        stage_update(
             "running",
             message=f"正在执行 {name}，请保持页面打开查看进度",
             data={"backend": chosen, "current_step": name, "solved": False, "run_id": run_id},
@@ -1032,9 +1044,7 @@ def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) ->
                 "remediation": [*remediation, f"日志：cfd/logs/{name}.log"],
             }
             _write_status(status_path, payload)
-            update_stage(
-                case_id,
-                "cfd_run",
+            stage_update(
                 "failed",
                 message=reason,
                 artifacts=["cfd/run_status.json"],
@@ -1069,9 +1079,7 @@ def run_case(case_id: str, backend: str | None = None, timeout_s: int = 7200) ->
         },
     }
     _write_status(status_path, payload)
-    update_stage(
-        case_id,
-        "cfd_run",
+    stage_update(
         "warn",
         message=f"求解已在 {chosen} 后端执行完毕，等待 CFD 工程师复核",
         artifacts=["cfd/run_status.json"],
@@ -1090,11 +1098,17 @@ def _case_residuals(cfd_dir: Path) -> dict:
     )
 
 
-def check_result_gate(case_id: str) -> dict:
+def check_result_gate(case_id: str, *, cfd_dir_override: Path | None = None) -> dict:
     """判断 CFD 结果是否够格进入患者报告。"""
     from .cases import case_dir
 
-    cfd_dir = case_dir(case_id) / "cfd"
+    root = case_dir(case_id)
+    cfd_dir = Path(cfd_dir_override) if cfd_dir_override is not None else root / "cfd"
+    if cfd_dir_override is not None:
+        try:
+            cfd_dir.resolve(strict=False).relative_to(root.resolve())
+        except ValueError as exc:
+            raise PipelineError("blocked", "鼻塞方案结果目录不在病例目录内", ["重新生成鼻塞方案 CFD 算例"]) from exc
     status_path = cfd_dir / "run_status.json"
     checks = []
 

@@ -351,6 +351,109 @@ def save_oblique_endplanes(
     return _persist_plan(case_id, root, scope, plan, mask_version)
 
 
+def _plane_from_index(volume, axis: int, sign: int, side: str, index: int) -> dict:
+    direction = np.asarray(volume.axis_dirs[axis], dtype=float)
+    outward = (1 if side == "anterior" else -1) * sign
+    return {
+        "point_lps_mm": (np.asarray(volume.origin, dtype=float) + index * volume.spacing[axis] * direction).tolist(),
+        "normal_lps": (direction * outward).tolist(),
+    }
+
+
+def _oblique_plan_from_existing(
+    saved: dict | None, scope: str, volume, axis: int, sign: int, view: str, mask_version: int,
+) -> dict:
+    """Keep the current peer plane while upgrading an older paired CT plan."""
+    plan = {
+        "format": "oblique_planes_v1", "scope": scope, "axis": axis, "view": view,
+        "anterior_sign": sign, "mask_version": mask_version,
+        "anterior_plane": None, "posterior_plane": None,
+    }
+    if not isinstance(saved, dict) or saved.get("mask_version") != mask_version:
+        return plan
+    if saved.get("format") == "oblique_planes_v1":
+        for side in ("anterior", "posterior"):
+            plane = saved.get(f"{side}_plane")
+            if plane is not None:
+                name = "鼻孔端" if side == "anterior" else "鼻咽端"
+                # Validate the persisted peer, but retain its exact coordinates.
+                # Re-normalizing here introduces tiny float changes every time the
+                # opposite side is saved, which makes an untouched peer appear to
+                # have changed in the client.
+                oblique._plane(plane, name)
+                plan[f"{side}_plane"] = {
+                    "point_lps_mm": list(plane["point_lps_mm"]),
+                    "normal_lps": list(plane["normal_lps"]),
+                }
+    elif saved.get("format") is None:
+        for side in ("anterior", "posterior"):
+            index = saved.get(f"{side}_index")
+            if type(index) is int and 0 <= index < volume.shape[axis]:
+                plan[f"{side}_plane"] = _plane_from_index(volume, axis, sign, side, index)
+    return plan
+
+
+def _pair_validation(plan: dict, mask: np.ndarray, volume, *, main_airway: bool) -> dict:
+    result = {**plan, "complete": False}
+    result.pop("validation_error", None)
+    if not result.get("anterior_plane") or not result.get("posterior_plane"):
+        return result
+    # 联合校验会重新归一化法向；保留保存方案中的端面 JSON，避免保存另一端
+    # 时让未修改端因浮点舍入产生无意义的变化。
+    saved_planes = {
+        "anterior_plane": result["anterior_plane"],
+        "posterior_plane": result["posterior_plane"],
+    }
+    try:
+        validation = oblique.validate_plane_pair(
+            mask, volume, result["anterior_plane"], result["posterior_plane"], main_airway=main_airway,
+        )
+    except PipelineError as exc:
+        result["validation_error"] = exc.to_dict()
+        return result
+    result.update(validation)
+    result.update(saved_planes)
+    result["complete"] = True
+    return result
+
+
+def save_single_endplane(case_id: str, scope: str, side: str, plane: dict, mask_version: int) -> dict:
+    """Save one side without discarding its peer or requiring a valid pair yet."""
+    if side not in {"anterior", "posterior"}:
+        raise PipelineError("failed", "端面方向无效", ["分别选择鼻孔端或鼻咽端"])
+    scope = _scope(scope)
+    _, root, volume, mask, axis, sign, view = _oblique_context(case_id, scope, mask_version)
+    normalized = oblique.validate_plane_endpoint(plane, side)
+    anterior = np.asarray(ANTERIOR_LPS, dtype=float)
+    plane_ap = float(np.dot(normalized["point_lps_mm"], anterior))
+    origin_ap = float(np.dot(volume.origin, anterior))
+    ap_step = float(np.dot(volume.axis_dirs[axis], anterior) * volume.spacing[axis])
+    last_ap = origin_ap + (volume.shape[axis] - 1) * ap_step
+    if not min(origin_ap, last_ap) - volume.spacing[axis] <= plane_ap <= max(origin_ap, last_ap) + volume.spacing[axis]:
+        raise PipelineError("blocked", "端面位置超出 CT 前后扫描范围", ["把当前端面移回 CT 气道范围后重试"])
+
+    working = np.asarray(mask, dtype=bool)
+    if scope == "main_airway":
+        from .surface import select_largest_component
+
+        working, _ = select_largest_component(working)
+    area = oblique._area_estimate(working, volume, normalized, None)
+    if area < MIN_OPENING_AREA_MM2:
+        name = "鼻孔端" if side == "anterior" else "鼻咽端"
+        raise PipelineError(
+            "blocked", f"{name}未形成足够大的截面", ["沿主气道移动当前端面，再单独保存"],
+            {"side": side, "area_estimate_mm2": round(area, 3), "technical_minimum_mm2": MIN_OPENING_AREA_MM2},
+        )
+
+    plan = _oblique_plan_from_existing(
+        load_plan(case_id, scope), scope, volume, axis, sign, view, mask_version,
+    )
+    plan[f"{side}_plane"] = normalized
+    plan[f"{side}_area_estimate_mm2"] = round(area, 3)
+    validated = _pair_validation(plan, working, volume, main_airway=scope == "main_airway")
+    return _persist_plan(case_id, root, scope, validated, mask_version)
+
+
 def current_plan(
     case_id: str, scope: str, segmentation: dict, volume, mask: np.ndarray,
 ) -> dict | None:
@@ -368,6 +471,19 @@ def current_plan(
              "current_mask_version": segmentation.get("mask_version")},
         )
     if plan.get("format") == "oblique_planes_v1":
+        if not plan.get("complete", True) and plan.get("validation_error"):
+            error = plan["validation_error"]
+            raise PipelineError(
+                "blocked", error.get("reason", "两个端面暂未通过联合检查"),
+                error.get("remediation") or ["分别调整并保存鼻孔端和鼻咽端后重试"],
+                {"model_scope": scope, "saved_endplanes": plan},
+            )
+        if not plan.get("anterior_plane") or not plan.get("posterior_plane"):
+            raise PipelineError(
+                "blocked", "鼻孔端和鼻咽端尚未分别保存完整",
+                ["在端面选择面板中分别选择并保存鼻孔端与鼻咽端，再联合核对"],
+                {"model_scope": scope, "saved_endplanes": plan},
+            )
         oblique.validate_plane_pair(
             mask, volume, plan.get("anterior_plane"), plan.get("posterior_plane"),
             main_airway=scope == "main_airway",

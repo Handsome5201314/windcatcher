@@ -11,10 +11,13 @@ const state = {
   mode: "3d",
   pollTimer: null,
   clientRunningStage: null,
+  uploadFiles: [],
   viewerAssetCaseId: null,
   viewerAssetMode: null,
   viewer3dCaseId: null,
   viewer3dKey: null,
+  scenarioViewers: new Set(),
+  scenarioPolls: new Map(),
   ctViewer: {
     caseId: null,
     maskKey: null,
@@ -52,9 +55,11 @@ const state = {
     profile: null,
     status: "idle",
     error: null,
+    pairError: null,
     stale: false,
     values: { anterior: null, posterior: null },
     baseline: { anterior: null, posterior: null },
+    dirtySides: { anterior: false, posterior: false },
     planes: { anterior: null, posterior: null },
     baselinePlanes: { anterior: null, posterior: null },
     mode: "anterior",
@@ -274,6 +279,14 @@ function normalizedEndplane(plane) {
   return { point_lps_mm: [...plane.point_lps_mm], normal_lps: plane.normal_lps.map((value) => value / length) };
 }
 
+function endplaneFlowDirection(side, normal) {
+  // The saved normal points toward the anatomical outside that gets clipped.
+  // Inlet air enters from the nostril, so its visible arrow is opposite that
+  // clipping normal; the nasopharyngeal outlet points toward the lung side.
+  const flowSign = side === "anterior" ? -1 : 1;
+  return normal.map((value) => value === 0 ? 0 : value * flowSign);
+}
+
 function planeFromCtIndex(profile, side, index) {
   if (!Number.isInteger(index) || index < 0 || index >= profile.count) return null;
   const direction = profile.ap_direction_lps;
@@ -310,6 +323,22 @@ function endplanePairChanged(a, b) {
     return ["point_lps_mm", "normal_lps"].some((field) =>
       a[side][field].some((value, axis) => Math.abs(value - b[side][field][axis]) > 1e-5));
   });
+}
+
+function endplaneSideChanged(planes, baselinePlanes, side) {
+  return endplanePairChanged(
+    { anterior: planes[side], posterior: null },
+    { anterior: baselinePlanes[side], posterior: null },
+  );
+}
+
+function updateEndplaneDirty() {
+  const e = state.endplanes;
+  e.dirtySides = {
+    anterior: endplaneSideChanged(e.planes, e.baselinePlanes, "anterior"),
+    posterior: endplaneSideChanged(e.planes, e.baselinePlanes, "posterior"),
+  };
+  e.dirty = e.dirtySides.anterior || e.dirtySides.posterior;
 }
 
 function endplaneBody(context = endplaneContext()) {
@@ -397,11 +426,12 @@ async function runEndplanePreview() {
 
 function updateEndplaneDraft(schedulePreview = true) {
   const e = state.endplanes;
-  e.dirty = endplanePairChanged(e.planes, e.baselinePlanes);
+  updateEndplaneDirty();
   if (e.profile) {
     for (const side of ["anterior", "posterior"]) e.values[side] = ctIndexFromPlane(e.profile, e.planes[side]);
   }
   e.error = null;
+  e.pairError = null;
   clearEndplanePreview();
   if (schedulePreview && e.planes.anterior && e.planes.posterior) scheduleEndplanePreview();
   renderEndplaneUi();
@@ -415,7 +445,7 @@ function endplaneSaved() {
     normalizedEndplane(saved.anterior_plane) && normalizedEndplane(saved.posterior_plane);
   const validOld = Number.isInteger(saved?.anterior_index) && Number.isInteger(saved?.posterior_index);
   return Boolean(context && Number.isInteger(context.version) && e.key === context.key && e.status === "ready" &&
-    e.profile?.can_save !== false && !e.stale && saved && (validNew || validOld));
+    e.profile?.can_save !== false && !e.stale && saved && saved.complete !== false && !saved.validation_error && (validNew || validOld));
 }
 
 function guardEndplaneDraft() {
@@ -428,8 +458,9 @@ function guardEndplaneDraft() {
   if (!window.confirm("鼻孔侧或鼻咽侧层面尚未保存。确定放弃这次选择吗？")) return false;
   e.values = { ...e.baseline };
   e.planes = cloneEndplanePair(e.baselinePlanes);
-  e.dirty = false;
+  updateEndplaneDirty();
   e.error = null;
+  e.pairError = e.profile?.saved?.validation_error?.reason || null;
   clearEndplanePreview();
   e.viewer?.setPlanes(e.planes, e.mode);
   renderEndplaneUi();
@@ -450,9 +481,11 @@ function resetEndplaneState() {
   e.profile = null;
   e.status = "idle";
   e.error = null;
+  e.pairError = null;
   e.stale = false;
   e.values = { anterior: null, posterior: null };
   e.baseline = { anterior: null, posterior: null };
+  e.dirtySides = { anterior: false, posterior: false };
   e.planes = { anterior: null, posterior: null };
   e.baselinePlanes = { anterior: null, posterior: null };
   e.mode = "anterior";
@@ -477,6 +510,7 @@ function syncEndplaneContext(data = state.case) {
       e.status = "idle";
       e.values = { anterior: null, posterior: null };
       e.baseline = { anterior: null, posterior: null };
+      e.dirtySides = { anterior: false, posterior: false };
       e.planes = { anterior: null, posterior: null };
       e.baselinePlanes = { anterior: null, posterior: null };
       e.dirty = false;
@@ -504,9 +538,11 @@ async function loadEndplaneProfile(context = endplaneContext(), force = false) {
   e.profile = null;
   e.status = "loading";
   e.error = null;
+  e.pairError = null;
   e.stale = false;
   e.values = { anterior: null, posterior: null };
   e.baseline = { anterior: null, posterior: null };
+  e.dirtySides = { anterior: false, posterior: false };
   e.planes = { anterior: null, posterior: null };
   e.baselinePlanes = { anterior: null, posterior: null };
   e.dirty = false;
@@ -534,6 +570,7 @@ async function loadEndplaneProfile(context = endplaneContext(), force = false) {
     const saved = profile.saved;
     e.stale = Boolean(profile.stale || saved?.stale ||
       (saved?.mask_version !== undefined && Number(saved.mask_version) !== context.version));
+    e.pairError = saved?.validation_error?.reason || null;
     if (!e.stale && saved) {
       if (saved.format === "oblique_planes_v1") {
         e.baselinePlanes = {
@@ -550,6 +587,7 @@ async function loadEndplaneProfile(context = endplaneContext(), force = false) {
       for (const side of ["anterior", "posterior"]) e.values[side] = ctIndexFromPlane(profile, e.planes[side]);
       e.baseline = { ...e.values };
     }
+    updateEndplaneDirty();
     if (e.open) loadEndplaneSelectionModel(context);
   } catch (error) {
     if (e.requestId !== requestId || endplaneContext()?.key !== context.key) return;
@@ -570,29 +608,35 @@ function endplaneArea(index) {
   return Number.isFinite(area) && area >= 0 ? area : null;
 }
 
-function endplaneValidation() {
+function endplaneValidation(side = null) {
   const e = state.endplanes;
   if (!e.profile) return "当前 CT 层面资料尚未加载";
-  const anterior = normalizedEndplane(e.planes.anterior);
-  const posterior = normalizedEndplane(e.planes.posterior);
-  if (!anterior || !posterior) return "请先在 3D 模型上分别放置鼻孔端和咽喉端裁切面";
-  const anteriorIndex = ctIndexFromPlane(e.profile, anterior);
-  const posteriorIndex = ctIndexFromPlane(e.profile, posterior);
-  if (anteriorIndex === null || posteriorIndex === null) return "端面超出 CT 前后扫描范围，请移回气道区域";
-  if ((anteriorIndex - posteriorIndex) * Number(e.profile.anterior_sign) <= 0) return "两端前后顺序不正确，请在 CT 中核对";
-  for (const [side, plane] of [["anterior", anterior], ["posterior", posterior]]) {
-    const outward = (side === "anterior" ? 1 : -1) * Number(e.profile.anterior_sign);
+  const sides = side ? [side] : ["anterior", "posterior"];
+  const planes = {};
+  const indices = {};
+  for (const current of sides) {
+    const plane = normalizedEndplane(e.planes[current]);
+    const label = current === "anterior" ? "鼻孔端" : "鼻咽端";
+    if (!plane) return `请先放置${label}裁切面`;
+    const index = ctIndexFromPlane(e.profile, plane);
+    if (index === null) return `${label}超出 CT 前后扫描范围，请移回气道区域`;
+    planes[current] = plane;
+    indices[current] = index;
+    const outward = (current === "anterior" ? 1 : -1) * Number(e.profile.anterior_sign);
     const projection = plane.normal_lps.reduce((sum, value, axis) =>
       sum + value * e.profile.ap_direction_lps[axis] * outward, 0);
     if (projection <= 0) {
-      const sideLabel = side === "anterior" ? "鼻孔端" : "咽喉端";
-      return `${sideLabel}法向朝向模型内部。请选中“选${sideLabel}”，点击“翻转当前端面方向”后再检查。`;
+      return `${label}法向朝向模型内部。请选中“选${label}”，点击“翻转裁切法向”后再检查。`;
     }
-    if (isAxialEndplane(e.profile, side, plane)) {
-      const area = endplaneArea(ctIndexFromPlane(e.profile, plane));
-      if (area === null || area < 1) return "正交端面的掩膜估算面积低于 1 mm² 技术下限，请重新放置";
+    if (isAxialEndplane(e.profile, current, plane)) {
+      const area = endplaneArea(index);
+      if (area === null || area < 1) return `${label}掩膜估算面积低于 1 mm² 技术下限，请重新放置`;
     }
   }
+  if (side) return null;
+  const anterior = planes.anterior;
+  const posterior = planes.posterior;
+  if ((indices.anterior - indices.posterior) * Number(e.profile.anterior_sign) <= 0) return "鼻孔端必须位于鼻咽端前方，请分别核实并保存两端";
   return null;
 }
 
@@ -618,14 +662,20 @@ function renderEndplaneUi(preserveNumber = null) {
   else if (context && e.status === "loading") { statusText = "读取中"; message = "正在读取当前模型范围每一层的掩膜截面积…"; }
   else if (context && e.status === "error") { statusText = "读取失败"; message = e.error || "端面数据读取失败"; }
   else if (context && e.status === "ready") {
-    statusText = e.saving ? "保存中" : e.profile?.can_save === false ? "当前不可保存" : e.dirty ? "未保存" : e.stale ? "旧设置已失效" : endplaneSaved() ? "已保存" : "待选择";
+    const saved = e.profile?.saved;
+    const savedAnterior = Boolean(saved?.anterior_plane || Number.isInteger(saved?.anterior_index));
+    const savedPosterior = Boolean(saved?.posterior_plane || Number.isInteger(saved?.posterior_index));
+    statusText = e.saving ? "保存中" : e.profile?.can_save === false ? "当前不可保存" : e.dirty ? "未保存" : e.stale ? "旧设置已失效" : e.pairError ? "两端有冲突" : endplaneSaved() ? "已保存" : savedAnterior || savedPosterior ? "已保存一端" : "待选择";
     message = e.error || e.selectionError || (e.profile?.can_save === false
       ? e.profile.message || "当前掩膜尚未满足端面保存条件，请先重新分割、清理体外空气并确认掩膜。"
       : e.stale
       ? "之前保存的端面属于旧掩膜版本，已失效；请在当前 CT 中重新选择两端。"
+      : e.pairError
+      ? `${e.pairError}；请只调整并保存冲突的那一端。`
       : e.dirty ? "所选层面尚未保存。请在 CT 中核实两端后保存。"
       : endplaneSaved() ? "当前范围的端面位置已保存；可以重新生成 STL 与几何质检。"
-      : "尚未选择裁切位置。请先在 3D 模型上点击鼻孔端和咽喉端；选中后可移动或旋转切面，再用 CT 核对。");
+      : savedAnterior !== savedPosterior ? "已保存一侧端面；请继续选择并保存另一侧，完成后才会生成模型。"
+      : "尚未选择裁切位置。请先在 3D 模型上点击鼻孔端和鼻咽端；选中后可移动或旋转切面，再用 CT 核对。");
   }
   feedback.textContent = message;
   feedback.classList.toggle("is-error", e.status === "error" || Boolean(e.error && e.status === "ready"));
@@ -655,7 +705,7 @@ function renderEndplaneUi(preserveNumber = null) {
   if (flipButton) flipButton.disabled = e.saving || !e.planes[e.mode];
   const placementStatus = $("endplane-placement-status");
   if (placementStatus) {
-    const sideLabel = e.mode === "anterior" ? "鼻孔端" : "咽喉端";
+    const sideLabel = e.mode === "anterior" ? "鼻孔端" : "鼻咽端";
     placementStatus.textContent = e.planes[e.mode]
       ? `当前编辑${sideLabel}；可拖动模型上的${e.tool === "rotate" ? "旋转" : "移动"}手柄`
       : `点击 3D 气道表面放置${sideLabel}切面`;
@@ -682,8 +732,13 @@ function renderEndplaneUi(preserveNumber = null) {
     feedback.textContent = validation;
     feedback.classList.add("is-error");
   }
-  $("endplane-save").disabled = e.saving || e.profile?.can_save === false || !e.dirty || Boolean(validation);
-  $("endplane-discard").disabled = e.saving || !e.dirty;
+  for (const side of ["anterior", "posterior"]) {
+    const sideValidation = endplaneValidation(side);
+    const saveButton = $(`endplane-${side}-save`);
+    const discardButton = $(`endplane-${side}-discard`);
+    if (saveButton) saveButton.disabled = e.saving || e.profile?.can_save === false || !e.dirtySides[side] || Boolean(sideValidation);
+    if (discardButton) discardButton.disabled = e.saving || !e.dirtySides[side];
+  }
 }
 
 function normalizedProfileDirection(profile) {
@@ -692,7 +747,7 @@ function normalizedProfileDirection(profile) {
 }
 
 function planeNormalFromObject(object) {
-  // PlaneGeometry lies in XY with its front normal on local +Z. Three.js
+  // The marker lies in XY with its front normal on local +Z. Three.js
   // getWorldDirection() reports the camera-facing -Z axis, which would flip
   // a user-rotated endplane and make the backend retain the wrong half-space.
   return new THREE.Vector3(0, 0, 1).applyQuaternion(object.getWorldQuaternion(new THREE.Quaternion())).normalize();
@@ -774,6 +829,7 @@ function createEndplaneViewer(host) {
     if (!object || !object.visible) return;
     const position = object.getWorldPosition(new THREE.Vector3());
     const normal = planeNormalFromObject(object);
+    object.userData.flow_direction_lps = endplaneFlowDirection(side, normal.toArray());
     state.endplanes.planes[side] = { point_lps_mm: position.toArray(), normal_lps: normal.toArray() };
     updateClipping();
   }
@@ -805,31 +861,103 @@ function createEndplaneViewer(host) {
     }
   }
 
+  function markerRadius(data) {
+    const index = profile ? ctIndexFromPlane(profile, data) : null;
+    const rawArea = index === null ? NaN : Number(profile?.areas_mm2?.[index]);
+    const estimated = Number.isFinite(rawArea) && rawArea > 0
+      ? Math.sqrt(rawArea / Math.PI)
+      : frameRadius * 0.055;
+    // The marker represents the local opening scale; it is deliberately capped so
+    // it cannot hide the airway or recreate the old full-frame square.
+    return Math.min(Math.max(estimated, frameRadius * 0.018), frameRadius * 0.11);
+  }
+
+  function markerPosition(side, data) {
+    const position = new THREE.Vector3(...data.point_lps_mm);
+    if (!modelMesh || !profile || !isAxialEndplane(profile, side, data)) return position;
+    // A CT-index plane uses the CT origin as its reference point, often far
+    // outside the airway. Moving its marker within the plane keeps the cut intact.
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(new THREE.Vector3(...data.normal_lps), position);
+    const bounds = new THREE.Box3().setFromObject(modelMesh);
+    const vertex = new THREE.Vector3();
+    if (!bounds.isEmpty() && plane.intersectsBox(bounds)) plane.projectPoint(bounds.getCenter(vertex), position);
+    return position;
+  }
+
   function makePlane(side, data) {
     const color = side === "anterior" ? 0x36a9ff : 0xff9c55;
-    const size = Math.max(frameRadius * 1.9, 80);
-    const material = new THREE.MeshBasicMaterial({
-      color, transparent: true, opacity: 0.22, side: THREE.DoubleSide,
+    const radius = markerRadius(data);
+    const group = new THREE.Group();
+    group.quaternion.setFromUnitVectors(
+      new THREE.Vector3(0, 0, 1), new THREE.Vector3(...data.normal_lps).normalize(),
+    );
+    const disk = new THREE.Mesh(new THREE.CircleGeometry(radius, 48), new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity: 0.14, side: THREE.DoubleSide,
       depthWrite: false,
+    }));
+    disk.renderOrder = 4;
+
+    const ringPoints = [];
+    for (let index = 0; index < 48; index += 1) {
+      const angle = (index / 48) * Math.PI * 2;
+      ringPoints.push(new THREE.Vector3(Math.cos(angle) * radius * 1.06, Math.sin(angle) * radius * 1.06, 0));
+    }
+    const ring = new THREE.LineLoop(
+      new THREE.BufferGeometry().setFromPoints(ringPoints),
+      new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.98, depthTest: false }),
+    );
+    ring.renderOrder = 6;
+
+    const arrowLength = Math.max(radius * 1.8, frameRadius * 0.045);
+    const flowDirection = endplaneFlowDirection(side, data.normal_lps);
+    const localFlowDirection = new THREE.Vector3(...flowDirection)
+      .applyQuaternion(group.quaternion.clone().invert())
+      .normalize();
+    const arrow = new THREE.ArrowHelper(
+      localFlowDirection, new THREE.Vector3(0, 0, 0),
+      arrowLength, color, Math.max(radius * 0.48, frameRadius * 0.012), Math.max(radius * 0.32, frameRadius * 0.009),
+    );
+    // ArrowHelper shares its default geometries; these clones belong to this marker.
+    arrow.line.geometry = arrow.line.geometry.clone();
+    arrow.cone.geometry = arrow.cone.geometry.clone();
+    arrow.renderOrder = 7;
+    arrow.line.material.transparent = true;
+    arrow.line.material.opacity = 0.92;
+    arrow.line.material.depthTest = false;
+    arrow.cone.material.transparent = true;
+    arrow.cone.material.opacity = 0.98;
+    arrow.cone.material.depthTest = false;
+
+    group.add(disk, ring, arrow);
+    group.renderOrder = 5;
+    group.userData = { side, radius_mm: radius, kind: "endplane-marker", flow_direction_lps: flowDirection };
+    group.position.copy(markerPosition(side, data));
+    planeGroup.add(group);
+    return group;
+  }
+
+  function disposeObject(object) {
+    object.traverse((child) => {
+      child.geometry?.dispose();
+      if (child.material) {
+        const materials = Array.isArray(child.material) ? child.material : [child.material];
+        materials.forEach((material) => material.dispose());
+      }
     });
-    const object = new THREE.Mesh(new THREE.PlaneGeometry(size, size), material);
-    object.renderOrder = 4;
-    object.userData.side = side;
-    object.position.fromArray(data.point_lps_mm);
-    object.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(...data.normal_lps).normalize());
-    planeGroup.add(object);
-    return object;
   }
 
   function setPlanes(planes, side = activeSide) {
     activeSide = side === "posterior" ? "posterior" : "anterior";
+    if (transform) {
+      transform.detach();
+      transform.visible = false;
+    }
     for (const key of ["anterior", "posterior"]) {
       const existing = planeObjects[key];
       const data = planes?.[key];
       if (existing) {
         planeGroup.remove(existing);
-        existing.geometry.dispose();
-        existing.material.dispose();
+        disposeObject(existing);
         planeObjects[key] = null;
       }
       if (data && validLpsVector(data.point_lps_mm) && validLpsVector(data.normal_lps)) {
@@ -854,7 +982,10 @@ function createEndplaneViewer(host) {
     camera.updateMatrixWorld(true);
     modelMesh.updateMatrixWorld(true);
     raycaster.setFromCamera(pointer, camera);
-    const hit = raycaster.intersectObject(modelMesh, false)[0];
+    const clippingPlanes = endplaneClippingPlanes(state.endplanes.planes);
+    const tolerance = Math.max(frameRadius * 1e-5, 0.01);
+    const hit = raycaster.intersectObject(modelMesh, false).find(({ point }) =>
+      clippingPlanes.every((plane) => plane.distanceToPoint(point) >= -tolerance));
     if (!hit || !hit.point) return;
     const direction = normalizedProfileDirection(profile);
     const outward = (activeSide === "anterior" ? 1 : -1) * Number(profile.anterior_sign || 1);
@@ -1018,8 +1149,9 @@ function setEndplaneIndex(side, index, preserveNumber = null) {
   // CT 精确调整仍然使用同一组平面数据；这样从滑块改动后保存的方案
   // 与 3D 视图、预检和后端裁切保持一致。
   e.planes[side] = e.profile ? planeFromCtIndex(e.profile, side, index) : null;
-  e.dirty = e.values.anterior !== e.baseline.anterior || e.values.posterior !== e.baseline.posterior;
+  updateEndplaneDirty();
   e.error = null;
+  e.pairError = null;
   clearEndplanePreview();
   e.viewer?.setPlanes(e.planes, e.mode);
   if (e.planes.anterior && e.planes.posterior) scheduleEndplanePreview();
@@ -1043,41 +1175,65 @@ async function jumpToEndplane(side) {
   focusStageTarget($("viewer-card"), $(`slice-range-${profile.view}`));
 }
 
-async function saveEndplanes() {
+async function saveSingleEndplane(side) {
   const e = state.endplanes;
   const context = endplaneContext();
-  if (!context || e.status !== "ready" || e.profile?.can_save === false || e.saving || !e.dirty) return;
-  const validation = endplaneValidation();
+  if (!context || !["anterior", "posterior"].includes(side) || e.status !== "ready" ||
+      e.profile?.can_save === false || e.saving || !e.dirtySides[side]) return;
+  const validation = endplaneValidation(side);
   if (validation) { e.error = validation; renderEndplaneUi(); return; }
+  const plane = normalizedEndplane(e.planes[side]);
+  if (!plane) { e.error = `${side === "anterior" ? "鼻孔端" : "鼻咽端"}尚未放置`; renderEndplaneUi(); return; }
   e.saving = true;
   e.error = null;
   renderEndplaneUi();
   let committed = false;
   try {
-    const body = endplaneBody(context) || {
-      scope: context.scope,
-      anterior_index: e.values.anterior,
-      posterior_index: e.values.posterior,
-      mask_version: context.version,
-    };
-    await api(`/api/cases/${encodeURIComponent(context.caseId)}/segment/endplanes`, {
+    const result = await api(`/api/cases/${encodeURIComponent(context.caseId)}/segment/endplanes/${side}`, {
       method: "POST",
-      body,
+      body: {
+        scope: context.scope,
+        mask_version: context.version,
+        plane,
+      },
     });
+    if (result.scope !== context.scope || result.mask_version !== context.version ||
+        result.format !== "oblique_planes_v1" || !normalizedEndplane(result[`${side}_plane`])) {
+      throw new Error("服务端没有返回可核对的当前端面保存结果");
+    }
     committed = true;
     if (state.caseId !== context.caseId) return;
-    state.case = await api(`/api/cases/${encodeURIComponent(context.caseId)}`);
+    const savedPlane = normalizedEndplane(result[`${side}_plane`]);
+    e.profile = { ...e.profile, saved: result };
+    e.baselinePlanes[side] = savedPlane;
+    e.planes[side] = cloneEndplane(savedPlane);
+    e.values[side] = ctIndexFromPlane(e.profile, savedPlane);
+    e.baseline[side] = e.values[side];
+    e.pairError = result.validation_error?.reason || null;
+    e.stale = false;
+    updateEndplaneDirty();
+    clearEndplanePreview();
+    e.viewer?.setPlanes(e.planes, e.mode);
+    if (e.planes.anterior && e.planes.posterior) scheduleEndplanePreview();
     state.viewer3dCaseId = null;
     state.viewer3dKey = null;
     state.viewer3d?.clear();
-    state.mode = "slices";
-    await loadEndplaneProfile(endplaneContext(), true);
-    if (!endplaneSaved()) throw new Error("端面已提交，但未能核对当前保存状态");
+    state.case = await api(`/api/cases/${encodeURIComponent(context.caseId)}`);
     renderCase();
-    toast("端面位置已保存；旧 STL 与 CFD 算例已失效，请重新生成模型");
+    const label = side === "anterior" ? "鼻孔端" : "鼻咽端";
+    const other = side === "anterior" ? "posterior" : "anterior";
+    if (e.dirtySides[other]) {
+      toast(`${label}已保存；另一端仍有未保存更改，请单独保存另一端`);
+    } else if (result.complete === true && !result.validation_error) {
+      toast(`${label}已保存；两端联合预检通过，可以生成 STL`);
+    } else if (result.validation_error) {
+      toast(`${label}已保存，但两端存在冲突，请调整并保存冲突的一端`, true);
+    } else {
+      toast(`${label}已保存；请继续选择并保存另一端`);
+    }
   } catch (error) {
     if (state.caseId !== context.caseId) return;
-    e.error = committed ? `位置可能已保存，但刷新状态失败：${error.detail?.reason || error.message}` :
+    e.error = committed ? `位置已保存，但刷新状态失败：${error.detail?.reason || error.message}` :
       error.detail?.reason || error.message || "保存端面位置失败";
     renderEndplaneUi();
     toast(e.error, true);
@@ -1085,6 +1241,26 @@ async function saveEndplanes() {
     e.saving = false;
     renderEndplaneUi();
   }
+}
+
+async function saveEndplanes() {
+  // 保留函数名供旧调用方兼容；新界面始终按当前编辑端面单独保存。
+  const side = state.endplanes.mode === "posterior" ? "posterior" : "anterior";
+  return saveSingleEndplane(side);
+}
+
+function discardSingleEndplane(side) {
+  const e = state.endplanes;
+  if (!["anterior", "posterior"].includes(side) || e.saving) return;
+  e.values[side] = e.baseline[side];
+  e.planes[side] = cloneEndplane(e.baselinePlanes[side]);
+  e.error = null;
+  e.pairError = e.profile?.saved?.validation_error?.reason || null;
+  updateEndplaneDirty();
+  clearEndplanePreview();
+  e.viewer?.setPlanes(e.planes, e.mode);
+  if (e.planes.anterior && e.planes.posterior) scheduleEndplanePreview();
+  renderEndplaneUi();
 }
 
 function bindEndplaneControls() {
@@ -1121,18 +1297,9 @@ function bindEndplaneControls() {
       setEndplaneIndex(side, index, side);
     });
     $(`endplane-${side}-jump`).addEventListener("click", () => jumpToEndplane(side));
+    $(`endplane-${side}-discard`).addEventListener("click", () => discardSingleEndplane(side));
+    $(`endplane-${side}-save`).addEventListener("click", () => saveSingleEndplane(side));
   }
-  $("endplane-discard").addEventListener("click", () => {
-    const e = state.endplanes;
-    e.values = { ...e.baseline };
-    e.planes = cloneEndplanePair(e.baselinePlanes);
-    e.dirty = false;
-    e.error = null;
-    clearEndplanePreview();
-    e.viewer?.setPlanes(e.planes, e.mode);
-    renderEndplaneUi();
-  });
-  $("endplane-save").addEventListener("click", saveEndplanes);
   $("endplane-retry").addEventListener("click", () => loadEndplaneProfile(endplaneContext(), true));
   $("endplane-mode-anterior").addEventListener("click", () => {
     state.endplanes.mode = "anterior";
@@ -1182,10 +1349,11 @@ function toast(message, isError = false) {
 }
 
 async function api(path, options = {}) {
+  const formData = typeof FormData !== "undefined" && options.body instanceof FormData;
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
+    headers: formData ? (options.headers || {}) : { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
-    body: options.body ? JSON.stringify(options.body) : undefined,
+    body: formData ? options.body : options.body ? JSON.stringify(options.body) : undefined,
   });
   const payload = await response.json().catch(() => ({}));
   const status = payload?.status || payload?.detail?.status;
@@ -1197,6 +1365,24 @@ async function api(path, options = {}) {
    throw Object.assign(new Error([detail.reason || "请求失败", ...(detail.remediation || [])].join("\n")), { detail });
   }
  return payload;
+}
+
+async function apiUploadCase(files, synthetic, anonymize) {
+  const form = new FormData();
+  form.append("synthetic", synthetic ? "true" : "false");
+  form.append("anonymize", anonymize ? "true" : "false");
+  const relativePaths = [];
+  for (const file of files) {
+    const raw = file.webkitRelativePath || file.name || "";
+    const parts = raw.replace(/\\/g, "/").split("/").filter(Boolean);
+    // webkitdirectory includes the selected folder as the first component;
+    // strip it so the server receives the actual sequence directory itself.
+    const relative = file.webkitRelativePath && parts.length > 1 ? parts.slice(1).join("/") : parts.join("/");
+    relativePaths.push(relative || file.name);
+    form.append("files", file, file.name || "dicom");
+  }
+  form.append("relative_paths", JSON.stringify(relativePaths));
+  return api("/api/cases/upload", { method: "POST", body: form });
 }
 
 function busy(button, isBusy) {
@@ -1796,6 +1982,9 @@ function renderEmptyCase() {
 async function selectCase(caseId) {
   if (state.caseId && !guardEndplaneDraft()) return false;
   stopCasePolling();
+  destroyScenarioViewers();
+  state.scenarioPolls.forEach((timer) => clearInterval(timer));
+  state.scenarioPolls.clear();
   state.clientRunningStage = null;
   state.maskEditor.active = false;
   state.maskEditor.stroke = null;
@@ -2253,7 +2442,10 @@ function renderMetrics(data) {
 
 /* ---------- 病例头部信息 ---------- */
 function renderCaseHead(data) {
-  $("case-sub").textContent = `${data.source_type === "synthetic" ? "合成测试数据" : "本地目录"} · ${data.created_at.slice(0, 16).replace("T", " ")}`;
+  const sourceLabel = data.source_type === "synthetic"
+    ? "合成测试数据"
+    : data.source_type === "browser_upload" ? "浏览器上传 · 服务主机处理" : "本地目录";
+  $("case-sub").textContent = `${sourceLabel} · ${data.created_at.slice(0, 16).replace("T", " ")}`;
   $("case-synthetic").hidden = !data.synthetic;
   const s = data.stages;
   let message = "等待开始。";
@@ -2457,6 +2649,431 @@ function renderCfdProgress(runStatus, stageData, status) {
   </div>`;
 }
 
+function scenarioPill(scenario) {
+  const cfd = scenario.cfd || {};
+  if (cfd.status === "solved") return ["pill-warn", "已求解 · 待复核"];
+  if (cfd.status === "prepared") return ["pill-warn", "算例已生成"];
+  if (cfd.status === "running") return ["pill-warn", "正在求解"];
+  if (cfd.status === "failed") return ["pill-fail", "求解失败"];
+  if (scenario.review?.approved) return ["pill-ok", "已审核"];
+  if (scenario.placement?.confirmed) return ["pill-warn", "待审核"];
+  return ["pill-mute", "待摆位"];
+}
+
+function scenarioVectorInputs(name, value) {
+  const values = Array.isArray(value) && value.length === 3 ? value : [0, 0, 0];
+  return `<div class="scenario-vector" role="group" aria-label="${name}">${values.map((item, index) => `<label>${["X", "Y", "Z"][index]}<input name="${name}" type="number" step="any" value="${escapeHtml(String(item))}" inputmode="decimal" /></label>`).join("")}</div>`;
+}
+
+function createScenarioViewer3d(host) {
+  if (!host || typeof THREE === "undefined" || !THREE.STLLoader || !THREE.OrbitControls) return null;
+  const width = () => host.clientWidth || 420;
+  const height = () => host.clientHeight || 300;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0d1519);
+  const camera = new THREE.PerspectiveCamera(36, width() / height(), 0.1, 1000000);
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(width(), height());
+  renderer.domElement.setAttribute("aria-label", "气道与鼻塞三维叠加预览");
+  host.replaceChildren(renderer.domElement);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x162629, 1.15));
+  const key = new THREE.DirectionalLight(0xffffff, 1.0);
+  key.position.set(1.4, 1.5, 1.1);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x70cfc0, 0.5);
+  rim.position.set(-1.2, -0.8, -1.4);
+  scene.add(rim);
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  const group = new THREE.Group();
+  scene.add(group);
+  let airway = null;
+  let plug = null;
+  let requestId = 0;
+  let disposed = false;
+
+  function disposeMesh(mesh) {
+    if (!mesh) return;
+    mesh.geometry?.dispose();
+    if (Array.isArray(mesh.material)) mesh.material.forEach((material) => material.dispose());
+    else mesh.material?.dispose();
+  }
+
+  function clearMeshes() {
+    if (airway) group.remove(airway);
+    if (plug) group.remove(plug);
+    disposeMesh(airway);
+    disposeMesh(plug);
+    airway = null;
+    plug = null;
+  }
+
+  function fit() {
+    const box = new THREE.Box3().setFromObject(group);
+    if (box.isEmpty()) return;
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const radius = Math.max(size.x, size.y, size.z) || 1;
+    controls.target.copy(center);
+    camera.position.copy(center.clone().add(new THREE.Vector3(radius * 0.9, radius * 0.55, radius * 1.15)));
+    camera.near = Math.max(0.05, radius / 10000);
+    camera.far = Math.max(100, radius * 30);
+    camera.updateProjectionMatrix();
+  }
+
+  function resize() {
+    camera.aspect = width() / height();
+    camera.updateProjectionMatrix();
+    renderer.setSize(width(), height());
+  }
+
+  function setPlacement(placement) {
+    if (!plug) return;
+    const translation = placement?.translation_mm || [0, 0, 0];
+    const rotation = placement?.rotation_deg || [0, 0, 0];
+    const scale = placement?.scale || [1, 1, 1];
+    plug.position.set(...translation.map(Number));
+    plug.rotation.order = "ZYX";
+    plug.rotation.set(...rotation.map((value) => Number(value) * Math.PI / 180));
+    plug.scale.set(...scale.map(Number));
+  }
+
+  function loadGeometry(url) {
+    return new Promise((resolve, reject) => {
+      const loader = new THREE.STLLoader();
+      loader.load(url, resolve, undefined, reject);
+    });
+  }
+
+  async function load(baseUrl, plugUrl, placement, onStatus) {
+    const currentRequest = ++requestId;
+    clearMeshes();
+    onStatus?.("正在加载气道与鼻塞模型…", false);
+    try {
+      const loaded = await Promise.allSettled([loadGeometry(baseUrl), loadGeometry(plugUrl)]);
+      const failure = loaded.find((item) => item.status === "rejected");
+      if (failure || disposed || currentRequest !== requestId) {
+        loaded.filter((item) => item.status === "fulfilled").forEach((item) => item.value.dispose());
+        if (failure) throw failure.reason;
+        return;
+      }
+      const airwayGeometry = loaded[0].value;
+      const plugGeometry = loaded[1].value;
+      airwayGeometry.computeVertexNormals();
+      plugGeometry.computeVertexNormals();
+      airway = new THREE.Mesh(airwayGeometry, new THREE.MeshPhysicalMaterial({
+        color: 0x2bb3a6, roughness: 0.28, metalness: 0, transparent: true, opacity: 0.34,
+        side: THREE.DoubleSide, depthWrite: false,
+      }));
+      plug = new THREE.Mesh(plugGeometry, new THREE.MeshStandardMaterial({
+        color: 0xe59b54, roughness: 0.32, metalness: 0.02, transparent: true, opacity: 0.96,
+      }));
+      airway.renderOrder = 1;
+      plug.renderOrder = 2;
+      group.add(airway, plug);
+      setPlacement(placement);
+      fit();
+      onStatus?.("可旋转、滚轮缩放；青色为气道，橙色为鼻塞。输入变化会实时预览。", false);
+    } catch (error) {
+      if (disposed || currentRequest !== requestId) return;
+      onStatus?.("叠加预览加载失败：请先确认当前病例已生成气道 STL。", true);
+    }
+  }
+
+  (function animate() {
+    if (disposed) return;
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }());
+  window.addEventListener("resize", resize);
+  const viewer = {
+    load,
+    setPlacement,
+    fit,
+    resize,
+    destroy() {
+      disposed = true;
+      requestId += 1;
+      window.removeEventListener("resize", resize);
+      clearMeshes();
+      controls.dispose?.();
+      renderer.dispose?.();
+      renderer.domElement.remove();
+    },
+  };
+  state.scenarioViewers.add(viewer);
+  return viewer;
+}
+
+function destroyScenarioViewers() {
+  state.scenarioViewers.forEach((viewer) => viewer.destroy?.());
+  state.scenarioViewers.clear();
+}
+
+function renderScenarioList(items) {
+  const target = $("scenario-list");
+  if (!target) return;
+  destroyScenarioViewers();
+  if (!Array.isArray(items)) throw new Error("鼻塞方案接口返回格式无效");
+  if (!items.length) {
+    target.innerHTML = `<div class="scenario-empty"><strong>还没有鼻塞方案</strong><p>上传一个 STL 后，服务会保留原始文件、毫米规范化文件和每次摆位版本。当前病例的气道基准完成后，才能生成独立 CFD 对比。</p></div>`;
+    return;
+  }
+  target.innerHTML = items.map((scenario) => {
+    const [pillClass, pillText] = scenarioPill(scenario);
+    const placement = scenario.placement || {};
+    const version = Number(scenario.current_version) || 1;
+    const reviewReady = Boolean(scenario.review?.approved && scenario.base_status === "current");
+    const cfdReady = Boolean(["prepared", "solved"].includes(scenario.cfd?.status));
+    const running = scenario.cfd?.status === "running";
+    const disabledReview = !placement.confirmed || scenario.base_status !== "current" || running;
+    const disabledCfd = !reviewReady || running;
+    return `<article class="scenario-item" data-scenario-id="${escapeHtml(scenario.scenario_id)}" data-version="${version}">
+      <div class="scenario-item-head"><div><strong>${escapeHtml(scenario.scenario_id)}</strong><span>当前版本 v${String(version).padStart(4, "0")} · ${escapeHtml(scenario.model?.unit_input || "mm")} 输入</span></div><span class="pill ${pillClass}"><i></i>${pillText}</span></div>
+      <div class="scenario-item-meta"><span>几何：${escapeHtml(scenario.model?.qc?.verdict || "未记录")}</span><span>气道基准：${escapeHtml(scenario.base_status || "未记录")}</span><span>CFD：${escapeHtml(scenario.cfd?.status || "未开始")}</span></div>
+      <div class="scenario-placement-layout"><div class="scenario-preview"><div class="scenario-preview-head"><strong>气道 × 鼻塞叠加预览</strong><span>当前版本 v${String(version).padStart(4, "0")}</span><button type="button" class="button button-quiet button-compact" data-scenario-open-preview>重置视角</button></div><div class="scenario-viewer" data-scenario-viewer></div><p class="scenario-viewer-status" data-scenario-viewer-status role="status" aria-live="polite">正在准备叠加预览…</p><div class="scenario-viewer-legend"><span><i class="scenario-airway-swatch"></i>气道</span><span><i class="scenario-plug-swatch"></i>鼻塞</span></div></div>
+        <details class="scenario-placement" ${placement.confirmed ? "" : "open"}><summary>人工核对位置与尺寸</summary>
+          <form class="scenario-placement-form" data-scenario-placement><fieldset ${running ? "disabled" : ""}>
+            <label>平移（mm）${scenarioVectorInputs("translation_mm", placement.translation_mm)}</label>
+            <label>旋转（度）${scenarioVectorInputs("rotation_deg", placement.rotation_deg)}</label>
+            <label>缩放${scenarioVectorInputs("scale", placement.scale || [1, 1, 1])}</label>
+            <div class="scenario-form-actions"><button type="submit" class="button button-primary button-compact">保存新版本</button><span>每次保存都会生成新版本，旧版本保留。</span></div>
+          </fieldset></form>
+        </details>
+      </div>
+      <div class="scenario-item-actions">
+        <input class="scenario-review-role" type="text" value="engineer" maxlength="80" aria-label="审核角色" placeholder="审核角色" />
+        <button type="button" class="button button-quiet button-compact" data-scenario-review ${disabledReview ? "disabled" : ""}>${scenario.review?.approved ? "重新审核" : "提交人工审核"}</button>
+        <button type="button" class="button button-quiet button-compact" data-scenario-prep ${disabledCfd ? "disabled" : ""}>生成独立 CFD</button>
+        <button type="button" class="button button-primary button-compact" data-scenario-run ${!cfdReady || disabledCfd ? "disabled" : ""}>求解并对比</button>
+        <a class="button button-quiet button-compact" href="${escapeHtml(scenario.download_url || "#")}">下载资产</a>
+        <button type="button" class="button button-quiet button-compact" data-scenario-comparison ${!cfdReady ? "disabled" : ""}>查看前后对比</button>
+      </div>
+      <div class="scenario-task-status" data-scenario-task-status role="status" aria-live="polite">${scenario.cfd?.status === "running" ? "鼻塞 CFD 正在后台执行，页面会自动更新状态。" : ""}</div><div class="scenario-comparison" data-scenario-comparison-output hidden aria-live="polite"></div>
+    </article>`;
+  }).join("");
+}
+
+async function loadScenarioList(caseId) {
+  const target = $("scenario-list");
+  if (!target || state.caseId !== caseId) return;
+  destroyScenarioViewers();
+  target.innerHTML = `<p class="scenario-loading" role="status">正在读取鼻塞方案记录…</p>`;
+  try {
+    const items = await api(`/api/cases/${encodeURIComponent(caseId)}/scenarios`);
+    if (state.caseId !== caseId || !$("scenario-list")) return;
+    renderScenarioList(items);
+    bindScenarioItems(caseId);
+  } catch (error) {
+    if (state.caseId !== caseId) return;
+    target.innerHTML = `<div class="scenario-error"><strong>鼻塞方案暂时无法读取</strong><p>${escapeHtml(error.detail?.reason || error.message || "请求失败")}</p><button type="button" class="button button-quiet button-compact" data-scenario-retry>重试</button></div>`;
+    target.querySelector("[data-scenario-retry]")?.addEventListener("click", () => loadScenarioList(caseId));
+  }
+}
+
+function scenarioFormVectors(form, name, fallback) {
+  const inputs = [...form.querySelectorAll(`input[name="${name}"]`)];
+  if (inputs.length !== 3) throw new Error(`${name} 需要填写 X、Y、Z 三个值`);
+  const values = inputs.map((input) => input.value.trim() === "" ? NaN : Number(input.value));
+  if (values.some((value) => !Number.isFinite(value))) throw new Error(`${name} 必须是有限数字，不能留空`);
+  return values;
+}
+
+function scenarioPlacementSignature(form) {
+  try {
+    return JSON.stringify(["translation_mm", "rotation_deg", "scale"].map((name) => scenarioFormVectors(form, name)));
+  } catch {
+    return null;
+  }
+}
+
+function syncScenarioCardActions(card, dirty) {
+  card.querySelectorAll("[data-scenario-review], [data-scenario-prep], [data-scenario-run], [data-scenario-comparison]").forEach((control) => {
+    control.disabled = control.dataset.scenarioBaseDisabled === "true" || dirty;
+  });
+}
+
+function scenarioCardAction(card, button, action) {
+  if (!card || card.dataset.busy === "true" || (button && button.disabled)) return;
+  const caseId = state.caseId;
+  const scenarioId = card.dataset.scenarioId;
+  card.dataset.busy = "true";
+  const previousDisabled = new Map([...card.querySelectorAll("button, input, select")].map((control) => [control, control.disabled]));
+  card.querySelectorAll("button, input, select").forEach((control) => { control.disabled = true; });
+  Promise.resolve().then(action)
+    .then(async () => {
+      if (state.caseId === caseId && card.isConnected && card.dataset.scenarioId === scenarioId) await loadScenarioList(caseId);
+    })
+    .catch((error) => toast(error.detail?.reason || error.message || "鼻塞方案操作失败", true))
+    .finally(() => {
+      if (card.isConnected) {
+        card.dataset.busy = "false";
+        card.querySelectorAll("button, input, select").forEach((control) => { control.disabled = previousDisabled.get(control) ?? false; });
+      }
+    });
+}
+
+function renderScenarioComparison(output, comparison) {
+  if (!output) return;
+  output.hidden = false;
+  if (!comparison || comparison.status === "missing") {
+    output.innerHTML = `<p>${escapeHtml(comparison?.reason || "尚未生成独立 CFD 结果。先点击‘求解并对比’。")}</p>`;
+    return;
+  }
+  if (["blocked", "stale", "pending_validation"].includes(comparison.status) && !comparison.baseline && !comparison.scenario) {
+    output.innerHTML = `<p>${escapeHtml(comparison.reason || "当前结果不能与基准直接比较，请重新生成并核对工况。")}</p>`;
+    return;
+  }
+  const baseline = comparison.baseline || {};
+  const scenario = comparison.scenario || {};
+  const delta = comparison.delta || {};
+  const pressureUnit = scenario.pressure_unit || baseline.pressure_unit || "";
+  const gateText = comparison.eligibility?.numeric_ok ? "数值检查暂通过，仍需网格敏感性和 CFD 工程师复核" : "数值检查未完成，不能据此判断改善";
+  output.innerHTML = `<div class="scenario-comparison-grid"><div><span>基准压降</span><strong>${fmt(baseline.delta_pressure, pressureUnit ? ` ${pressureUnit}` : "") || "未生成"}</strong></div><div><span>鼻塞压降</span><strong>${fmt(scenario.delta_pressure, pressureUnit ? ` ${pressureUnit}` : "") || "未生成"}</strong></div><div><span>压降变化</span><strong>${fmt(delta.pressure_percent, " %") || "未计算"}</strong></div><div><span>流量变化</span><strong>${fmt(delta.flow_percent, " %") || "未计算"}</strong></div></div><p>${escapeHtml(gateText)}</p><small>${escapeHtml((comparison.notes || ["未记录比较说明"])[0])}</small>`;
+}
+
+function bindScenarioItems(caseId) {
+  document.querySelectorAll(".scenario-item").forEach((card) => {
+    const scenarioId = card.dataset.scenarioId;
+    const version = Number(card.dataset.version);
+    const placementForm = card.querySelector("[data-scenario-placement]");
+    const viewerStatus = card.querySelector("[data-scenario-viewer-status]");
+    const viewerHost = card.querySelector("[data-scenario-viewer]");
+    let viewer = null;
+    try {
+      viewer = createScenarioViewer3d(viewerHost);
+    } catch {
+      if (viewerStatus) {
+        viewerStatus.textContent = "当前浏览器无法创建三维预览，请使用支持 WebGL 的浏览器；仍可保存数值摆位后审核。";
+        viewerStatus.classList.add("is-error");
+      }
+    }
+    const baseUrl = `/api/cases/${encodeURIComponent(caseId)}/model`;
+    const plugUrl = `/api/cases/${encodeURIComponent(caseId)}/scenarios/${encodeURIComponent(scenarioId)}/download?artifact=normalized&version=${version}`;
+    const currentPlacement = () => ({
+      translation_mm: scenarioFormVectors(placementForm, "translation_mm", [0, 0, 0]),
+      rotation_deg: scenarioFormVectors(placementForm, "rotation_deg", [0, 0, 0]),
+      scale: scenarioFormVectors(placementForm, "scale", [1, 1, 1]),
+    });
+    const savedPlacementSignature = scenarioPlacementSignature(placementForm);
+    card.dataset.scenarioDirty = "false";
+    card.querySelectorAll("[data-scenario-review], [data-scenario-prep], [data-scenario-run], [data-scenario-comparison]").forEach((control) => {
+      control.dataset.scenarioBaseDisabled = String(control.disabled);
+    });
+    syncScenarioCardActions(card, false);
+    const updateDirtyState = () => {
+      const dirty = scenarioPlacementSignature(placementForm) !== savedPlacementSignature;
+      card.dataset.scenarioDirty = dirty ? "true" : "false";
+      syncScenarioCardActions(card, dirty);
+      return dirty;
+    };
+    card.querySelector("[data-scenario-open-preview]")?.addEventListener("click", () => {
+      if (viewer) viewer.fit();
+      else if (viewerStatus) viewerStatus.textContent = "三维预览不可用；请核对模型状态后重试。";
+    });
+    if (viewer) {
+      viewer.load(baseUrl, plugUrl, {
+        ...currentPlacement(),
+      }, (message, failed) => {
+        if (viewerStatus) {
+          viewerStatus.textContent = message;
+          viewerStatus.classList.toggle("is-error", Boolean(failed));
+        }
+      });
+      placementForm?.querySelectorAll("input").forEach((input) => input.addEventListener("input", () => {
+        const dirty = updateDirtyState();
+        try {
+          viewer.setPlacement(currentPlacement());
+          if (viewerStatus) {
+            viewerStatus.textContent = dirty ? "当前输入尚未保存；预览已更新，保存后才会生成新版本。" : "已恢复到已保存摆位。";
+            viewerStatus.classList.remove("is-error");
+          }
+        } catch (error) {
+          if (viewerStatus) {
+            viewerStatus.textContent = error.message;
+            viewerStatus.classList.add("is-error");
+          }
+        }
+      }));
+    }
+    if (!viewer) placementForm?.querySelectorAll("input").forEach((input) => input.addEventListener("input", updateDirtyState));
+    placementForm?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      scenarioCardAction(card, event.submitter || placementForm.querySelector("button[type='submit']"), async () => {
+        await api(`/api/cases/${encodeURIComponent(caseId)}/scenarios/${encodeURIComponent(scenarioId)}/placement`, { method: "PUT", body: {
+          ...currentPlacement(),
+          expected_version: version,
+        }});
+        toast("鼻塞摆位已保存为新版本，请继续人工审核");
+      });
+    });
+    card.querySelector("[data-scenario-review]")?.addEventListener("click", (event) => scenarioCardAction(card, event.currentTarget, async () => {
+      if (card.dataset.scenarioDirty === "true") throw new Error("当前摆位尚未保存，请先点击“保存新版本”再审核");
+      const role = card.querySelector(".scenario-review-role")?.value.trim() || "engineer";
+      await api(`/api/cases/${encodeURIComponent(caseId)}/scenarios/${encodeURIComponent(scenarioId)}/review`, { method: "POST", body: { approved: true, reviewer_role: role, notes: "已在工作台人工核对摆位", expected_version: version }});
+      toast("鼻塞方案已记录人工审核");
+    }));
+    card.querySelector("[data-scenario-prep]")?.addEventListener("click", (event) => scenarioCardAction(card, event.currentTarget, async () => {
+      if (card.dataset.scenarioDirty === "true") throw new Error("当前摆位尚未保存，请先点击“保存新版本”再生成 CFD");
+      await api(`/api/cases/${encodeURIComponent(caseId)}/scenarios/${encodeURIComponent(scenarioId)}/cfd-prep`, { method: "POST", body: { version }});
+      toast("鼻塞独立 CFD 算例已生成");
+    }));
+    card.querySelector("[data-scenario-run]")?.addEventListener("click", (event) => scenarioCardAction(card, event.currentTarget, async () => {
+      if (card.dataset.scenarioDirty === "true") throw new Error("当前摆位尚未保存，请先点击“保存新版本”再求解");
+      const result = await api(`/api/cases/${encodeURIComponent(caseId)}/scenarios/${encodeURIComponent(scenarioId)}/cfd-run`, { method: "POST", body: { version }});
+      toast(`鼻塞 CFD 已提交（任务 ${result.task?.job_id || "已登记"}），计算会在后台继续`);
+      startScenarioCfdPolling(caseId, scenarioId, version);
+    }));
+    card.querySelector("[data-scenario-comparison]")?.addEventListener("click", async (event) => {
+      const output = card.querySelector("[data-scenario-comparison-output]");
+      const button = event.currentTarget;
+      busy(button, true);
+      try {
+        renderScenarioComparison(output, await api(`/api/cases/${encodeURIComponent(caseId)}/scenarios/${encodeURIComponent(scenarioId)}/comparison?version=${version}`));
+      } catch (error) {
+        renderScenarioComparison(output, { status: "blocked", reason: error.detail?.reason || error.message });
+      } finally { busy(button, false); }
+    });
+    if (card.querySelector("[data-scenario-task-status]")?.textContent.trim()) startScenarioCfdPolling(caseId, scenarioId, version);
+  });
+}
+
+function stopScenarioCfdPolling(key) {
+  const timer = state.scenarioPolls.get(key);
+  if (timer) clearInterval(timer);
+  state.scenarioPolls.delete(key);
+}
+
+function startScenarioCfdPolling(caseId, scenarioId, version) {
+  const key = `${caseId}/${scenarioId}/v${version}`;
+  stopScenarioCfdPolling(key);
+  const poll = async () => {
+    if (state.caseId !== caseId) { stopScenarioCfdPolling(key); return; }
+    const card = document.querySelector(`.scenario-item[data-scenario-id="${CSS.escape(scenarioId)}"]`);
+    const statusNode = card?.querySelector("[data-scenario-task-status]");
+    try {
+      const status = await api(`/api/cases/${encodeURIComponent(caseId)}/scenarios/${encodeURIComponent(scenarioId)}/cfd-status?version=${version}`);
+      const task = status.task || {};
+      if (statusNode) statusNode.textContent = ["queued", "running"].includes(task.status) ? (task.message || "鼻塞 CFD 正在后台执行，页面会自动更新状态。") : (task.message || "");
+      if (!["queued", "running"].includes(task.status) && ["solved", "failed", "blocked"].includes(task.status || status.status)) {
+        stopScenarioCfdPolling(key);
+        await loadScenarioList(caseId);
+      }
+    } catch (error) {
+      if (statusNode) statusNode.textContent = `任务状态读取失败：${error.detail?.reason || error.message || "请求失败"}`;
+    }
+  };
+  poll();
+  state.scenarioPolls.set(key, setInterval(poll, 2500));
+}
+
+function renderScenarioPanel(data) {
+  return `<div id="detail-scenarios" class="card scenario-panel" tabindex="-1"><div class="card-head"><div><h2>鼻塞方案闭环</h2><span class="hint">上传 → 人工摆位 → 审核 → 独立 CFD → 前后对比</span></div><span class="pill pill-mute"><i></i>研究预览</span></div><div class="card-body"><p class="scenario-intro">鼻塞实体会作为气道内独立 wall 障碍物加入网格，基准算例不会被覆盖。只有同一气道基准、同一入口工况且数值检查完成后，才会显示前后差异；工程师复核通过前不会给出医疗建议。</p><form id="scenario-upload-form" class="scenario-upload-form"><div class="scenario-upload-field"><label for="scenario-model">鼻塞 STL</label><input id="scenario-model" name="model" type="file" accept=".stl,model/stl" required /><small>仅上传患者方案资产；服务会保留原始文件、毫米规范化文件和版本记录。</small></div><div class="scenario-upload-field"><label for="scenario-unit">模型单位</label><select id="scenario-unit" name="unit"><option value="mm">mm</option><option value="cm">cm</option><option value="m">m</option><option value="inch">inch</option></select></div><button type="submit" class="button button-primary button-compact">上传鼻塞模型</button><span data-scenario-upload-status role="status" aria-live="polite"></span></form><div id="scenario-list" class="scenario-list" aria-live="polite"><p class="scenario-loading">正在读取鼻塞方案记录…</p></div></div></div>`;
+}
+
 function renderDetails(data) {
   const box = $("detail-panels");
   const parts = [];
@@ -2614,8 +3231,51 @@ function renderDetails(data) {
       </div></div>`);
   }
 
+  // 鼻塞方案是独立于基准病例的研究闭环：即使基准尚未就绪，也要展示
+  // 上传和阻断原因，让用户知道下一步缺什么；真正的 CFD 按钮由服务端状态解锁。
+  parts.push(renderScenarioPanel(data));
+
   box.innerHTML = parts.join("");
   if (["ok", "warn"].includes(s.segment.status)) bindModelScopeCard(data);
+  const scenarioUploadForm = box.querySelector("#scenario-upload-form");
+  if (scenarioUploadForm) {
+    const fileInput = scenarioUploadForm.querySelector("input[name='model']");
+    const unitInput = scenarioUploadForm.querySelector("select[name='unit']");
+    const submitButton = scenarioUploadForm.querySelector("button[type='submit']");
+    const statusNode = scenarioUploadForm.querySelector("[data-scenario-upload-status]");
+    fileInput?.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      if (statusNode) statusNode.textContent = file ? `已选择：${file.name}` : "";
+    });
+    scenarioUploadForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const file = fileInput?.files?.[0];
+      if (!file) {
+        if (statusNode) statusNode.textContent = "请选择 STL 文件";
+        fileInput?.focus();
+        return;
+      }
+      const form = new FormData();
+      form.append("model", file, file.name || "nasal-plug.stl");
+      form.append("unit", unitInput?.value || "mm");
+      busy(submitButton, true);
+      if (statusNode) statusNode.textContent = "正在上传并检查 STL…";
+      try {
+        await api(`/api/cases/${encodeURIComponent(data.case_id)}/scenarios`, { method: "POST", body: form });
+        if (fileInput) fileInput.value = "";
+        if (statusNode) statusNode.textContent = "上传完成，已建立版本 v0001";
+        toast("鼻塞模型已上传，请继续人工摆位");
+        await loadScenarioList(data.case_id);
+      } catch (error) {
+        const reason = error.detail?.reason || error.message || "鼻塞模型上传失败";
+        if (statusNode) statusNode.textContent = reason;
+        toast(reason, true);
+      } finally {
+        busy(submitButton, false);
+      }
+    });
+    loadScenarioList(data.case_id);
+  }
   const surfaceEditButton = box.querySelector("[data-surface-edit-mask]");
   const surfaceEndplanesButton = box.querySelector("[data-surface-endplanes]");
   if (surfaceEndplanesButton) surfaceEndplanesButton.addEventListener("click", () => {
@@ -2804,6 +3464,7 @@ function renderReportSummary(report, flowPayload, cfdResult) {
     : "实际入口流量尚不可用");
   const resistance = baselineFlow.resistance || {};
   const regionFlow = baselineFlow.region_flow || {};
+  const wholeSection = regionFlow.analysis_type === "whole_section";
   const solverState = run.status === "ran" ? "已执行" : run.status === "failed" ? "求解失败" : "尚未执行";
   const gateText = gate.eligible ? "已通过结果闸门，可进入工程复核。" : "尚未通过全部结果闸门；以下已显示的值仅作观测，需复核。";
   const metricSummary = (value, unit, digits = 3) => reportNumber(value) === null ? "未记录" : escapeHtml(fmt(value, unit));
@@ -2822,6 +3483,9 @@ function renderReportSummary(report, flowPayload, cfdResult) {
   const splitText = splitAvailable
     ? `左 ${metricSummary(leftRight.left_lpm, " L/min")}（${metricSummary(leftRight.left_fraction == null ? null : leftRight.left_fraction * 100, " %", 1)}），右 ${metricSummary(leftRight.right_lpm, " L/min")}（${metricSummary(leftRight.right_fraction == null ? null : leftRight.right_fraction * 100, " %", 1)}）${leftRight.status === "available_pending_validation" ? "（待复核）" : ""}`
     : escapeHtml(leftRight.reason || "未生成");
+  const sectionFlowText = wholeSection
+    ? `正向 ${metricSummary(regionFlow.totals?.forward_lpm, " L/min")}，反向 ${metricSummary(regionFlow.totals?.reverse_lpm, " L/min")}，净流量 ${metricSummary(regionFlow.totals?.net_lpm, " L/min")}`
+    : splitText;
   const baseline = `<section class="report-section" aria-labelledby="report-baseline-title">
     <div class="report-section-head"><div><h3 id="report-baseline-title">本次气流计算</h3><p>稳态吸气；指标描述当前模型和呼吸条件，仍需数值与工程复核。</p></div>${baselineStatus}</div>
     <div class="report-metric-grid">
@@ -2831,7 +3495,7 @@ function renderReportSummary(report, flowPayload, cfdResult) {
       ${reportMetric("模拟鼻阻力", resistance.status === "checked" ? metricSummary(resistance.value, " Pa·s/mL") : "未计算", resistance.reason || "当前模型压降 ÷ 实际吸气流量；数值小不代表一定更舒服")}
       ${reportMetric("速度采样摘要", baselineObserved ? distributionText(velocity, ` ${velocity.unit || "m/s"}`) : "未生成", "流线与切片采样，不能代表全鼻腔体积平均")}
       ${reportMetric("压力采样摘要", baselineObserved ? distributionText(pressure, ` ${pressure.unit || ""}`) : "未生成", "可视化采样摘要；单位独立于压降")}
-      ${reportMetric("截面左右侧正向流量", baselineObserved ? splitText : "未生成", leftRight.description || leftRight.reason || "所选截面分配，受入口边界条件约束")}
+      ${reportMetric(wholeSection ? "整截面流量" : "截面左右侧正向流量", baselineObserved ? sectionFlowText : "未生成", wholeSection ? "沿 CT 前→后方向，松手后从已有最终速度场重新积分" : (leftRight.description || leftRight.reason || "历史截面分配记录"))}
       ${reportMetric("狭窄区域", baselineObserved ? narrowText : "未生成", narrow.status === "not_available" ? "当前算例未输出沿程截面积曲线" : "")}
     </div>
     <div class="report-note"><b>当前计算状态：</b>${escapeHtml(solverState)}；${escapeHtml(gateText)}</div>
@@ -2844,11 +3508,16 @@ function renderReportSummary(report, flowPayload, cfdResult) {
       ? (regionFlow.coverage_complete === false ? "待补齐分区" : "占比不可用") : metricSummary(region.percent_of_side, " %");
     return `<tr><th scope="row">${escapeHtml(region.label || region.id)}</th><td>${metricSummary(region.forward_lpm, " L/min")}</td><td>${metricSummary(region.percent_of_section, " %")}</td><td>${sidePercent}</td></tr>`;
   }).join("");
-  const regionalSection = `<section class="report-section" aria-labelledby="report-region-title"><div class="report-section-head"><div><h3 id="report-region-title">气流经过哪里</h3><p>比例属于三维界面标出的分析截面，按正向穿越流量计算。</p></div>${reportStatus(regionFlow.status === "ready" ? "已计算 · 待复核" : "未计算", "warn")}</div>
-    ${regionalRows ? `<div class="report-region-scroll"><table class="report-region-table"><thead><tr><th scope="col">区域</th><th scope="col">正向流量</th><th scope="col">占整截面</th><th scope="col">占该侧</th></tr></thead><tbody>${regionalRows}</tbody></table></div><p>整截面正向流量 ${metricSummary(regionFlow.totals?.forward_lpm, " L/min")}；回流 ${metricSummary(regionFlow.totals?.reverse_lpm, " L/min")}；净流量 ${metricSummary(regionFlow.totals?.net_lpm, " L/min")}。未标注区保留在整截面分母中。</p>` : `<p>${escapeHtml(regionFlow.reason || "在病例流场页选择截面，人工标注左右及上／中／下区域后计算。")}</p>`}
-    <p>${escapeHtml(typeof regionFlow.inlet_condition === "string" ? regionFlow.inlet_condition : regionFlow.inlet_condition?.description || "当前左右分配受算例入口设定约束，不能直接解释为自然呼吸分配。")}</p>
-  </section>`;
-  const interpretation = `<section class="report-section"><h3>这些结果说明到哪一步</h3><p>流线只追踪部分气流，没有画线的位置也可能有气流。区域比例不代表鼻甲感觉或黏膜功能；当前模型不能据此判断治疗效果。</p><p>${escapeHtml(baselineFlow.wall_shear_stress?.reason || "壁面剪切应力 WSS 尚未形成可验证的生产结果，本轮保持缺项。")}</p><p>${escapeHtml(gateText)}</p></section>`;
+  const regionalSection = wholeSection
+    ? `<section class="report-section" aria-labelledby="report-region-title"><div class="report-section-head"><div><h3 id="report-region-title">整截面气流统计</h3><p>拖动三维模型上的截面后，在松手位置重新计算；速度统计按截面三角面面积加权。</p></div>${reportStatus(regionFlow.status === "ready" ? "已计算 · 待复核" : "未计算", "warn")}</div>
+      ${regionFlow.status === "ready" ? `<div class="report-metric-grid"><div class="report-metric"><b>位置</b><span>${metricSummary(regionFlow.plane?.position_fraction == null ? null : regionFlow.plane.position_fraction * 100, " %", 1)}</span></div><div class="report-metric"><b>面积</b><span>${metricSummary(regionFlow.totals?.area_mm2, " mm²")}</span></div><div class="report-metric"><b>速度平均 / P95 / 最大</b><span>${metricSummary(regionFlow.velocity?.mean_mps, " m/s")} / ${metricSummary(regionFlow.velocity?.p95_mps, " m/s")} / ${metricSummary(regionFlow.velocity?.max_mps, " m/s")}</span></div></div><p>正向 ${metricSummary(regionFlow.totals?.forward_lpm, " L/min")}；反向 ${metricSummary(regionFlow.totals?.reverse_lpm, " L/min")}；净流量 ${metricSummary(regionFlow.totals?.net_lpm, " L/min")}。</p>` : `<p>${escapeHtml(regionFlow.reason || "在病例流场页选择截面并重新计算。")}</p>`}
+      <p>${escapeHtml(typeof regionFlow.inlet_condition === "string" ? regionFlow.inlet_condition : regionFlow.inlet_condition?.description || "当前结果描述所选截面和当前入口工况，需结合工程复核解读。")}</p>
+    </section>`
+    : `<section class="report-section" aria-labelledby="report-region-title"><div class="report-section-head"><div><h3 id="report-region-title">历史人工分区结果</h3><p>这是旧版左右、上中下标注结果；新截面分析不再要求人工分区。</p></div>${reportStatus(regionFlow.status === "ready" ? "历史记录" : "未计算", "warn")}</div>
+      ${regionalRows ? `<div class="report-region-scroll"><table class="report-region-table"><thead><tr><th scope="col">区域</th><th scope="col">正向流量</th><th scope="col">占整截面</th><th scope="col">占该侧</th></tr></thead><tbody>${regionalRows}</tbody></table></div><p>整截面正向流量 ${metricSummary(regionFlow.totals?.forward_lpm, " L/min")}；回流 ${metricSummary(regionFlow.totals?.reverse_lpm, " L/min")}；净流量 ${metricSummary(regionFlow.totals?.net_lpm, " L/min")}。</p>` : `<p>${escapeHtml(regionFlow.reason || "尚无历史人工分区结果。")}</p>`}
+      <p>${escapeHtml(typeof regionFlow.inlet_condition === "string" ? regionFlow.inlet_condition : regionFlow.inlet_condition?.description || "历史人工分区结果仅供兼容读取。")}</p>
+    </section>`;
+  const interpretation = `<section class="report-section"><h3>这些结果说明到哪一步</h3><p>流线只追踪部分气流，没有画线的位置也可能有气流。${wholeSection ? "整截面流量和速度不能直接代表鼻甲感觉或黏膜功能。" : "历史区域比例不代表鼻甲感觉或黏膜功能。"}当前模型不能据此判断治疗效果。</p><p>${escapeHtml(baselineFlow.wall_shear_stress?.reason || "壁面剪切应力 WSS 尚未形成可验证的生产结果，本轮保持缺项。")}</p><p>${escapeHtml(gateText)}</p></section>`;
 
   const scenarios = Array.isArray(comparisonData.items) ? comparisonData.items : [];
   const comparison = scenarios.length
@@ -2883,7 +3552,7 @@ function renderReportSummary(report, flowPayload, cfdResult) {
     ${uncertaintyBody}
   </section>`;
   const comparisonDetails = scenarios.length ? `${comparisonSection}${conclusionSection}` : `<details class="report-section"><summary>后续结构方案与设计参考</summary>${comparisonSection}${conclusionSection}</details>`;
-  return `<div class="report-summary-head"><div><strong>报告摘要</strong><span>当前呼吸条件、区域流量及解释范围</span></div></div>${baseline}${regionalSection}${interpretation}${comparisonDetails}`;
+  return `<div class="report-summary-head"><div><strong>报告摘要</strong><span>当前呼吸条件、截面气流及解释范围</span></div></div>${baseline}${regionalSection}${interpretation}${comparisonDetails}`;
 }
 
 function miniMarkdown(text) {
@@ -4192,6 +4861,10 @@ $("btn-history-cases").addEventListener("click", () => {
 });
 $("btn-pick-directory").addEventListener("click", async (event) => {
   const button = event.currentTarget;
+  if (window.WindcatcherSharedAccess) {
+    $("newcase-upload").click();
+    return;
+  }
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 60_000);
   busy(button, true);
@@ -4215,6 +4888,33 @@ $("btn-pick-directory").addEventListener("click", async (event) => {
     window.clearTimeout(timeout);
     busy(button, false);
   }
+});
+$("newcase-upload").addEventListener("change", (event) => {
+  const files = Array.from(event.currentTarget.files || []);
+  state.uploadFiles = files;
+  const names = new Set(files.map((file) => {
+    const parts = String(file.webkitRelativePath || file.name || "").replace(/\\/g, "/").split("/").filter(Boolean);
+    return parts.length > 1 ? parts[0] : "";
+  }).filter(Boolean));
+  if (!files.length) {
+    $("selected-source").textContent = "尚未选择";
+    $("selected-source").classList.remove("is-selected");
+    return;
+  }
+  if (names.size > 1) {
+    state.uploadFiles = [];
+    event.currentTarget.value = "";
+    $("selected-source").textContent = "请选择单个序列文件夹";
+    $("selected-source").classList.remove("is-selected");
+    toast("一次只能上传一个 DICOM 序列文件夹", true);
+    return;
+  }
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+  const sizeLabel = totalBytes >= 1024 ** 3
+    ? `${(totalBytes / 1024 ** 3).toFixed(2)} GB`
+    : `${(totalBytes / 1024 ** 2).toFixed(0)} MB`;
+  $("selected-source").textContent = `${files.length} 个文件 · ${sizeLabel}，提交时上传`;
+  $("selected-source").classList.add("is-selected");
 });
 $("btn-edit-path").addEventListener("click", (event) => {
   const input = $("newcase-path");
@@ -4280,20 +4980,37 @@ $("case-select").addEventListener("change", (event) => {
 $("newcase-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!guardEndplaneDraft()) return;
+  const sharedAccess = typeof window !== "undefined" && window.WindcatcherSharedAccess === true;
+  const uploadFiles = sharedAccess && typeof state !== "undefined" && Array.isArray(state.uploadFiles) ? state.uploadFiles : [];
   const path = $("newcase-path").value.trim();
-  if (!path) {
+  if (sharedAccess && !uploadFiles.length) {
+    toast("请先点击“选择 DICOM 文件夹并上传”", true);
+    $("btn-pick-directory").focus();
+    return;
+  }
+  if (!sharedAccess && !path) {
     toast("请先点击“选择 DICOM 文件夹”", true);
     $("btn-pick-directory").focus();
     return;
   }
   const button = $("btn-newcase");
   busy(button, true);
+  const originalButtonText = button.textContent;
+  if (sharedAccess) button.textContent = "上传中…";
   try {
-    const result = await api("/api/cases", {
-      method: "POST",
-      body: { path, synthetic: $("newcase-synthetic").checked, anonymize: $("newcase-anonymize").checked },
-    });
+    const synthetic = $("newcase-synthetic").checked;
+    const anonymize = $("newcase-anonymize").checked;
+    const result = sharedAccess
+      ? await apiUploadCase(uploadFiles, synthetic, anonymize)
+      : await api("/api/cases", {
+        method: "POST",
+        body: { path, synthetic, anonymize },
+      });
     $("newcase-path").value = "";
+    if (sharedAccess) {
+      if (typeof state !== "undefined") state.uploadFiles = [];
+      $("newcase-upload").value = "";
+    }
     $("newcase-synthetic").checked = false;
     $("selected-source").textContent = "正在准备病例…";
     $("selected-source").classList.remove("is-selected");
@@ -4304,6 +5021,7 @@ $("newcase-form").addEventListener("submit", async (event) => {
   } catch (error) {
     toast(error.detail?.reason || "导入失败", true);
   } finally {
+    if (sharedAccess) button.textContent = originalButtonText;
     busy(button, false);
   }
 });

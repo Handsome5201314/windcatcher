@@ -25,8 +25,8 @@ _CASE_ID = re.compile(r"(?:case-\d{8}-\d{6}-[0-9a-f]{4}|synthetic(?:-[A-Za-z0-9_
 _ENUM_DETAILS = {
     "method": {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
     "outcome": {"ok", "success", "completed", "failed", "error", "blocked", "cancelled", "aborted", "pending", "running", "warn", "unknown", "invalid", "network_error"},
-    "stage": set(STAGES) | {"preview", "cfd_postprocess", "environment", "install", "ai_report", "selection", "endplanes", "viewer"},
-    "status": {"pending", "running", "ok", "warn", "failed", "blocked", "idle", "missing", "ready", "loading", "error", "saving", "cancelled", "completed", "recording", "stopped", "stale", "unavailable", "available"},
+    "stage": set(STAGES) | {"preview", "cfd_postprocess", "environment", "install", "ai_report", "selection", "endplanes", "viewer", "scenario"},
+    "status": {"pending", "running", "ok", "warn", "failed", "blocked", "idle", "missing", "ready", "loading", "error", "saving", "cancelled", "completed", "recording", "stopped", "stale", "unavailable", "available", "uploaded", "geometry_blocked", "placement_pending_review", "reviewed", "rejected"},
     "view": {"axial", "coronal", "sagittal", "3d", "none", "x", "y", "z"},
     "tool": {"paint", "erase", "translate", "rotate", "orbit", "pan", "zoom", "select", "add", "none"},
     "mode": {"3d", "slices", "anterior", "posterior", "translate", "rotate", "paint", "erase", "velocity", "pressure", "none", "mask", "model", "segment", "endplanes", "full_candidate", "main_airway", "complete_candidate", "main_nasal_airway"},
@@ -34,8 +34,8 @@ _ENUM_DETAILS = {
     "source": {"app.js", "activity-monitor.js", "cfd-viewer.js", "three.min.js", "STLLoader.js", "OrbitControls.js", "TransformControls.js", "server.py", "activity_monitor.py", "unknown", "inline"},
     "error_type": {"Error", "TypeError", "SyntaxError", "ReferenceError", "RangeError", "URIError", "EvalError", "NetworkError", "AbortError", "SecurityError", "QuotaExceededError", "DOMException", "UnhandledRejection", "UnknownError", "Exception", "RuntimeError", "ValueError", "KeyError", "OSError", "HTTPException", "PipelineError", "ValidationError", "RequestValidationError", "TimeoutError", "ConnectionError", "DatabaseError", "OperationalError", "PermissionError", "FileNotFoundError"},
 }
-_BOOL_DETAILS = {"overlay", "dirty", "checked"}
-_INTEGER_DETAILS = {"status_code", "index", "anterior_index", "posterior_index", "operation_count", "point_count", "button", "line", "column", "count", "sequence"}
+_BOOL_DETAILS = {"overlay", "dirty", "checked", "cfd_ready"}
+_INTEGER_DETAILS = {"status_code", "index", "anterior_index", "posterior_index", "operation_count", "point_count", "button", "line", "column", "count", "sequence", "version"}
 _NUMBER_DETAILS = {"duration_ms", "radius", "level", "width", "delta_x", "delta_y", "delta"}
 
 # 服务层可在请求/后台任务边界设置此上下文；事件自身显式提供的字段仍优先。
@@ -117,6 +117,13 @@ def _details(value) -> dict:
                 result[key] = item
         elif key == "client_time_ms":
             if type(item) in {int, float} and 0 <= item <= 10_000_000_000_000 and math.isfinite(item):
+                result[key] = item
+        elif key == "scenario_id":
+            identifier = _identifier(item)
+            if identifier:
+                result[key] = identifier
+        elif key == "geometry_verdict":
+            if isinstance(item, str) and item in {"pass", "warn", "failed"}:
                 result[key] = item
         elif key == "value":
             if type(item) is bool or _number(item):

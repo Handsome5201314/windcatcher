@@ -60,7 +60,11 @@ def create_case(source_type: str, source_path: str, synthetic: bool = False) -> 
         "updated_at": _now(),
         "source_type": source_type,          # local_path / direct_link / synthetic
         # 不把用户输入的绝对路径写入病例状态；路径可能包含患者姓名/住院号。
-        "source_path": "<本机 DICOM 文件夹>",
+        "source_path": {
+            "browser_upload": "<浏览器上传的 DICOM 文件夹>",
+            "direct_link": "<授权直链下载的 DICOM 文件夹>",
+            "synthetic": "<合成测试数据>",
+        }.get(source_type, "<本机 DICOM 文件夹>"),
         "synthetic": bool(synthetic),
         "stages": {
             stage: {"status": "pending", "message": "", "artifacts": [], "data": {}, "updated_at": None}

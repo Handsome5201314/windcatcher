@@ -2,8 +2,6 @@
 
 (function () {
   const COLOR_STOPS = [[0, 0.16, 0.38, 0.78], [0.25, 0.1, 0.72, 0.8], [0.5, 0.32, 0.83, 0.52], [0.75, 0.98, 0.79, 0.2], [1, 0.91, 0.23, 0.16]];
-  const REGION_COLORS = { "left-upper": 0x978de0, "left-middle": 0x4fb5ce, "left-lower": 0x60b992, "right-upper": 0xd59ac4, "right-middle": 0xe2ab66, "right-lower": 0xcf866e };
-
   function colorAt(value, range) {
     const t = Math.max(0, Math.min(1, (value - range[0]) / (range[1] - range[0] || 1)));
     let i = 1;
@@ -21,7 +19,7 @@
     if (!mesh || !isFiniteArray(mesh.positions) || mesh.positions.length % 3 || mesh.positions.length < 9) throw new Error(`${label}没有完整的三维坐标`);
     const n = mesh.positions.length / 3;
     if (mesh.indices && (!Array.isArray(mesh.indices) || mesh.indices.length % 3 || !mesh.indices.every((i) => Number.isInteger(i) && i >= 0 && i < n))) throw new Error(`${label}三角面索引无效`);
-    for (const key of ["speeds", "pressure"]) {
+    for (const key of ["speeds", "pressure", "normal_velocity_mps"]) {
       if (mesh[key] && (!isFiniteArray(mesh[key]) || mesh[key].length !== n)) throw new Error(`${label}${key}字段与网格不匹配`);
     }
   }
@@ -92,28 +90,23 @@
       this.analysisGroup = new THREE.Group();
       this.scene.add(this.analysisGroup);
       this.analysisVisible = true;
-      this.analysisMeshes = [];
+      this.analysisPlane = null;
+      this.analysisHandle = null;
+      this.analysisPlaneNormal = null;
+      this.analysisPlaneNormalValues = null;
+      this.analysisBounds = null;
+      this.analysisFraction = 0.5;
+      this.analysisPositionChange = null;
+      this.analysisPositionCommit = null;
+      this.analysisPositionCancel = null;
+      this.analysisPending = false;
+      this.analysisDragEnabled = true;
       this.analysisRaycaster = new THREE.Raycaster();
-      this.onAnalysisPointerDown = (event) => {
-        this.analysisPointer = event.isPrimary !== false && event.button === 0
-          ? { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false } : null;
-      };
-      this.onAnalysisPointerMove = (event) => {
-        const start = this.analysisPointer;
-        if (start && start.id === event.pointerId && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5) start.moved = true;
-      };
-      this.onAnalysisPointerUp = (event) => {
-        const start = this.analysisPointer;
-        this.analysisPointer = null;
-        if (!start || start.id !== event.pointerId || start.moved || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5 || !this.analysisGroup.visible || !this.onAnalysisSelect) return;
-        const rect = this.renderer.domElement.getBoundingClientRect();
-        if (!rect.width || !rect.height) return;
-        this.analysisRaycaster.setFromCamera(new THREE.Vector2((event.clientX - rect.left) / rect.width * 2 - 1, -(event.clientY - rect.top) / rect.height * 2 + 1), this.camera);
-        const hit = this.analysisRaycaster.intersectObjects(this.analysisMeshes, false)[0];
-        if (hit) this.onAnalysisSelect(hit.object.userData.regionId);
-      };
-      this.onAnalysisPointerCancel = () => { this.analysisPointer = null; };
-      for (const [name, handler] of [["pointerdown", this.onAnalysisPointerDown], ["pointermove", this.onAnalysisPointerMove], ["pointerup", this.onAnalysisPointerUp], ["pointercancel", this.onAnalysisPointerCancel]]) this.renderer.domElement.addEventListener(name, handler);
+      this.onAnalysisPointerDown = (event) => this.startAnalysisDrag(event);
+      this.onAnalysisPointerMove = (event) => this.moveAnalysisDrag(event);
+      this.onAnalysisPointerUp = (event) => this.endAnalysisDrag(event, false);
+      this.onAnalysisPointerCancel = (event) => this.endAnalysisDrag(event, true);
+      for (const [name, handler] of [["pointerdown", this.onAnalysisPointerDown], ["pointermove", this.onAnalysisPointerMove], ["pointerup", this.onAnalysisPointerUp], ["pointercancel", this.onAnalysisPointerCancel]]) this.renderer.domElement.addEventListener(name, handler, true);
       this.scene.add(new THREE.HemisphereLight(0xd7f2ee, 0x29343c, 0.85));
       const light = new THREE.DirectionalLight(0xffffff, 0.65);
       light.position.set(this.size, -this.size, this.size * 2);
@@ -241,39 +234,146 @@
         object.geometry?.dispose();
         object.material?.dispose();
       }
-      this.analysisMeshes = [];
-      this.onAnalysisSelect = null;
+      this.analysisPlane = null;
+      this.analysisHandle = null;
+      this.analysisPlaneNormal = null;
+      this.analysisPlaneNormalValues = null;
+      this.analysisBounds = null;
+      this.analysisPositionChange = null;
+      this.analysisPositionCommit = null;
+      this.analysisPositionCancel = null;
+      this.analysisPending = false;
       this.render();
     }
 
-    setAnalysisSection(result, onSelect) {
+    setAnalysisSection(result, callbacks = {}) {
       this.clearAnalysisSection();
       if (!result) return;
-      const regions = (result.region_meshes || []).filter((mesh) => mesh.positions?.length >= 9);
-      for (const mesh of regions) validateMesh(mesh, mesh.label || "分析区域");
       if (result.section_mesh?.positions?.length >= 9) {
         validateMesh(result.section_mesh, "分析截面");
-        const base = this.makeMesh(result.section_mesh, new THREE.MeshBasicMaterial({ color: 0xb5c7c5, side: THREE.DoubleSide, transparent: true, opacity: regions.length ? 0.2 : 0.72, depthWrite: false }), this.analysisGroup);
+        const hasSpeeds = Array.isArray(result.section_mesh.speeds);
+        const base = this.makeMesh(result.section_mesh, new THREE.MeshBasicMaterial({ color: hasSpeeds ? 0xffffff : 0xb5c7c5, side: THREE.DoubleSide, vertexColors: hasSpeeds, transparent: true, opacity: 0.78, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }), this.analysisGroup);
         base.renderOrder = 4;
+        if (hasSpeeds && this.ranges.velocity) this.setColors(base, result.section_mesh.speeds, this.ranges.velocity);
+        this.analysisPlane = base;
+        const point = result.plane?.point_lps_mm;
+        if (isFiniteArray(point) && point.length === 3) {
+          const marker = new THREE.Mesh(new THREE.SphereGeometry(Math.max(this.size * 0.012, 1.5), 16, 12), new THREE.MeshBasicMaterial({ color: 0xffc46b, depthTest: false }));
+          marker.position.set(point[0] - this.center.x, point[1] - this.center.y, point[2] - this.center.z);
+          marker.renderOrder = 8;
+          this.analysisGroup.add(marker);
+          this.analysisHandle = marker;
+        }
       }
-      for (const mesh of regions) {
-        const object = this.makeMesh(mesh, new THREE.MeshBasicMaterial({ color: REGION_COLORS[mesh.id] || 0xb5c7c5, side: THREE.DoubleSide, transparent: true, opacity: 0.75, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }), this.analysisGroup);
-        object.userData.regionId = mesh.id;
-        object.renderOrder = 5;
-        this.analysisMeshes.push(object);
-      }
-      this.onAnalysisSelect = onSelect;
+      this.analysisPositionChange = callbacks.onPositionChange || null;
+      this.analysisPositionCommit = callbacks.onPositionCommit || null;
+      this.analysisPositionCancel = callbacks.onPositionCancel || null;
+      this.analysisPending = false;
+      this.analysisBounds = result.plane?.position_bounds_mm;
+      this.analysisFraction = result.plane?.position_fraction ?? 0.5;
+      this.analysisPlaneNormalValues = result.plane?.normal_lps;
+      this.analysisPlaneNormal = isFiniteArray(this.analysisPlaneNormalValues) && this.analysisPlaneNormalValues.length === 3
+        ? new THREE.Vector3(...this.analysisPlaneNormalValues).normalize() : null;
       this.analysisGroup.visible = this.analysisVisible;
+      this.render();
+    }
+
+    setAnalysisPending(pending) {
+      this.analysisPending = Boolean(pending);
+      if (this.analysisPlane?.material) {
+        const colored = Boolean(this.analysisPlane.geometry.getAttribute("color"));
+        this.analysisPlane.material.opacity = this.analysisPending ? 0.32 : 0.78;
+        this.analysisPlane.material.vertexColors = !this.analysisPending && colored;
+        this.analysisPlane.material.color.set(this.analysisPending ? 0xb5c7c5 : (colored ? 0xffffff : 0xb5c7c5));
+        this.analysisPlane.material.needsUpdate = true;
+      }
       this.render();
     }
 
     setAnalysisVisible(visible) { this.analysisVisible = visible; this.analysisGroup.visible = visible; this.render(); }
 
-    selectAnalysisRegion(id) {
-      for (const object of this.analysisMeshes) {
-        object.material.opacity = object.userData.regionId === id ? 1 : 0.5;
-        object.renderOrder = object.userData.regionId === id ? 6 : 5;
-      }
+    setAnalysisBusy(busy) { this.analysisDragEnabled = !busy; if (busy) this.renderer.domElement.style.cursor = "wait"; else this.renderer.domElement.style.cursor = "grab"; }
+
+    setAnalysisPositionFraction(fraction) {
+      if (!this.analysisPlane || !this.analysisBounds || !Number.isFinite(fraction)) return;
+      const [low, high] = this.analysisBounds;
+      const next = Math.max(0.05, Math.min(0.95, fraction));
+      const delta = (next - this.analysisFraction) * (high - low);
+      const normal = this.analysisPlaneNormal;
+      if (!normal) return;
+      const shift = normal.clone().multiplyScalar(delta);
+      this.analysisPlane.position.add(shift);
+      this.analysisHandle?.position.add(shift);
+      this.analysisFraction = next;
+      this.render();
+    }
+
+    pointerRay(event) {
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+      this.analysisRaycaster.setFromCamera(new THREE.Vector2((event.clientX - rect.left) / rect.width * 2 - 1, -(event.clientY - rect.top) / rect.height * 2 + 1), this.camera);
+      return this.analysisRaycaster.ray;
+    }
+
+    startAnalysisDrag(event) {
+      if (!this.analysisDragEnabled || !this.analysisPlane || !this.analysisGroup.visible || event.isPrimary === false || event.button !== 0) return;
+      const ray = this.pointerRay(event);
+      if (!ray) return;
+      this.analysisGroup.updateMatrixWorld(true);
+      const hit = this.analysisRaycaster.intersectObject(this.analysisPlane, false)[0];
+      if (!hit) return;
+      const plane = this.analysisPlane;
+      const normal = this.analysisPlaneNormal?.clone();
+      if (!normal || normal.lengthSq() < 0.5) return;
+      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(this.camera.quaternion);
+      const screenX = normal.dot(right), screenY = normal.dot(up);
+      const projected = screenX * screenX + screenY * screenY;
+      if (projected < 1e-4) return;
+      const depth = Math.max(plane.getWorldPosition(new THREE.Vector3()).distanceTo(this.camera.position), this.size * 0.05);
+      const pixelsPerUnit = this.renderer.domElement.clientHeight / (2 * depth * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)));
+      event.preventDefault(); event.stopImmediatePropagation();
+      this.renderer.domElement.setPointerCapture?.(event.pointerId);
+      this.controls.enabled = false;
+      this.renderer.domElement.style.cursor = "grabbing";
+      this.analysisDrag = { id: event.pointerId, x: event.clientX, y: event.clientY,
+        startFraction: this.analysisFraction, startPlanePosition: plane.position.clone(),
+        startHandlePosition: this.analysisHandle?.position.clone(), normal, screenX, screenY, projected, pixelsPerUnit,
+        moved: false };
+    }
+
+    moveAnalysisDrag(event) {
+      const drag = this.analysisDrag;
+      if (!drag || drag.id !== event.pointerId || !this.analysisBounds) return;
+      event.preventDefault(); event.stopImmediatePropagation();
+      const [low, high] = this.analysisBounds;
+      const pixelShift = (event.clientX - drag.x) * drag.screenX - (event.clientY - drag.y) * drag.screenY;
+      const delta = pixelShift / (drag.pixelsPerUnit * drag.projected);
+      const fraction = Math.max(0.05, Math.min(0.95, drag.startFraction + delta / (high - low)));
+      const boundedDelta = (fraction - drag.startFraction) * (high - low);
+      this.analysisPlane.position.copy(drag.startPlanePosition).addScaledVector(drag.normal, boundedDelta);
+      if (this.analysisHandle && drag.startHandlePosition) this.analysisHandle.position.copy(drag.startHandlePosition).addScaledVector(drag.normal, boundedDelta);
+      this.analysisFraction = fraction;
+      drag.moved ||= Math.abs(fraction - drag.startFraction) > 0.001;
+      this.analysisPositionChange?.(fraction);
+      this.render();
+    }
+
+    endAnalysisDrag(event, cancelled) {
+      const drag = this.analysisDrag;
+      if (!drag || drag.id !== event.pointerId) return;
+      event.preventDefault(); event.stopImmediatePropagation();
+      this.analysisDrag = null;
+      this.controls.enabled = true;
+      this.renderer.domElement.style.cursor = "grab";
+      this.renderer.domElement.releasePointerCapture?.(event.pointerId);
+      if (cancelled) {
+        this.analysisPlane.position.copy(drag.startPlanePosition);
+        if (this.analysisHandle && drag.startHandlePosition) this.analysisHandle.position.copy(drag.startHandlePosition);
+        this.analysisFraction = drag.startFraction;
+        this.analysisPositionChange?.(drag.startFraction);
+        this.analysisPositionCancel?.();
+      } else if (drag.moved) this.analysisPositionCommit?.(this.analysisFraction);
       this.render();
     }
 
@@ -372,7 +472,7 @@
         else object.material?.dispose();
       });
       this.renderer.domElement.removeEventListener("webglcontextlost", this.onContextLost);
-      for (const [name, handler] of [["pointerdown", this.onAnalysisPointerDown], ["pointermove", this.onAnalysisPointerMove], ["pointerup", this.onAnalysisPointerUp], ["pointercancel", this.onAnalysisPointerCancel]]) this.renderer.domElement.removeEventListener(name, handler);
+      for (const [name, handler] of [["pointerdown", this.onAnalysisPointerDown], ["pointermove", this.onAnalysisPointerMove], ["pointerup", this.onAnalysisPointerUp], ["pointercancel", this.onAnalysisPointerCancel]]) this.renderer.domElement.removeEventListener(name, handler, true);
       this.renderer.dispose();
       this.renderer.forceContextLoss();
       this.container.replaceChildren();

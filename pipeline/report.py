@@ -16,6 +16,7 @@ from .openfoam_runner import check_result_gate
 
 SOURCE_LABEL = {
     "local_path": "本机本地目录",
+    "browser_upload": "浏览器上传（服务主机处理）",
     "direct_link": "授权直链（本机下载）",
     "synthetic": "合成测试数据（非患者数据）",
 }
@@ -222,14 +223,14 @@ def _resistance(flow: dict, pressure: dict) -> dict:
 
 
 def _region_flow(case_root: Path) -> dict:
-    # 分区标注独立于分割；读取器会校验场、网格、CT 几何和标注签名。
+    # 截面分析独立于分割；读取器会校验场、网格、CT 几何和结果签名。
     from .cfd_sections import get_sections
 
     sections = get_sections(case_root)
     if sections.get("status") != "ready":
-        return {"status": sections.get("status", "missing"), "reason": sections.get("reason") or "尚未确认分析截面和区域标注", "regions": [], "sides": []}
+        return {"status": sections.get("status", "missing"), "reason": sections.get("reason") or "尚未选择并计算分析截面", "regions": [], "sides": []}
     return {key: sections.get(key) for key in (
-        "status", "totals", "regions", "sides", "plane", "validation", "analysis_signature",
+        "status", "analysis_type", "totals", "velocity", "regions", "sides", "plane", "validation", "analysis_signature",
         "source_signature", "geometry_signature", "inlet_condition", "unassigned", "coverage_complete",
     )}
 
@@ -238,7 +239,9 @@ def _flow_split(region_flow: dict, eligible: bool) -> dict:
     """只从经签名核对的截面积分读取左右分配，不接受手填 inlet_split。"""
     result = {"status": "not_available", "left_lpm": None, "right_lpm": None, "left_fraction": None, "right_fraction": None}
     if region_flow.get("status") != "ready":
-        return {**result, "reason": region_flow.get("reason") or "尚未计算有效截面的左右分区流量"}
+        return {**result, "reason": region_flow.get("reason") or "尚未计算有效的截面流量"}
+    if region_flow.get("analysis_type") == "whole_section":
+        return {**result, "reason": "新整截面分析不再计算左右人工分区；如需左右比较，应在入口边界或独立物理量中核对"}
     sides = {side.get("id"): side for side in region_flow.get("sides") or [] if isinstance(side, dict)}
     left, right = sides.get("left", {}), sides.get("right", {})
     left_lpm, right_lpm = _number(left.get("forward_lpm")), _number(right.get("forward_lpm"))
@@ -262,7 +265,7 @@ def _baseline_flow_report(cfd_meta: dict | None, run_status: dict | None, gate: 
     flow = _flow_measurement(gate)
     pressure = _pressure_drop(gate)
     resistance = _resistance(flow, pressure)
-    region_flow = region_flow or {"status": "missing", "reason": "尚未确认分析截面和区域标注"}
+    region_flow = region_flow or {"status": "missing", "reason": "尚未选择并计算分析截面"}
     distribution = _distribution(payload)
     has_numeric_data = flow.get("raw_boundary_flow_m3s") is not None or pressure.get("value") is not None
     has_data = has_numeric_data or payload is not None or region_flow.get("status") == "ready"
@@ -604,25 +607,34 @@ def build_report(case_id: str) -> dict:
             lines.append(f"- 速度分布（可视化采样摘要）：最小 {_display(velocity.get('min'))}、采样平均 {_display(velocity.get('mean'))}、P95 {_display(velocity.get('p95'))}、最大 {_display(velocity.get('max'))} {velocity.get('unit', 'm/s')}（{velocity.get('sample_count')} 个采样值；非全鼻腔体积加权统计）")
         else:
             lines.append(f"- 速度分布：{velocity.get('reason') or baseline_flow.get('velocity_distribution', {}).get('reason', '未生成')}")
-        split = baseline_flow.get("left_right_flow", {})
-        if split.get("status") in {"checked", "available_pending_validation"}:
-            left_fraction = _number(split.get("left_fraction"))
-            right_fraction = _number(split.get("right_fraction"))
-            left_percent = left_fraction * 100 if left_fraction is not None else None
-            right_percent = right_fraction * 100 if right_fraction is not None else None
-            lines.append(f"- 截面左右侧正向通量：左 {_display(split.get('left_lpm'))} L/min（{_display(left_percent, 1)}%），右 {_display(split.get('right_lpm'))} L/min（{_display(right_percent, 1)}%）")
-        else:
-            lines.append(f"- 左右侧流量分配：{split.get('reason', '未生成')}")
         regions = baseline_flow.get("region_flow", {})
+        if regions.get("analysis_type") != "whole_section":
+            split = baseline_flow.get("left_right_flow", {})
+            if split.get("status") in {"checked", "available_pending_validation"}:
+                left_fraction = _number(split.get("left_fraction"))
+                right_fraction = _number(split.get("right_fraction"))
+                left_percent = left_fraction * 100 if left_fraction is not None else None
+                right_percent = right_fraction * 100 if right_fraction is not None else None
+                lines.append(f"- 截面左右侧正向通量：左 {_display(split.get('left_lpm'))} L/min（{_display(left_percent, 1)}%），右 {_display(split.get('right_lpm'))} L/min（{_display(right_percent, 1)}%）")
+            elif regions.get("status") != "ready":
+                lines.append(f"- 左右侧流量分配：{split.get('reason', '未生成')}")
         if regions.get("status") == "ready":
-            lines.append("- 上／中／下分区结果：比例按所在侧的正向穿越通量计算；漏标时不补齐或重新归一化。")
-            for region in regions.get("regions") or []:
-                percent = _number(region.get("percent_of_side"))
-                lines.append(f"  - {region.get('label', region.get('id', '区域'))}：正向 {_display(region.get('forward_lpm'))}、反向 {_display(region.get('reverse_lpm'))}、净通量 {_display(region.get('net_lpm'))} L/min；本侧占比 {_display(percent, 1)}%")
-            unassigned = regions.get("unassigned") or {}
-            lines.append(f"  - 未标注区域：正向 {_display(unassigned.get('forward_lpm'))}、反向 {_display(unassigned.get('reverse_lpm'))}、净通量 {_display(unassigned.get('net_lpm'))} L/min；占整个截面 {_display(unassigned.get('percent_of_section'), 1)}%")
-            if not regions.get("coverage_complete"):
-                lines.append("  - 截面标注覆盖不完整，上／中／下的本侧占比暂不可用。")
+            if regions.get("analysis_type") == "whole_section":
+                totals = regions.get("totals") or {}
+                velocity = regions.get("velocity") or {}
+                plane = regions.get("plane") or {}
+                lines.append(f"- 整截面分析：位置 {_display(_number(plane.get('position_fraction')) * 100 if _number(plane.get('position_fraction')) is not None else None, 1)}%，坐标 {_display(plane.get('position_coordinate_mm'))} mm，面积 {_display(totals.get('area_mm2'))} mm²。")
+                lines.append(f"- 整截面流量：正向 {_display(totals.get('forward_lpm'))}、反向 {_display(totals.get('reverse_lpm'))}、净流量 {_display(totals.get('net_lpm'))} L/min。")
+                lines.append(f"- 整截面速度：面积加权平均 {_display(velocity.get('mean_mps'))}、P95 {_display(velocity.get('p95_mps'))}、最大 {_display(velocity.get('max_mps'))} m/s。")
+            else:
+                lines.append("- 历史左右及上／中／下人工分区结果（仅为旧版截面记录）：比例按所在侧的正向穿越通量计算；漏标时不补齐或重新归一化。")
+                for region in regions.get("regions") or []:
+                    percent = _number(region.get("percent_of_side"))
+                    lines.append(f"  - {region.get('label', region.get('id', '区域'))}：正向 {_display(region.get('forward_lpm'))}、反向 {_display(region.get('reverse_lpm'))}、净通量 {_display(region.get('net_lpm'))} L/min；本侧占比 {_display(percent, 1)}%")
+                unassigned = regions.get("unassigned") or {}
+                lines.append(f"  - 未标注区域：正向 {_display(unassigned.get('forward_lpm'))}、反向 {_display(unassigned.get('reverse_lpm'))}、净通量 {_display(unassigned.get('net_lpm'))} L/min；占整个截面 {_display(unassigned.get('percent_of_section'), 1)}%")
+                if not regions.get("coverage_complete"):
+                    lines.append("  - 截面标注覆盖不完整，上／中／下的本侧占比暂不可用。")
             inlet_condition = regions.get("inlet_condition") or {}
             if inlet_condition.get("description"):
                 lines.append(f"  - 入口工况：{inlet_condition['description']}")

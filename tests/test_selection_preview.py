@@ -259,6 +259,91 @@ def _sample_planes():
     )
 
 
+def test_single_endplane_can_be_saved_before_the_other_and_blocks_modeling(confirmed_case):
+    case_id, root, seg = confirmed_case
+    anterior, posterior = _sample_planes()
+    first = endplanes.save_single_endplane(case_id, "main_airway", "anterior", anterior, 3)
+    assert first["anterior_plane"]["point_lps_mm"] == anterior["point_lps_mm"]
+    assert first["posterior_plane"] is None
+    assert first["complete"] is False
+    assert endplanes.get_endplanes(case_id)["saved"]["anterior_plane"] == first["anterior_plane"]
+    from pipeline.volume import load_volume
+    with pytest.raises(PipelineError, match="尚未.*保存|联合检查"):
+        endplanes.current_plan(case_id, "main_airway", seg, load_volume(case_id), np.load(root / "segment" / "mask.npy"))
+    second = endplanes.save_single_endplane(case_id, "main_airway", "posterior", posterior, 3)
+    assert second["anterior_plane"] == first["anterior_plane"]
+    assert second["posterior_plane"] == posterior
+    assert second["complete"] is True
+
+
+@pytest.mark.parametrize("side", ["anterior", "posterior"])
+def test_saving_one_end_does_not_replace_the_saved_opposite_end(confirmed_case, side):
+    case_id, _root, _seg = confirmed_case
+    anterior, posterior = _sample_planes()
+    original = endplanes.save_oblique_endplanes(case_id, "main_airway", anterior, posterior, 3)
+    replacement = {"point_lps_mm": [12.0, -10.0 if side == "anterior" else 5.0, 30.0], "normal_lps": [0.0, -1.0 if side == "anterior" else 1.0, 0.0]}
+    saved = endplanes.save_single_endplane(case_id, "main_airway", side, replacement, 3)
+    opposite = "posterior" if side == "anterior" else "anterior"
+    assert saved[f"{opposite}_plane"] == original[f"{opposite}_plane"]
+    assert saved[f"{side}_plane"] == replacement
+    assert saved["complete"] is True
+
+
+def test_independent_save_records_pair_conflict_without_losing_either_end(confirmed_case):
+    case_id, _root, _seg = confirmed_case
+    anterior, posterior = _sample_planes()
+    endplanes.save_single_endplane(case_id, "main_airway", "anterior", anterior, 3)
+    crossing = {**posterior, "point_lps_mm": [12.0, -14.0, 30.0]}
+    saved = endplanes.save_single_endplane(case_id, "main_airway", "posterior", crossing, 3)
+    assert saved["complete"] is False
+    assert "前方" in saved["validation_error"]["reason"]
+    assert saved["posterior_plane"] == crossing
+    corrected = endplanes.save_single_endplane(case_id, "main_airway", "posterior", posterior, 3)
+    assert corrected["complete"] is True
+    assert "validation_error" not in corrected
+
+
+def test_single_save_does_not_inherit_opposite_end_from_stale_mask(confirmed_case):
+    case_id, root, seg = confirmed_case
+    anterior, posterior = _sample_planes()
+    endplanes.save_oblique_endplanes(case_id, "main_airway", anterior, posterior, 3)
+    seg["mask_version"] = seg["external_air_validation"]["mask_version"] = 4
+    (root / "segment" / "segmentation.json").write_text(json.dumps(seg), encoding="utf-8")
+    saved = endplanes.save_single_endplane(case_id, "main_airway", "posterior", posterior, 4)
+    assert saved["anterior_plane"] is None
+    assert saved["complete"] is False
+    with pytest.raises(PipelineError, match="版本已变化"):
+        endplanes.save_single_endplane(case_id, "main_airway", "anterior", anterior, 3)
+
+
+def test_single_save_rejects_invalid_normal_without_replacing_saved_data(confirmed_case):
+    case_id, root, _seg = confirmed_case
+    anterior, _posterior = _sample_planes()
+    endplanes.save_single_endplane(case_id, "main_airway", "anterior", anterior, 3)
+    path = root / "segment" / "endplanes.json"
+    before = path.read_bytes()
+    with pytest.raises(PipelineError, match="法向"):
+        endplanes.save_single_endplane(case_id, "main_airway", "posterior", anterior, 3)
+    assert path.read_bytes() == before
+
+
+def test_single_endplane_api_and_legacy_ct_plan_preserve_the_other_side(confirmed_case):
+    from server import SingleEndplaneBody, api_save_single_endplane
+    case_id, _root, _seg = confirmed_case
+    endplanes.save_endplanes(case_id, "main_airway", 22, 8, 3)
+    anterior, _posterior = _sample_planes()
+    result = asyncio.run(api_save_single_endplane(case_id, "anterior", SingleEndplaneBody(
+        scope="main_airway", mask_version=3, plane=anterior,
+    )))
+    assert result["posterior_plane"]["point_lps_mm"] == [12.0, 8.0, 30.0]
+    assert result["complete"] is True
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(api_save_single_endplane(case_id, "invalid", SingleEndplaneBody(
+            scope="main_airway", mask_version=3, plane=anterior,
+        )))
+    assert caught.value.status_code == 400
+
+
 def test_oblique_plane_save_keeps_mask_and_invalidates_formal_geometry(confirmed_case):
     case_id, root, _seg = confirmed_case
     anterior, posterior = _sample_planes()
