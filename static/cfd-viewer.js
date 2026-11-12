@@ -38,8 +38,9 @@
   class CfdViewer {
     constructor(container, data, options = {}) {
       if (!window.THREE || !THREE.OrbitControls) throw new Error("三维渲染组件未加载，请刷新页面");
-      if (data.units?.coordinates !== "m" || data.units?.velocity !== "m/s") throw new Error("流场坐标或速度单位未确认，无法显示结果");
-      if (!["Pa", "m2/s2", "m²/s²"].includes(data.units?.pressure)) throw new Error("压力单位未确认，无法显示结果");
+      this.anatomyOnly = data.kind === "anatomy";
+      if (data.units?.coordinates !== "m" || !this.anatomyOnly && data.units?.velocity !== "m/s") throw new Error("流场坐标或速度单位未确认，无法显示结果");
+      if (!this.anatomyOnly && !["Pa", "m2/s2", "m²/s²"].includes(data.units?.pressure)) throw new Error("压力单位未确认，无法显示结果");
       if (!isFiniteArray(data.bounds_m) || data.bounds_m.length !== 6) throw new Error("流场空间范围缺失");
       data.streamlines = data.streamlines || [];
       data.slices = data.slices || [];
@@ -54,6 +55,7 @@
       this.container = container;
       this.data = data;
       this.options = options;
+      this.presentationMode = this.anatomyOnly ? "anatomy" : "flow";
       this.disposed = false;
       this.playing = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
       this.visible = true;
@@ -87,6 +89,13 @@
       this.renderer.domElement.addEventListener("webglcontextlost", this.onContextLost);
       this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
       this.controls.enableDamping = true;
+      this.patientPresentation = Boolean(options.patientPresentation);
+      if (this.patientPresentation) this.controls.enablePan = false;
+      this.onViewChange = () => {
+        if (!this.applyingPresentationState && this.patientPresentation && this.frameCenter)
+          this.options.onViewChange?.(this.getPresentationState());
+      };
+      this.controls.addEventListener("change", this.onViewChange);
       this.analysisGroup = new THREE.Group();
       this.scene.add(this.analysisGroup);
       this.analysisVisible = true;
@@ -131,8 +140,9 @@
       this.scene.add(lineGroup);
       this.lineGroup = lineGroup;
       for (const line of data.streamlines) this.addLine(line, lineGroup);
-      this.setDensity(2);
-      this.setField("velocity");
+      this.setDensity(this.patientPresentation ? 5 : 2);
+      if (this.anatomyOnly) this.setPresentationMode("anatomy");
+      else this.setField("velocity");
       this.reset();
       this.resizeObserver = new ResizeObserver(() => this.resize());
       this.resizeObserver.observe(container);
@@ -197,11 +207,12 @@
     }
 
     setField(field) {
+      if (this.anatomyOnly) return;
       if (!this.ranges[field]) throw new Error(`${field === "pressure" ? "压力" : "速度"}采样尚未生成`);
       this.field = field;
       for (const mesh of this.meshes) {
         const values = field === "pressure" ? mesh.data.pressure : mesh.data.speeds;
-        const colored = Boolean(values);
+        const colored = Boolean(values) && this.presentationMode !== "anatomy";
         mesh.object.material.vertexColors = colored;
         mesh.object.material.color.set(colored ? 0xffffff : 0x7fa5a4);
         if (colored) this.setColors(mesh.object, values, this.ranges[field]);
@@ -216,14 +227,27 @@
         line.object.material.needsUpdate = true;
       }
       this.updateParticles();
-      this.options.onLegend?.({ field, range: this.ranges[field], unit: field === "velocity" ? "m/s" : this.data.units.pressure });
+      const stops = COLOR_STOPS.map(([position, r, g, b]) =>
+        new THREE.Color(r, g, b).convertLinearToSRGB().getStyle() + " " + position * 100 + "%");
+      this.options.onLegend?.({ field, range: this.ranges[field],
+        unit: field === "velocity" ? "m/s" : this.data.units.pressure,
+        gradient: "linear-gradient(to right, " + stops.join(", ") + ")" });
       this.render();
     }
 
     setOpacity(value) { this.opacity = value; this.wall.material.opacity = value; this.wall.visible = value > 0; this.render(); }
+    setColorRanges(ranges = null) {
+      const next = ranges || { velocity: valueRange(this.data, "velocity"), pressure: valueRange(this.data, "pressure") };
+      for (const field of ["velocity", "pressure"]) {
+        if (next[field] !== null && (!isFiniteArray(next[field]) || next[field].length !== 2 || next[field][0] > next[field][1]))
+          throw new Error("对照色标范围无效");
+      }
+      this.ranges = { ...next };
+      this.setField(this.field);
+    }
     setSlice(axis) { this.sliceAxis = axis; this.setField(this.field); }
-    setLines(visible) { this.showLines = visible; this.lineGroup.visible = visible; this.render(); }
-    setPatches(visible) { this.showPatches = visible; this.patches.visible = visible; this.render(); }
+    setLines(visible) { this.showLines = visible; this.lineGroup.visible = visible && this.presentationMode !== "anatomy"; this.render(); }
+    setPatches(visible) { this.showPatches = visible; this.patches.visible = visible && this.presentationMode !== "anatomy"; this.render(); }
     setSpeed(value) { this.speed = value; }
     setPlaying(value) { this.playing = value; this.lastTime = null; }
 
@@ -388,8 +412,10 @@
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(total * 3), 3));
       geometry.setAttribute("color", new THREE.BufferAttribute(new Float32Array(total * 3), 3));
-      this.particles = new THREE.Points(geometry, new THREE.PointsMaterial({ size: Math.max(this.size / 110, 0.5), vertexColors: true, sizeAttenuation: true, depthWrite: false }));
+      const pointSize = this.patientPresentation ? Math.max(this.size / 45, 1.2) : Math.max(this.size / 110, 0.5);
+      this.particles = new THREE.Points(geometry, new THREE.PointsMaterial({ size: pointSize, vertexColors: true, sizeAttenuation: true, depthWrite: false }));
       this.particles.renderOrder = 3;
+      this.particles.visible = this.presentationMode !== "anatomy";
       this.scene.add(this.particles);
       this.updateParticles();
       this.render();
@@ -416,21 +442,177 @@
       colors.needsUpdate = true;
     }
 
+    frameDistanceForPose(azimuth, elevation) {
+      const vertical = Math.tan(this.camera.fov * Math.PI / 360) * 0.92;
+      const horizontal = vertical * this.camera.aspect;
+      const ca = Math.cos(azimuth), sa = Math.sin(azimuth);
+      const ce = Math.cos(elevation), se = Math.sin(elevation);
+      let distance = this.frameRadius * 1.05;
+      for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+        const x = sx * this.frameHalf.x, y = sy * this.frameHalf.y, z = sz * this.frameHalf.z;
+        const along = x * ce * ca + y * ce * sa + z * se;
+        const screenX = Math.abs(-x * sa + y * ca);
+        const screenY = Math.abs(-x * se * ca - y * se * sa + z * ce);
+        distance = Math.max(distance, along + screenX / horizontal, along + screenY / vertical);
+      }
+      return distance;
+    }
+
     reset() {
+      if (this.patientPresentation) {
+        const width = Math.max(this.container.clientWidth, 1);
+        const height = Math.max(this.container.clientHeight, 1);
+        this.camera.aspect = width / height;
+        const bounds = new THREE.Box3().setFromObject(this.wall);
+        bounds.expandByObject(this.patches);
+        bounds.expandByObject(this.lineGroup);
+        if (bounds.isEmpty()) throw new Error("模型几何范围为空，无法定位视角");
+        const sphere = bounds.getBoundingSphere(new THREE.Sphere());
+        this.frameCenter = sphere.center;
+        this.frameRadius = Math.max(sphere.radius, this.size * 0.01);
+        this.frameHalf = bounds.getSize(new THREE.Vector3()).multiplyScalar(0.5);
+        const azimuth = Math.atan2(-1.5, 1.3);
+        const elevation = Math.atan2(0.9, Math.hypot(1.3, 1.5));
+        this.frameDistance = this.frameDistanceForPose(azimuth, elevation);
+        this.camera.near = Math.max(this.frameRadius / 1000, 0.001);
+        this.camera.far = Math.max(this.size * 30, this.frameDistance + this.frameRadius * 4);
+        this.camera.updateProjectionMatrix();
+        this.controls.minDistance = this.frameDistance * 0.7;
+        this.controls.maxDistance = this.frameDistance * 5;
+      }
       const damping = this.controls.enableDamping;
       this.controls.enableDamping = false;
       this.controls.update();
-      this.camera.position.set(this.size * 1.3, -this.size * 1.5, this.size * 0.9);
-      this.controls.target.set(0, 0, 0);
+      if (this.patientPresentation) {
+        this.camera.position.copy(this.frameCenter).add(
+          new THREE.Vector3(1.3, -1.5, 0.9).normalize().multiplyScalar(this.frameDistance));
+        this.controls.target.copy(this.frameCenter);
+      } else {
+        this.operatorPose = null;
+        this.camera.position.set(this.size * 1.3, -this.size * 1.5, this.size * 0.9);
+        this.controls.target.set(0, 0, 0);
+      }
       this.controls.update();
       this.controls.enableDamping = damping;
       this.render();
     }
 
+    setPresentationMode(mode) {
+      if (!this.patientPresentation || !["anatomy", "flow"].includes(mode)) return;
+      if (this.anatomyOnly && mode === "flow") throw new Error("此参考病例仅发布了结构模型");
+      this.presentationMode = mode;
+      const flow = mode === "flow";
+      this.setOpacity(flow ? 0.28 : 1);
+      this.wall.material.transparent = flow;
+      this.wall.material.depthWrite = !flow;
+      this.wall.material.vertexColors = false;
+      this.wall.material.color.set(0x9ac2bd);
+      this.wall.material.needsUpdate = true;
+      this.lineGroup.visible = flow && this.showLines !== false;
+      this.patches.visible = flow && this.showPatches !== false;
+      for (const line of this.lines) line.object.material.opacity = 0.8;
+      if (this.particles) this.particles.visible = flow;
+      if (!this.anatomyOnly) this.setField?.(this.field);
+      this.render();
+    }
+
+    getPresentationState() {
+      const offset = this.camera.position.clone().sub(this.controls.target);
+      const azimuth = Math.atan2(offset.y, offset.x);
+      const elevation = Math.atan2(offset.z, Math.hypot(offset.x, offset.y));
+      return { azimuth, elevation, zoom: offset.length() / this.frameDistanceForPose(azimuth, elevation) };
+    }
+
+    applyPresentationState(state) {
+      if (!this.patientPresentation || !this.frameCenter || !state ||
+          ![state.azimuth, state.elevation, state.zoom].every(Number.isFinite)) return;
+      const distance = this.frameDistanceForPose(state.azimuth, state.elevation);
+      const radius = distance * Math.max(0.7, Math.min(5, state.zoom));
+      const horizontal = Math.cos(state.elevation) * radius;
+      const damping = this.controls.enableDamping;
+      this.applyingPresentationState = true;
+      this.controls.enableDamping = false;
+      this.controls.minDistance = distance * 0.7;
+      this.controls.maxDistance = distance * 5;
+      this.camera.position.set(this.frameCenter.x + Math.cos(state.azimuth) * horizontal,
+        this.frameCenter.y + Math.sin(state.azimuth) * horizontal,
+        this.frameCenter.z + Math.sin(state.elevation) * radius);
+      this.controls.target.copy(this.frameCenter);
+      this.controls.update();
+      this.controls.enableDamping = damping;
+      this.applyingPresentationState = false;
+      this.render();
+    }
+
+    applyOperatorPose(state) {
+      if (this.patientPresentation || !state ||
+          ![state.azimuth, state.elevation, state.zoom].every(Number.isFinite) ||
+          Math.abs(state.azimuth) > Math.PI || Math.abs(state.elevation) > Math.PI / 2 ||
+          state.zoom < 0.7 || state.zoom > 5) return;
+      const bounds = new THREE.Box3().setFromObject(this.wall);
+      bounds.expandByObject(this.patches);
+      bounds.expandByObject(this.lineGroup);
+      if (bounds.isEmpty()) throw new Error("模型几何范围为空，无法应用默认视角");
+      const sphere = bounds.getBoundingSphere(new THREE.Sphere());
+      this.frameCenter = sphere.center;
+      this.frameRadius = Math.max(sphere.radius, this.size * 0.01);
+      this.frameHalf = bounds.getSize(new THREE.Vector3()).multiplyScalar(0.5);
+      this.camera.aspect = Math.max(this.container.clientWidth, 1) / Math.max(this.container.clientHeight, 1);
+      const distance = this.frameDistanceForPose(state.azimuth, state.elevation);
+      const radius = distance * state.zoom;
+      this.camera.near = Math.max(this.frameRadius / 1000, 0.001);
+      this.camera.far = Math.max(this.size * 30, radius + this.frameRadius * 4);
+      this.camera.updateProjectionMatrix();
+      this.controls.minDistance = distance * 0.7;
+      this.controls.maxDistance = distance * 5;
+      const horizontal = Math.cos(state.elevation) * radius;
+      const damping = this.controls.enableDamping;
+      this.controls.enableDamping = false;
+      this.camera.position.set(this.frameCenter.x + Math.cos(state.azimuth) * horizontal,
+        this.frameCenter.y + Math.sin(state.azimuth) * horizontal,
+        this.frameCenter.z + Math.sin(state.elevation) * radius);
+      this.controls.target.copy(this.frameCenter);
+      this.controls.update();
+      this.controls.enableDamping = damping;
+      this.operatorPose = { ...state };
+      this.render();
+    }
+
+    setPresentationPose(azimuth, elevation) {
+      if (!this.patientPresentation || !this.frameCenter) return;
+      const distance = this.frameDistanceForPose(azimuth, elevation);
+      this.frameDistance = distance;
+      this.controls.minDistance = distance * 0.7;
+      this.controls.maxDistance = distance * 5;
+      const horizontal = Math.cos(elevation) * distance;
+      const damping = this.controls.enableDamping;
+      this.controls.enableDamping = false;
+      this.camera.position.set(
+        this.frameCenter.x + Math.cos(azimuth) * horizontal,
+        this.frameCenter.y + Math.sin(azimuth) * horizontal,
+        this.frameCenter.z + Math.sin(elevation) * distance);
+      this.controls.target.copy(this.frameCenter);
+      this.controls.update();
+      this.controls.enableDamping = damping;
+    }
+
     resize() {
       if (this.disposed) return;
       const width = Math.max(this.container.clientWidth, 1), height = Math.max(this.container.clientHeight, 1);
+      const previousAspect = this.camera.aspect;
       this.camera.aspect = width / height;
+      if ((this.patientPresentation || this.operatorPose) && this.frameRadius && previousAspect !== this.camera.aspect) {
+        const offset = this.camera.position.clone().sub(this.controls.target);
+        const azimuth = Math.atan2(offset.y, offset.x);
+        const elevation = Math.atan2(offset.z, Math.hypot(offset.x, offset.y));
+        this.frameDistance = this.frameDistanceForPose(azimuth, elevation);
+        this.controls.minDistance = this.frameDistance * 0.7;
+        this.controls.maxDistance = this.frameDistance * 5;
+        if (offset.length() < this.frameDistance) {
+          this.camera.position.copy(this.controls.target).add(offset.setLength(this.frameDistance));
+          this.controls.update();
+        }
+      }
       this.camera.updateProjectionMatrix();
       this.renderer.setSize(width, height, false);
       this.render();

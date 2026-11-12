@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+# Mirror the CPU image /openfoam/bash command contract while loading the
+# NVIDIA-compiled OpenFOAM environment from the verified GPU image.
+# OpenFOAM bashrc can return 1 when an optional library directory is absent.
+# Validate the required environment explicitly before executing the command.
+source /work/src/etc/bashrc WM_COMPILER=Nvidia-gpu WM_MPLIB=SYSTEMOPENMPI
+if [[ "${WM_COMPILER:-}" != Nvidia-gpu || -z "${FOAM_APPBIN:-}" ]]; then
+    echo "GPU OpenFOAM environment is unavailable" >&2
+    exit 1
+fi
+exec /bin/bash "$@"

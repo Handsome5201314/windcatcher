@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="referrer" content="no-referrer">
+  <title><!--SHARE_TITLE--> · 风见</title>
+  <link rel="stylesheet" href="/static/patient-view.css?v=20261101-reference1">
+</head>
+<body>
+  <main class="page">
+    <header><span class="brand">风见 / Windcatcher</span><h1><!--SHARE_TITLE--></h1>
+      <p><!--SHARE_INTRO--></p><!--SHARE_WARNING-->
+    </header>
+    <section id="unlock-panel" class="card" aria-labelledby="unlock-title">
+      <h2 id="unlock-title">输入访问码</h2><p>请使用团队单独提供的访问码。链接和访问码都只对应这一份模型。</p>
+      <form id="unlock-form"><label for="access-code">访问码</label>
+        <input id="access-code" name="access-code" autocomplete="one-time-code" required maxlength="64" spellcheck="false">
+        <button id="unlock-button" type="submit">查看模型</button></form>
+      <p id="unlock-error" class="error" role="alert" hidden></p>
+    </section>
+    <section id="model-panel" class="card" aria-labelledby="model-title" hidden>
+      <!--SHARE_MODEL_WARNING-->
+      <div class="model-top"><h2 id="model-title">鼻腔气道模型</h2><div class="actions" id="patient-actions">
+        <button id="tour-toggle" type="button" aria-pressed="false">播放导览</button>
+        <button id="view-reset" type="button">回正视角</button>
+        <label for="presentation-mode">查看方式</label><select id="presentation-mode"><option value="anatomy">看结构</option><option value="flow">看气流</option></select>
+        <label for="field">显示</label><select id="field"><option value="velocity">速度</option><option value="pressure">压力</option></select>
+        <button id="motion" type="button" aria-pressed="true">暂停粒子</button>
+        <button id="open-reference-comparison" type="button">与参考病例对照</button></div></div>
+      <div id="model" class="model" tabindex="0" aria-label="可旋转缩放的三维气流模型"></div>
+      <div class="tour-guide" id="patient-tour-guide"><progress id="tour-progress" max="60" value="0" aria-label="导览进度"></progress>
+        <p id="tour-caption" aria-live="polite">点击播放导览，自动查看模型各个角度。</p></div>
+      <section id="legend" class="legend" aria-labelledby="legend-title" aria-live="polite">
+        <h3 id="legend-title">颜色说明</h3>
+        <div id="legend-scale" hidden>
+          <div id="legend-colorbar" class="legend-colorbar" aria-hidden="true"></div>
+          <div class="legend-values"><span id="legend-min"></span><span id="legend-max"></span></div>
+        </div>
+        <p id="legend-description"></p>
+        <p id="legend-unit-note" class="hint"></p>
+      </section>
+      <section id="patient-reference-comparison" aria-label="我的模型与参考病例对照" hidden></section>
+      <p><a class="reference-link" href="/references" target="_blank" rel="noopener">单独浏览参考病例库</a></p>
+      <p class="hint">也可拖动旋转、双指缩放；偏离画面时点击“回正视角”。粒子运动是稳态计算的可视化，不代表实时呼吸或诊疗结论。</p>
+      <p id="model-error" class="error" role="alert" hidden></p>
+    </section>
+    <footer>如对模型有疑问，请联系向你提供链接的团队成员。不要把链接或访问码转发给他人。</footer>
+  </main>
+  <script src="/static/vendor/three.min.js?v=20261101-framing3"></script>
+  <script src="/static/vendor/OrbitControls.js?v=20261101-framing3"></script>
+  <script src="/static/cfd-viewer.js?v=20261101-reference1"></script>
+  <script src="/static/reference-view.js?v=20261102-flow-test1"></script>
+  <script src="/static/patient-view.js?v=20261101-reference1"></script>
+</body>
+</html>

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>风见 · 鼻腔气流工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=20261017-scenario-loop1" />
+    <link rel="stylesheet" href="/static/app.css?v=20261109-single-port-v1" />
 </head>
 <body>
   <div class="shell">
@@ -26,11 +26,16 @@
       </div>
       <nav class="side-nav" aria-label="主导航">
         <button data-route="work" class="is-active"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 12l4-8 3 5 2-3 5 6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label-text">工作台</span></button>
+        <button data-route="agent" type="button" title="Agent 自动处理" aria-label="Agent 自动处理"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="5" width="14" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M10 2v3M7 10h.01M13 10h.01M7 13h6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><span class="label-text"><span class="agent-nav-name">Agent</span> 自动处理</span></button>
         <button data-route="cases"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4.5" width="14" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M3 8.5h14" stroke="currentColor" stroke-width="1.7"/></svg><span class="label-text">病例</span></button>
+        <button data-route="accounts" type="button" title="账号管理" aria-label="账号管理" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="6.5" r="2.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M2.5 16c.3-3 2-4.5 4.5-4.5s4.2 1.5 4.5 4.5M14 8h4M16 6v4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><span class="label-text">账号管理</span></button>
         <button data-route="results" title="当前病例流场"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h9c4 0 4-4 1-4M3 10h13M3 14h9c4 0 4 4 1 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><span class="label-text">病例流场</span></button>
+        <button data-route="cfd-review" type="button" title="CFD 复核" aria-label="CFD 复核" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 4h10v12H5zM8 8h5M8 11h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><span class="label-text">CFD 复核</span></button>
+        <button data-route="share" type="button" title="患者分享管理" aria-label="患者分享管理" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7.5 12.5l5-5M8 6.5l1-1a3 3 0 0 1 4.2 4.2l-1 1M12 13.5l-1 1a3 3 0 0 1-4.2-4.2l1-1" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label-text">患者分享管理</span></button>
         <button data-route="env"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M10 6.5V10l2.4 2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><span class="label-text">环境</span></button>
         <button data-route="method"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 4h9M6 10h9M6 16h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><span class="label-text">处理流程</span></button>
         <button data-route="sample"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v10m0 0l-3.5-3.5M10 13l3.5-3.5M4.5 16.5h11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label-text">参考样本</span></button>
+        <button data-route="activity" type="button" title="操作记录" aria-label="操作记录" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10h3l2-5 4 10 2-5h3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label-text">操作记录</span></button>
       </nav>
       <div class="sidebar-foot">
         <span class="local-led"><i></i>仅本机 · 127.0.0.1</span>
@@ -47,15 +52,57 @@
           <span id="case-synthetic" hidden class="badge-synthetic">合成测试数据</span>
         </div>
 
-        <section class="history-panel" aria-labelledby="history-title">
+        <section id="quick-preview-panel" class="quick-preview-panel" aria-labelledby="quick-preview-title" hidden>
+          <div class="quick-preview-head">
+            <div class="quick-preview-title-group">
+              <div class="quick-preview-kicker"><span class="quick-preview-kicker-dot" aria-hidden="true"></span>研究预览</div>
+              <h1 id="quick-preview-title">主鼻腔气流预览</h1>
+              <p>导入 CT 后生成主鼻腔候选；确认掩膜后，自动尝试三端口建模、质检和 CFD。遇到质量问题会暂停并提供病例修正入口。</p>
+              <div class="quick-preview-meta"><span id="quick-preview-case">未选择病例</span><span id="quick-preview-source">状态来源：病例服务端产物</span></div>
+            </div>
+            <div class="quick-preview-actions">
+              <button id="quick-preview-rebuild" class="button button-quiet" type="button" hidden disabled>重新生成 CFD 算例</button>
+              <button id="quick-preview-primary" class="button button-primary" type="button" disabled>选择病例后开始</button>
+              <button id="quick-preview-open-results" class="button button-quiet" type="button" disabled>查看真实流场</button>
+            </div>
+          </div>
+
+          <div id="quick-preview-stages" class="quick-preview-stages" aria-label="自动流程进度"></div>
+
+          <div class="quick-preview-grid">
+            <div id="quick-preview-visual" class="quick-preview-visual" role="img" aria-label="真实 CFD 结果将在求解完成后显示">
+              <div class="quick-preview-visual-head"><span>气流结果</span><span class="quick-preview-visual-badge">真实结果入口</span></div>
+              <div class="quick-preview-visual-empty"><strong id="quick-preview-results">求解完成后显示真实流场</strong><span>这里不显示前端估算图。完成求解后进入“病例流场”查看速度、压力和流线。</span></div>
+              <div class="quick-preview-scale" aria-hidden="true"><i></i><span>低速</span><b></b><span>高速</span></div>
+            </div>
+            <div id="quick-preview-metrics" class="quick-preview-metrics" aria-label="病例真实指标"></div>
+          </div>
+
+          <div id="quick-preview-quality" class="quick-preview-quality" role="status" aria-live="polite"></div>
+          <div class="quick-preview-proof"><strong>如何避免黑盒</strong><span>每个状态都来自病例 API 和本地产物；没有结果就显示“未生成”，失败会保留原因、版本和专家处理入口。</span><button id="quick-preview-open-advanced" class="button button-quiet button-compact" type="button">查看完整证据与专家流程</button></div>
+          <details id="quick-preview-evidence" class="quick-preview-evidence">
+            <summary><span><strong>证据链</strong><small>输入、算法、产物与闸门</small></span><b>展开</b></summary>
+            <div id="quick-preview-evidence-content" class="quick-preview-evidence-content" aria-live="polite"></div>
+          </details>
+        </section>
+
+        <details id="advanced-workflow-panel" class="advanced-workflow-panel">
+          <summary><span><strong>完整工程流程（专家）</strong><small>掩膜、端面、几何质检、CFD 参数和复核记录</small></span><b>展开</b></summary>
+
+        <section id="history-panel" class="history-panel" aria-labelledby="history-title">
           <div class="history-head">
             <div>
-              <h2 id="history-title">既往分析记录</h2>
-              <p>病例会保存在本机；选择一条记录即可回到它上次停下的阶段。</p>
+              <div class="history-title-row"><h2 id="history-title">病例记录</h2><span id="history-count" class="history-count" aria-live="polite"></span></div>
+              <p>病例保存在本机；当前病例可从上方下拉框切换。</p>
             </div>
-            <button id="btn-history-cases" class="button button-quiet button-compact" type="button">管理病例</button>
+            <div class="history-head-actions">
+              <button id="btn-history-cases" class="button button-quiet button-compact" type="button">管理病例</button>
+              <button id="btn-history-toggle" class="button button-quiet button-compact history-toggle" type="button" aria-expanded="false" aria-controls="history-list">
+                <span class="history-toggle-label">展开病例</span><span class="history-chevron" aria-hidden="true">⌄</span>
+              </button>
+            </div>
           </div>
-          <div id="history-list" class="history-list" aria-live="polite">
+          <div id="history-list" class="history-list" aria-live="polite" hidden>
             <div class="skeleton" style="height:52px;"></div>
           </div>
         </section>
@@ -85,7 +132,7 @@
               <button id="btn-view-slices" class="vt-btn is-on">CT 复核</button>
               <button id="btn-view-3d" class="vt-btn">STL 预览</button>
               <button id="btn-edit-mask" class="vt-btn" title="在当前病例的三平面切片上编辑候选掩膜">编辑掩膜</button>
-              <button id="btn-endplanes" class="vt-btn" type="button" aria-controls="endplane-panel" aria-expanded="false" title="在 CT 层面选择鼻孔侧与鼻咽侧的几何裁切位置">端面裁切</button>
+              <button id="btn-endplanes" class="vt-btn" type="button" aria-controls="endplane-panel" aria-expanded="false" title="检查左右鼻孔与鼻咽端的正式裁切范围">检查气道开口</button>
               <button id="btn-download-stl" class="vt-btn">下载 STL</button>
             </div>
           </div>
@@ -111,36 +158,127 @@
           <section class="endplane-panel" id="endplane-panel" aria-labelledby="endplane-title" hidden>
             <div class="endplane-heading">
               <div>
-                <h2 id="endplane-title">选择鼻孔侧与鼻咽侧裁切面</h2>
-                <p>先查看按原始体素分辨率重建的 3D 气道，再点选鼻孔端和鼻咽端，拖动或旋转裁切面。CT 切片可用于辅助核对位置。保存后按两个平面裁掉外侧模型，形成新的两端开口；流量和压力仍在后续 CFD 阶段设置。</p>
+                <h2 id="endplane-title">选择气道开口</h2>
+                <p>当前正式流程：依次选择左鼻孔、右鼻孔和鼻咽端，在 CT 上确认对应区域，并查看服务端实际裁切网格后保存。</p>
               </div>
               <span id="endplane-status" class="pill pill-mute" aria-live="polite"><i></i>等待读取</span>
             </div>
             <p class="endplane-feedback" id="endplane-feedback" role="status" aria-live="polite"></p>
             <button id="endplane-retry" class="button button-quiet button-compact" type="button" hidden>重新读取层面</button>
+
             <div id="endplane-controls" hidden>
-              <div class="endplane-mode-bar" role="group" aria-label="选择要放置的裁切面">
+              <div id="endplane-opening-steps" class="endplane-opening-steps" role="group" aria-label="选择气道开口" hidden>
+                <button id="endplane-step-left" class="endplane-opening-step" type="button" aria-pressed="false"><span class="endplane-step-number" aria-hidden="true">1</span><span class="endplane-step-copy"><strong>左鼻孔</strong><small id="endplane-step-left-hint">进气口 · 点击选择</small></span><span id="endplane-step-left-status" class="endplane-step-status">待定位</span></button>
+                <button id="endplane-step-right" class="endplane-opening-step" type="button" aria-pressed="false"><span class="endplane-step-number" aria-hidden="true">2</span><span class="endplane-step-copy"><strong>右鼻孔</strong><small id="endplane-step-right-hint">进气口 · 点击选择</small></span><span id="endplane-step-right-status" class="endplane-step-status">待定位</span></button>
+                <button id="endplane-step-posterior" class="endplane-opening-step" type="button" aria-pressed="false"><span class="endplane-step-number" aria-hidden="true">3</span><span class="endplane-step-copy"><strong>鼻咽端</strong><small id="endplane-step-posterior-hint">出气口 · 点击选择</small></span><span id="endplane-step-posterior-status" class="endplane-step-status">待定位</span></button>
+              </div>
+              <div id="endplane-auto-candidate" class="endplane-auto-candidate" hidden>
+                <button id="endplane-auto-candidate-button" class="button button-quiet button-compact" type="button">自动找三个开口</button>
+                <p id="endplane-auto-candidate-status" role="status" aria-live="polite">根据已确认的气道范围生成待复核草稿；不会自动保存端口或运行 CFD。</p>
+              </div>
+              <div id="endplane-legacy-mode-bar" class="endplane-mode-bar" role="group" aria-label="选择要放置的裁切面">
                 <button id="endplane-mode-anterior" class="button button-quiet button-compact" type="button" aria-pressed="true">1 选鼻孔端</button>
+                <button id="endplane-mode-left" class="button button-quiet button-compact" type="button" aria-pressed="false" hidden>1 左鼻孔</button>
+                <button id="endplane-mode-right" class="button button-quiet button-compact" type="button" aria-pressed="false" hidden>2 右鼻孔</button>
                 <button id="endplane-mode-posterior" class="button button-quiet button-compact" type="button" aria-pressed="false">2 选鼻咽端</button>
-                <span id="endplane-placement-status" aria-live="polite">点击模型放置蓝色鼻孔端面</span>
+              </div>
+              <p id="endplane-placement-status" class="endplane-placement-guide" role="status" aria-live="polite">点击模型放置鼻孔端切面</p>
+              <button id="endplane-switch-local" class="button button-quiet button-compact" type="button" hidden>改用局部鼻孔裁切（需重新选支段）</button>
+              <div id="endplane-local-mode" class="endplane-local-mode" hidden>
+                <strong id="endplane-local-title">局部鼻孔端 · 单支段入口</strong>
+                <p id="endplane-local-help">先定鼻孔端切面，再点选该切面外侧准备移除的鼻孔支段。只针对所选支段预检；另一鼻孔不会自动成为入口。本视图仅示意平面和选点，不代表最终删除区域。</p>
+                <div class="endplane-local-actions">
+                  <button id="endplane-seed-place" class="vt-btn" type="button" aria-pressed="false">选择待切鼻孔支段</button>
+                  <button id="endplane-seed-clear" class="vt-btn" type="button" disabled>清除选点</button>
+                  <span id="endplane-seed-status" role="status" aria-live="polite">尚未选择鼻孔支段</span>
+                </div>
+                <div id="endplane-single-port" class="endplane-single-port" hidden>
+                  <div class="endplane-local-actions">
+                    <button id="endplane-single-port-find" class="vt-btn" type="button" disabled>尝试找更完整的单一入口</button>
+                    <button id="endplane-single-port-apply" class="vt-btn" type="button" hidden>采用建议</button>
+                  </div>
+                  <p id="endplane-single-port-status" role="status" aria-live="polite"></p>
+                </div>
               </div>
               <div class="endplane-3d-tools" role="group" aria-label="裁切面操作">
-                <button id="endplane-tool-translate" class="vt-btn is-on" type="button" aria-pressed="true">移动切面</button>
-                <button id="endplane-tool-rotate" class="vt-btn" type="button" aria-pressed="false">旋转切面</button>
-                <button id="endplane-flip-normal" class="vt-btn" type="button" title="不改变切面位置，翻转用于裁切的外侧法向；气流箭头仍按端面类型表示流向" disabled>翻转裁切法向</button>
-                <button id="endplane-reset-camera" class="vt-btn" type="button">复位视角</button>
-                <span>拖动空白处旋转模型；选中彩色手柄可移动或旋转端面。</span>
+                <button id="endplane-place" class="vt-btn" type="button" aria-pressed="false">重新点选位置</button>
+                <button id="endplane-focus" class="vt-btn" type="button">正对当前端面</button>
+                <button id="endplane-reset-camera" class="vt-btn" type="button">查看整体</button>
+                <span>拖动旋转 · 滚轮缩放 · 点选完成后可放心旋转查看</span>
               </div>
+              <div class="endplane-workspace">
+              <p id="endplane-selection-progress" class="endplane-selection-progress" role="status" aria-live="polite" hidden></p>
+              <div class="endplane-model-column">
+              <div class="endplane-view-heading"><strong>三维开口预览</strong><span id="endplane-view-kind">定位模型</span></div>
               <div class="endplane-3d-stage" id="endplane-3d-stage" aria-label="三维气道端面选择视图">
                 <div id="endplane-3d" class="endplane-3d-host"></div>
+                <canvas id="endplane-port-lasso" aria-label="在三维模型上圈选入口" hidden></canvas>
+                <div id="endplane-active-badge" class="endplane-active-badge" hidden></div>
                 <div id="endplane-3d-overlay" class="endplane-3d-overlay" role="status" aria-live="polite">正在按原始体素分辨率重建 3D 气道…</div>
               </div>
+              <div class="endplane-legend"><span id="endplane-model-legend">青色：端面内的气道预览</span><label id="endplane-show-removed-label"><input id="endplane-show-removed" type="checkbox" checked /> 显示灰色未裁切模型对照</label><label class="surface-preview-control" for="endplane-preview-mode">表面显示 <select id="endplane-preview-mode"><option value="smooth" selected>平滑预览</option><option value="raw">原始</option></select></label></div>
+              <p class="surface-preview-help">平滑预览只柔化表面光照；体素轮廓、选点位置和实际裁切均不变。核对端面时可切回原始。</p>
+              <p id="endplane-3d-help" class="endplane-3d-help">灰色是未裁切候选模型的半透明叠影，不是实际切除部分的精确网格；请对照 CT 和生成的 STL 核对范围。蓝色为鼻孔端，橙色为鼻咽端；亮色轮廓是模型与切面的交线。</p>
+              </div>
+              <div class="endplane-adjust">
+                <div class="endplane-view-heading"><strong>CT 局部对照</strong><span id="endplane-ct-active">当前开口</span></div>
+                <details id="endplane-fine-tune" class="endplane-fine-tune">
+                <summary>角度与位置微调</summary>
+                <h3 id="endplane-adjust-title">微调鼻孔端</h3>
+                <p id="endplane-adjust-hint">先在模型上点一个位置，或展开下方 CT 层号选面。</p>
+                <div class="endplane-slider"><label for="endplane-offset">沿切面前后移动 <output id="endplane-offset-value">0 mm</output></label><input id="endplane-offset" type="range" min="-20" max="20" step="0.2" value="0" disabled /></div>
+                <div class="endplane-slider"><label for="endplane-tilt-u">上下倾斜 <output id="endplane-tilt-u-value">0°</output></label><input id="endplane-tilt-u" type="range" min="-60" max="60" step="1" value="0" disabled /></div>
+                <div class="endplane-slider"><label for="endplane-tilt-v">左右倾斜 <output id="endplane-tilt-v-value">0°</output></label><input id="endplane-tilt-v" type="range" min="-60" max="60" step="1" value="0" disabled /></div>
+                <div class="endplane-adjust-actions"><button id="endplane-undo" class="vt-btn" type="button" disabled>撤销上一步</button><button id="endplane-flip-normal" class="vt-btn" type="button" disabled>切除另一侧</button></div>
+                </details>
+                <div class="endplane-section-head"><strong>当前切面的 CT</strong><button id="endplane-section-retry" class="vt-btn" type="button" hidden>重试</button></div>
+                <div class="endplane-section-tools" role="group" aria-label="CT 视野缩放">
+                  <button id="endplane-section-fit" class="vt-btn" type="button" disabled>聚焦开口</button>
+                  <button id="endplane-section-full" class="vt-btn" type="button" disabled>完整 CT</button>
+                  <button id="endplane-section-plus" class="vt-btn" type="button" aria-label="放大 CT" disabled>＋</button>
+                  <button id="endplane-section-minus" class="vt-btn" type="button" aria-label="缩小 CT" disabled>−</button>
+                </div>
+                <div class="endplane-section"><img id="endplane-section-image" alt="当前端面位置与角度对应的完整 CT 截面" hidden /><canvas id="endplane-section-regions" aria-label="点击 CT 区域选择开口，也可使用下方区域按钮" hidden></canvas><canvas id="endplane-port-projection" aria-hidden="true" hidden></canvas><p id="endplane-section-status" role="status" aria-live="polite">放置切面后显示对应 CT</p></div>
+                <p id="endplane-port-projection-status" class="endplane-section-caption" hidden></p>
+                <p id="endplane-section-zoom" class="endplane-section-caption">自动聚焦全部开口；可切回完整 CT。</p>
+                <p class="endplane-section-caption">绿色：全部气道轮廓；标色：选中的开口区域。这里只选择局部范围，不会切掉平面碰到的其他气道。</p>
+                <p id="endplane-region-status" class="endplane-region-status" role="status" aria-live="polite"></p>
+                <div id="endplane-region-choices" class="endplane-region-choices" role="group" aria-label="选择 CT 开口区域"></div>
+                <button id="endplane-clear-region" class="vt-btn" type="button" disabled>重选当前开口区域</button>
+              </div>
+              </div>
+
               <p id="endplane-orientation" class="endplane-orientation"></p>
-              <p class="endplane-3d-help">蓝色鼻孔端箭头表示吸气，指向气道内部；橙色鼻咽端箭头表示负压驱动的流向，指向肺侧。端面法向用于裁切外侧，实际开口以 STL 几何质检为准。</p>
-              <p id="endplane-preview-status" class="endplane-preview-status" role="status" aria-live="polite">请先放置两端裁切面，再检查几何预检结果。</p>
+              <p id="endplane-preview-status" class="endplane-preview-status" role="status" aria-live="polite">请先放置左右鼻孔和鼻咽端三个切面，再检查几何预检结果。</p>
+              <div id="endplane-retention" class="endplane-retention" hidden>
+                <strong id="endplane-retention-summary"></strong>
+                <div class="endplane-retention-track" role="img" aria-label="裁切后的主气道保留比例"><span id="endplane-retention-fill"></span></div>
+                <p id="endplane-retention-detail"></p>
+              </div>
+              <button id="endplane-preview-model" class="vt-btn" type="button" disabled hidden>查看实际裁切</button>
+              <section id="endplane-formal-ports" class="endplane-formal-ports" aria-labelledby="endplane-formal-ports-title">
+                <div class="endplane-formal-ports-head"><div><h3 id="endplane-formal-ports-title">正式入口数据</h3><p>只显示服务端实际封盖网格；三维实验草稿不会出现在这里。</p></div><button id="endplane-formal-ports-refresh" class="vt-btn" type="button">刷新状态</button></div>
+                <p id="endplane-formal-ports-status" role="status" aria-live="polite">等待读取正式入口数据…</p>
+                <ul id="endplane-formal-ports-list" class="endplane-formal-ports-list" aria-label="已保存的正式端口" hidden></ul>
+                <div id="endplane-formal-preview" class="endplane-formal-preview" hidden>
+                  <p id="endplane-formal-preview-status" role="status" aria-live="polite"></p>
+                  <div id="endplane-formal-preview-grid" class="endplane-formal-preview-grid" hidden>
+                    <div><strong>已保存 STL · 真实封盖</strong><div id="endplane-formal-model" class="endplane-formal-model" aria-label="可旋转的正式三维网格和所选端口封盖"></div></div>
+                    <div><strong>CT · 同一端口边界投影</strong><div class="endplane-formal-ct"><img id="endplane-formal-ct-image" alt="正式端口所在平面的 CT 截面" /><canvas id="endplane-formal-ct-boundary" width="384" height="384" aria-label="正式封盖边界在 CT 截面的投影"></canvas></div></div>
+                  </div>
+                </div>
+              </section>
               <div class="endplane-save-bar" role="group" aria-label="保存端面位置">
+                <div id="endplane-local-save" class="endplane-save-actions" hidden>
+                  <strong id="endplane-save-summary" class="endplane-save-summary">选择三个开口后保存</strong>
+                  <label id="endplane-bilateral-confirm-wrap" class="endplane-bilateral-confirm" hidden><input id="endplane-bilateral-confirm" type="checkbox">我已对照 CT 和实际裁切网格，核对左鼻孔、右鼻孔及鼻咽三个开口。</label>
+                  <p id="endplane-save-reason" role="status" aria-live="polite"></p>
+                  <button id="endplane-go-missing" class="button button-quiet button-compact" type="button" hidden>返回未完成选区</button>
+                  <button id="endplane-local-save-button" class="button button-primary button-compact" type="button" disabled>预检通过后保存端面</button>
+                  <button id="endplane-local-discard" class="button button-quiet button-compact" type="button" disabled>放弃局部裁切更改</button>
+                </div>
                 <div class="endplane-save-actions" role="group" aria-label="鼻孔端保存操作">
-                  <button id="endplane-anterior-save" class="button button-primary button-compact" type="button" disabled>保存鼻孔端</button>
+                  <button id="endplane-anterior-save" class="button button-primary button-compact" type="button" disabled>保存鼻孔端并继续</button>
                   <button id="endplane-anterior-discard" class="button button-quiet button-compact" type="button" disabled>放弃鼻孔端更改</button>
                 </div>
                 <div class="endplane-save-actions" role="group" aria-label="鼻咽端保存操作">
@@ -148,6 +286,56 @@
                   <button id="endplane-posterior-discard" class="button button-quiet button-compact" type="button" disabled>放弃鼻咽端更改</button>
                 </div>
               </div>
+              <details id="endplane-opening-markup" class="endplane-opening-markup" hidden>
+                <summary>实验工具：三维点选与画圈（草稿，不参与正式裁切）</summary>
+                <p>先在三维模型点入口内部，再沿可见的完整鼻孔开口拖动画圈。彩色区域是实际选中的 STL 三角面；这是未保存草稿，刷新会丢失，也不会改变正式裁切或 CFD。</p>
+                <div class="endplane-local-actions">
+                  <button id="endplane-markup-seed" class="vt-btn" type="button" aria-pressed="false">1 点选入口内部</button>
+                  <button id="endplane-markup-outline" class="vt-btn" type="button" aria-pressed="false" disabled>2 在三维模型画圈</button>
+                  <button id="endplane-markup-clear" class="vt-btn" type="button" disabled>清除本端标注</button>
+                </div>
+                <p id="endplane-markup-status" class="endplane-opening-markup-status" role="status" aria-live="polite">尚未标注三维开口</p>
+                <dl class="endplane-opening-markup-meta">
+                  <div><dt>opening ID</dt><dd id="endplane-markup-id">—</dd></div>
+                  <div><dt>实际选中面</dt><dd id="endplane-markup-faces">未生成</dd></div>
+                  <div><dt>区域边界</dt><dd id="endplane-markup-boundary">未生成</dd></div>
+                  <div><dt>面积</dt><dd id="endplane-markup-area">—</dd></div>
+                </dl>
+              </details>
+              <details class="endplane-advanced" id="endplane-advanced">
+                <summary>高级调整：左右分开 / 三点定面 / 三轴手柄</summary>
+                <label id="endplane-independent-wrap" hidden><input id="endplane-independent" type="checkbox" /> 左右鼻孔分别调整切面</label>
+                <div class="endplane-3d-tools">
+                  <button id="endplane-three-points" class="vt-btn" type="button" aria-pressed="false">在模型上选三点定面</button>
+                  <button id="endplane-align-view" class="vt-btn" type="button">切面平行当前屏幕</button>
+                  <label><input id="endplane-gizmo" type="checkbox" /> 显示三轴手柄</label>
+                  <button id="endplane-tool-translate" class="vt-btn is-on" type="button" aria-pressed="true">移动</button>
+                  <button id="endplane-tool-rotate" class="vt-btn" type="button" aria-pressed="false">旋转</button>
+                </div>
+                <p>三点应分散在同一开口周围；三点重合或接近一条直线时需要重新选择。</p>
+              </details>
+            <details id="endplane-learning-panel" class="endplane-learning" aria-labelledby="endplane-learning-title" hidden>
+              <summary>候选与纠错记录（可选）</summary>
+              <div class="endplane-learning-heading">
+                <div><h3 id="endplane-learning-title">候选与纠错</h3><p>可从当前已确认掩膜本机生成候选，也可手动选好两端后登记草稿。加载候选、核对 CT 后再记录反馈；正式端面需单独保存。</p></div>
+                <button id="endplane-learning-refresh" class="button button-quiet button-compact" type="button">刷新候选</button>
+              </div>
+              <p id="endplane-learning-status" class="endplane-learning-status" role="status" aria-live="polite">请先确认当前病例的气道掩膜。</p>
+              <div class="endplane-learning-picker">
+                <label for="endplane-learning-select">端面候选</label>
+                <select id="endplane-learning-select" aria-describedby="endplane-learning-details" disabled></select>
+                <button id="endplane-learning-load" class="button button-quiet button-compact" type="button" disabled>加载到草稿</button>
+                <button id="endplane-learning-auto" class="button button-quiet button-compact" type="button" disabled>本机生成候选</button>
+                <button id="endplane-learning-register" class="button button-quiet button-compact" type="button" disabled>登记当前草稿</button>
+              </div>
+              <p id="endplane-learning-details" class="endplane-learning-details" hidden></p>
+              <label class="endplane-learning-confirm" for="endplane-learning-confirm"><input id="endplane-learning-confirm" type="checkbox" disabled>我已对照当前 CT 人工核对所选候选与两端草稿，确认本次反馈。</label>
+              <div class="endplane-learning-actions" role="group" aria-label="记录候选人工反馈">
+                <button id="endplane-learning-accept" class="button button-quiet button-compact" type="button" disabled>接受</button>
+                <button id="endplane-learning-adjust" class="button button-quiet button-compact" type="button" disabled>以当前草稿修正</button>
+                <button id="endplane-learning-reject" class="button button-quiet button-compact" type="button" disabled>否决</button>
+              </div>
+            </details>
               <details class="endplane-precise" id="endplane-precise">
                 <summary>精确调整 CT 层号（仅正交裁切）</summary>
                 <p>层号只用于沿原始 CT 前后方向的正交裁切。若在 3D 中旋转过平面，以下逐层面积不代表倾斜面面积。</p>
@@ -176,7 +364,7 @@
               </details>
               <p class="endplane-caution">精确调整区的逐层截面积只适用于正交参考层；倾斜端面的面积以几何预检为准。1 mm² 只是程序过滤毛刺的最低技术阈值，不代表解剖位置正确。完整候选中断开的鼻窦、旁支仍须单独复核。</p>
               <div class="endplane-actions">
-                <span>两端分别保存；只有两端均已保存且联合预检通过后，才能生成 STL。每次保存都会使旧 STL / CFD 算例失效。</span>
+                <span id="endplane-actions-help">端面保存会使旧 STL / CFD 算例失效；请先核对预检和实际裁切。</span>
               </div>
             </div>
           </section>
@@ -205,6 +393,7 @@
               </section>
             </div>
             <div id="viewer-3d" hidden></div>
+            <div id="viewer-preview-controls" class="surface-preview-controls" hidden><label class="surface-preview-control" for="viewer-preview-mode">表面显示 <select id="viewer-preview-mode"><option value="smooth" selected>平滑预览</option><option value="raw">原始</option></select></label><span>仅改变光照，原始 STL 和 CFD 几何不变</span></div>
             <div class="viewer-note" id="viewer-note"></div>
           </div>
           <div class="viewer-controls" id="viewer-controls" hidden>
@@ -245,14 +434,127 @@
             </div>
             <p class="mask-editor-help">在切片上点击或拖动编辑青色区域。体外空气清理后仍需逐层检查鼻孔、鼻咽端面和鼻窦；手工修改后可用上方按钮重新检查体外空气，如有误删可撤销本次清理。</p>
           </div>
+          <details id="seg-learning-panel" class="endplane-learning segmentation-learning" hidden>
+            <summary>分割改进 · 修正记录与试算</summary>
+            <section id="seg-model-panel" aria-label="AI 分割候选对照" hidden>
+              <p class="endplane-learning-details"><strong>AI 分割对照</strong> · 本机生成独立候选，当前分割保持原样。</p>
+              <div class="endplane-learning-picker">
+                <button id="seg-model-run" type="button" class="button button-primary button-compact" disabled>生成 AI 候选</button>
+                <button id="seg-model-refresh" type="button" class="button button-quiet button-compact">刷新进度</button>
+                <button id="seg-model-cancel" type="button" class="button button-quiet button-compact" hidden>取消任务</button>
+                <button id="seg-model-adopt" type="button" class="button button-primary button-compact" hidden disabled>采用 AI 候选为待复核草稿</button>
+                <label for="seg-model-mode">CT 显示</label>
+                <select id="seg-model-mode" disabled><option value="current">当前结果</option><option value="baseline">原主鼻腔（冻结）</option><option value="candidate">AI 候选</option><option value="difference">增删差异</option></select>
+                <button id="seg-model-jump" type="button" class="button button-quiet button-compact" disabled>跳到差异最多处</button>
+              </div>
+              <p id="seg-model-status" class="endplane-learning-status" role="status" aria-live="polite"></p>
+              <p id="seg-model-result" class="endplane-learning-details"></p>
+              <p id="seg-model-adopt-help" class="endplane-learning-details" hidden>采用后会保留旧掩膜快照，并把 AI 候选放入当前待复核草稿；仍需在三平面 CT 中人工核对并点击“确认气道范围”，不会自动生成 STL 或 CFD。</p>
+              <p class="endplane-learning-details">差异颜色：青色＝共同区域，绿色＝新增，红色＝旧有新无。颜色不代表正确或错误。编辑时自动回到当前结果。</p>
+            </section>
+            <p class="endplane-learning-details">编辑会自动记录主鼻腔掩膜的前后差异。记录不等于正确标签；试验策略仅在副本执行，不会改动当前模型。</p>
+            <p id="seg-learning-status" class="endplane-learning-status" role="status" aria-live="polite"></p>
+            <div class="endplane-learning-picker">
+              <label for="seg-learning-select">修正记录</label><select id="seg-learning-select" disabled></select>
+              <button id="seg-learning-refresh" type="button" class="button button-quiet button-compact">刷新</button>
+            </div>
+            <p id="seg-learning-details" class="endplane-learning-details"></p>
+            <div class="endplane-learning-picker">
+              <label for="seg-learning-strategy">试验策略</label><select id="seg-learning-strategy" disabled></select>
+              <button id="seg-learning-run" type="button" class="button button-quiet button-compact" disabled>试算并对照</button>
+            </div>
+            <pre id="seg-learning-result" class="endplane-learning-details" role="status" aria-live="polite"></pre>
+            <details><summary>将本次修正作为参考样本</summary>
+              <p class="endplane-learning-details">只有已对照 CT 核对的当前版本才可登记。它不代替气道确认，也不会放行气流求解。</p>
+              <div class="endplane-learning-picker">
+                <label for="seg-learning-reason">主要问题</label><select id="seg-learning-reason">
+                  <option value="external_residual">体外空气残留</option><option value="missing_airway">漏掉鼻腔气道</option>
+                  <option value="sinus_residual">鼻窦残留</option><option value="broken_connection">通道断开</option>
+                  <option value="boundary_error">边界不准确</option><option value="mixed">多种问题</option>
+                </select>
+                <label for="seg-learning-subject">匿名患者分组</label><input id="seg-learning-subject" placeholder="subject-001" maxlength="72" aria-describedby="seg-learning-group-help" autocomplete="off">
+              </div>
+              <p id="seg-learning-group-help" class="endplane-learning-details">同一患者的不同 CT 使用同一个匿名编号，避免混入开发集和留出集。不要填写姓名。</p>
+              <label class="endplane-learning-confirm"><input id="seg-learning-checked" type="checkbox">我已对照 CT 核对当前主鼻腔掩膜的完整性和边界</label>
+              <label class="endplane-learning-confirm"><input id="seg-learning-authorized" type="checkbox">已确认该病例可用于本地分割改进评测</label>
+              <div class="endplane-learning-actions">
+                <button id="seg-learning-approve" type="button" class="button button-quiet button-compact" disabled>保存为已核对参考</button>
+                <button id="seg-learning-reject" type="button" class="button button-quiet button-compact" disabled>不作为参考</button>
+              </div>
+            </details>
+          </details>
           <div class="viewer-foot">本地处理 · 数据不上传</div>
         </div>
 
         <div id="case-message-wrap"></div>
         <div id="detail-panels"></div>
+        </details>
       </section>
 
       <!-- ============ 病例 ============ -->
+      <!-- ============ Agent 自动处理 ============ -->
+      <section id="page-agent" class="page" aria-labelledby="agent-title">
+        <div class="page-heading agent-heading">
+          <div><h1 id="agent-title">Agent 自动处理</h1><p>选择病例后开始，Agent 会依次处理，并列出需要你复核的地方。</p></div>
+          <a class="button button-quiet" href="#work">返回工作台</a>
+        </div>
+        <section id="orchestration-panel" class="orchestration-panel agent-layout" aria-label="自动处理控制">
+          <div class="card agent-selection">
+            <div class="card-head"><h2>1. 选择病例</h2><span id="orchestration-selected-count" class="hint" aria-live="polite">已选 0 例</span></div>
+            <div class="card-body">
+              <div class="orchestration-actions agent-selection-actions">
+                <button id="orchestration-current" class="button button-quiet button-compact" type="button" disabled>仅选工作台当前病例</button>
+                <button id="orchestration-select-all" class="button button-quiet button-compact" type="button" disabled>全选</button>
+                <button id="orchestration-clear" class="button button-quiet button-compact" type="button" disabled>清空</button>
+                <button id="orchestration-load" class="button button-quiet button-compact" type="button">刷新列表</button>
+              </div>
+              <p id="orchestration-cases-status" class="agent-context" role="status" aria-live="polite">进入此页后自动读取已导入病例。</p>
+              <div id="orchestration-cases" class="orchestration-cases" role="group" aria-label="选择待处理病例"></div>
+              <p id="orchestration-empty" class="agent-empty" hidden>尚无可处理病例。请先<a href="#cases">导入病例</a>，再刷新列表。</p>
+              <details id="orchestration-settings" class="agent-settings">
+                <summary>高级设置</summary>
+                <label class="orchestration-harness"><input id="orchestration-use-harness" type="checkbox" checked>使用 DeepSeek Harness 编排处理步骤</label>
+                <label class="orchestration-harness"><input id="orchestration-retry-failed" type="checkbox">重试已修正的失败步骤</label>
+                <p>按病例编号逐例处理。掩膜未确认时暂停；已确认掩膜可自动尝试双侧三端口，未通过技术检查时转局部修正。数值检查未通过会显示原因。</p>
+              </details>
+              <div class="agent-start-row"><button id="orchestration-start" class="button button-primary" type="button" disabled>开始自动处理</button></div>
+            </div>
+          </div>
+          <div class="card agent-progress">
+            <div class="card-head"><h2>2. 处理进度</h2><button id="orchestration-refresh" class="button button-quiet button-compact" type="button" hidden>刷新状态</button></div>
+            <div class="card-body">
+              <p id="orchestration-status" class="orchestration-status" role="status" aria-live="polite">选择病例后点击“开始自动处理”，这里会显示当前步骤和待复核事项。</p>
+              <div id="orchestration-live" class="orchestration-live" hidden>
+                <strong id="orchestration-progress-label"></strong>
+                <progress id="orchestration-progress" max="1" value="0" aria-label="已检查病例数"></progress>
+                <span id="orchestration-clock" aria-live="off"></span>
+              </div>
+              <div id="orchestration-results" class="orchestration-results" hidden></div>
+              <button id="orchestration-cancel" class="button button-quiet button-compact agent-cancel" type="button" title="正在运行的病例继续处理，仅取消尚未开始的病例" hidden>取消未开始病例</button>
+            </div>
+          </div>
+        </section>
+        <details id="harness-advice-panel" class="card harness-advice" aria-labelledby="harness-advice-title" hidden>
+          <summary id="harness-advice-title">可选：查看当前工作台病例的 AI 建议</summary>
+          <div class="card-body">
+            <p>仅在点击时向已配置模型发送匿名阶段摘要；不发送 CT 或病历正文。这里生成说明，不启动处理。</p>
+            <p id="harness-advice-case" class="agent-context">尚未在工作台选择病例。</p>
+            <div class="harness-advice-toolbar">
+              <button id="harness-advice-generate" type="button" class="button button-quiet button-compact" disabled>生成下一步建议</button>
+              <span id="harness-advice-status" class="access-status" role="status" aria-live="polite">请先选择病例。</span>
+            </div>
+            <div id="harness-advice-result" class="harness-advice-result" hidden>
+              <div><span class="harness-advice-label">建议复核</span><strong id="harness-advice-next"></strong></div>
+              <div><span class="harness-advice-label">状态提醒</span><p id="harness-advice-recap"></p></div>
+              <div><span class="harness-advice-label">技能草案</span><p id="harness-advice-draft"></p></div>
+              <small id="harness-advice-proof" class="harness-advice-proof"></small>
+              <small id="harness-advice-metering" class="harness-advice-proof"></small>
+            </div>
+          </div>
+        </details>
+
+      </section>
+
       <section id="page-cases" class="page" aria-label="病例">
         <div class="page-heading">
           <div><h1>病例</h1><p>本机病例与导入；影像只在你的电脑上处理。</p></div>
@@ -281,7 +583,7 @@
                   <p id="source-help" class="field-help">请选择包含同一套 DICOM 序列的具体文件夹，例如 ISO_Soft 或 ISO_Bone 的序列目录。数据不会上传。</p>
                 </div>
                 <label class="check"><input id="newcase-synthetic" type="checkbox" aria-describedby="synthetic-help" />仅用于人工生成的合成测试 CT</label>
-                <p id="synthetic-help" class="field-help">合成测试模式会跳过人工端面选择。真实人体 CT，包括公开或已脱敏的数据，请不要勾选。</p>
+                <p id="synthetic-help" class="field-help">合成测试可自动生成端面，也可手动选面验收流程。真实人体 CT，包括公开或已脱敏的数据，请不要勾选。</p>
                 <label class="check"><input id="newcase-anonymize" type="checkbox" checked />导入时生成本地匿名化副本</label>
                 <button id="btn-newcase" class="button button-primary" type="submit">导入并质控</button>
                 <p style="margin:0;color:var(--ink-3);font-size:11.5px;line-height:1.6;">如果拿到的是 .7z 分卷或压缩包，请先在本机解压，再选择里面的一套 DICOM 序列。</p>
@@ -289,6 +591,26 @@
             </div>
           </div>
         </div>
+        <section id="case-grants-panel" class="card access-panel" aria-labelledby="case-grants-title" hidden>
+          <div class="card-head"><h2 id="case-grants-title">病例授权</h2></div>
+          <div class="card-body">
+            <p>只有该病例的 owner 可授予或撤销访问权；账号管理员不自动拥有其他人的病例。</p>
+            <div class="access-inline"><label for="grants-case">病例</label><select id="grants-case" class="case-select"><option value="">选择病例…</option></select><button id="grants-refresh" class="button button-quiet button-compact" type="button" disabled>读取授权</button></div>
+            <p id="grants-status" class="access-status" role="status" aria-live="polite">请选择病例。</p>
+            <div id="grants-list" class="access-list" aria-live="polite"></div>
+            <form id="grant-form" class="access-form">
+              <div class="field"><label for="grant-user-id">目标账号 ID</label><input id="grant-user-id" type="text" list="grant-users" pattern="[0-9a-f]{32}" maxlength="32" autocomplete="off" required disabled placeholder="由账号管理员提供的 32 位 ID" /><datalist id="grant-users"></datalist></div>
+              <div class="field"><label for="grant-role">病例权限</label><select id="grant-role" disabled><option value="viewer">仅查看</option><option value="editor">编辑</option><option value="reviewer">复核与分享</option><option value="owner">owner（可管理授权）</option></select></div>
+              <button id="grant-submit" class="button button-primary" type="submit" disabled>保存授权</button>
+            </form>
+          </div>
+        </section>
+      </section>
+
+      <section id="page-accounts" class="page" aria-label="账号管理" hidden>
+        <div class="page-heading"><div><h1>账号管理</h1><p>管理员创建或停用操作账号；新账号默认无法访问现有病例。</p></div><button id="accounts-refresh" class="button button-quiet" type="button">刷新账号</button></div>
+        <section class="card" aria-labelledby="accounts-list-title"><div class="card-head"><h2 id="accounts-list-title">账号列表</h2></div><div class="card-body"><p id="accounts-status" class="access-status" role="status" aria-live="polite">等待读取账号。</p><div id="accounts-list" class="access-list" aria-live="polite"></div></div></section>
+        <section class="card" aria-labelledby="accounts-create-title"><div class="card-head"><h2 id="accounts-create-title">创建账号</h2></div><div class="card-body"><p>请通过安全渠道交付初始密码。账号 ID 可提供给对应病例 owner，用于授权。</p><form id="account-create-form" class="access-form"><div class="field"><label for="account-username">账号名</label><input id="account-username" type="text" minlength="1" maxlength="80" autocomplete="off" required /></div><div class="field"><label for="account-password">初始密码</label><input id="account-password" type="password" maxlength="1024" autocomplete="new-password" required aria-describedby="account-password-help" /><p id="account-password-help" class="field-help">密码至少 16 个 UTF-8 字节；密码不会显示在账号列表中。</p></div><div class="field"><label for="account-role">全局角色</label><select id="account-role"><option value="member">普通成员</option><option value="admin">账号管理员</option></select></div><button id="account-create-submit" class="button button-primary" type="submit" disabled>创建账号</button></form></div></section>
       </section>
 
       <!-- ============ 环境 ============ -->
@@ -298,13 +620,106 @@
           <button id="btn-refresh-env" class="button button-quiet">重新探测</button>
         </div>
         <div id="env-body"><div class="skeleton" style="height:180px;"></div></div>
+        <section id="operator-preferences-panel" class="card operator-preferences" aria-labelledby="operator-preferences-title" hidden>
+          <div class="card-head"><h2 id="operator-preferences-title">个人使用偏好</h2><span class="hint">仅当前账号</span></div>
+          <div class="card-body">
+            <p>偏好只改变视角、色标显示和快捷入口，不修改病例、网格、边界条件或求解参数。</p>
+            <p id="operator-preferences-status" class="access-status" role="status" aria-live="polite">等待读取个人偏好。</p>
+            <form id="operator-preferences-form" class="operator-preferences-form">
+              <fieldset class="pref-fieldset">
+                <legend>默认视角</legend>
+                <label class="check"><input id="pref-pose-enabled" type="checkbox" disabled />启用自定义视角</label>
+                <div class="pref-grid pref-grid-three">
+                  <div class="field"><label for="pref-azimuth">水平方位角（°）</label><input id="pref-azimuth" type="number" min="-180" max="180" step="any" value="0" disabled /></div>
+                  <div class="field"><label for="pref-elevation">仰角（°）</label><input id="pref-elevation" type="number" min="-90" max="90" step="any" value="0" disabled /></div>
+                  <div class="field"><label for="pref-zoom">距离倍率（0.7–5）</label><input id="pref-zoom" type="number" min="0.7" max="5" step="any" value="1" disabled /></div>
+                </div>
+                <p class="field-help">角度只用于默认观察方向；进入病例流场后仍可自由旋转、缩放。</p>
+              </fieldset>
+              <fieldset class="pref-fieldset">
+                <legend>显示色标</legend>
+                <label class="check"><input id="pref-velocity-enabled" type="checkbox" disabled />自定义速度范围（m/s）</label>
+                <div class="pref-grid pref-grid-two">
+                  <div class="field"><label for="pref-velocity-min">速度最小值（m/s）</label><input id="pref-velocity-min" type="number" min="0" max="500" step="any" disabled /></div>
+                  <div class="field"><label for="pref-velocity-max">速度最大值（m/s）</label><input id="pref-velocity-max" type="number" min="0" max="500" step="any" disabled /></div>
+                </div>
+                <label class="check"><input id="pref-pressure-enabled" type="checkbox" disabled />自定义压力范围</label>
+                <div class="pref-grid pref-grid-three">
+                  <div class="field"><label for="pref-pressure-unit">压力单位</label><select id="pref-pressure-unit" disabled><option value="Pa">Pa</option><option value="m2/s2">m²/s²（数据标识 m2/s2）</option><option value="m²/s²">m²/s²（数据标识 m²/s²）</option></select></div>
+                  <div class="field"><label for="pref-pressure-min">压力最小值（所选单位）</label><input id="pref-pressure-min" type="number" min="-1000000" max="1000000" step="any" disabled /></div>
+                  <div class="field"><label for="pref-pressure-max">压力最大值（所选单位）</label><input id="pref-pressure-max" type="number" min="-1000000" max="1000000" step="any" disabled /></div>
+                </div>
+                <p class="field-help">色标只在结果数据的单位与此处完全一致时应用；切换压力单位后需重新填写数值。</p>
+              </fieldset>
+              <fieldset class="pref-fieldset">
+                <legend>常用步骤（最多 8 项）</legend>
+                <div class="pref-step-grid">
+                  <label class="check"><input id="pref-step-qc" type="checkbox" disabled />质量检查</label>
+                  <label class="check"><input id="pref-step-segment" type="checkbox" disabled />分割</label>
+                  <label class="check"><input id="pref-step-endplanes" type="checkbox" disabled />端面裁切</label>
+                  <label class="check"><input id="pref-step-surface" type="checkbox" disabled />表面模型</label>
+                  <label class="check"><input id="pref-step-cfd_prep" type="checkbox" disabled />CFD 算例</label>
+                  <label class="check"><input id="pref-step-cfd_run" type="checkbox" disabled />CFD 求解</label>
+                  <label class="check"><input id="pref-step-cfd_results" type="checkbox" disabled />病例流场</label>
+                  <label class="check"><input id="pref-step-report" type="checkbox" disabled />报告</label>
+                  <label class="check"><input id="pref-step-review" type="checkbox" disabled />CFD 复核</label>
+                  <label class="check"><input id="pref-step-share" type="checkbox" disabled />患者分享</label>
+                </div>
+                <p class="field-help">保存后显示快捷入口；点击只跳转到现有页面，不会自动开始处理或发布。</p>
+                <div id="operator-favorite-links" class="pref-favorite-links" aria-label="常用步骤快捷入口"></div>
+              </fieldset>
+              <div class="pref-actions"><button id="operator-preferences-refresh" class="button button-quiet" type="button">重新加载</button><button id="operator-preferences-save" class="button button-primary" type="submit" disabled>保存偏好</button></div>
+            </form>
+          </div>
+        </section>
+        <section id="operator-recipes-panel" class="card operator-recipes" aria-labelledby="operator-recipes-title" hidden>
+          <div class="card-head"><h2 id="operator-recipes-title">个人操作配方草案</h2><span class="hint">仅当前账号 · 不自动执行</span></div>
+          <div class="card-body">
+            <p>把常用检查顺序记为私有草案。步骤只是建议标签，工具仅限只读查询；保存草案不会处理病例或发布结果。</p>
+            <div class="recipe-toolbar"><p id="operator-recipes-status" class="access-status" role="status" aria-live="polite">等待读取草案。</p><button id="operator-recipes-refresh" class="button button-quiet" type="button">重新加载</button></div>
+            <div id="operator-recipes-list" class="recipe-list" aria-label="个人操作配方草案列表" aria-live="polite"></div>
+            <section class="recipe-candidates" aria-labelledby="operator-recipe-candidates-title">
+              <div class="recipe-toolbar"><h3 id="operator-recipe-candidates-title">使用习惯线索</h3><button id="operator-recipe-candidates-refresh" class="button button-quiet" type="button" disabled>分析我的操作记录</button></div>
+              <p class="field-help">仅根据当前账号近 180 天、仍有权访问的不同病例中的重复操作顺序提出建议；不代表建模质量或临床结论。</p>
+              <p id="operator-recipe-candidates-status" class="access-status" role="status" aria-live="polite">点击“分析我的操作记录”查看候选。</p>
+              <div id="operator-recipe-candidates-list" class="recipe-list" aria-label="候选操作顺序" aria-live="polite"></div>
+            </section>
+            <form id="operator-recipes-form" class="operator-recipes-form">
+              <h3 id="operator-recipes-form-title">新建草案</h3>
+              <fieldset class="pref-fieldset"><legend>建议步骤（至少 1 项）</legend><div class="pref-step-grid">
+                <label class="check"><input id="recipe-step-qc" type="checkbox" disabled />质量检查</label>
+                <label class="check"><input id="recipe-step-segment" type="checkbox" disabled />分割</label>
+                <label class="check"><input id="recipe-step-endplanes" type="checkbox" disabled />端面裁切</label>
+                <label class="check"><input id="recipe-step-surface" type="checkbox" disabled />表面模型</label>
+                <label class="check"><input id="recipe-step-cfd_prep" type="checkbox" disabled />CFD 算例</label>
+                <label class="check"><input id="recipe-step-cfd_results" type="checkbox" disabled />病例流场</label>
+                <label class="check"><input id="recipe-step-report" type="checkbox" disabled />报告</label>
+                <label class="check"><input id="recipe-step-review" type="checkbox" disabled />CFD 复核</label>
+              </div></fieldset>
+              <fieldset class="pref-fieldset"><legend>允许读取的信息（至少 1 项）</legend><div class="pref-step-grid">
+                <label class="check"><input id="recipe-tool-service_status" type="checkbox" disabled />服务状态</label>
+                <label class="check"><input id="recipe-tool-list_cfd_cases" type="checkbox" disabled />匿名病例列表</label>
+                <label class="check"><input id="recipe-tool-inspect_cfd_case" type="checkbox" disabled />病例准备状态</label>
+                <label class="check"><input id="recipe-tool-get_cfd_batch" type="checkbox" disabled />计算批次摘要</label>
+              </div><p class="field-help">选择仅记录草案所需信息，不授予新权限；使用时仍须按病例鉴权。</p></fieldset>
+              <div class="field"><label for="operator-recipes-trigger">建议出现的时机</label><select id="operator-recipes-trigger" disabled><option value="manual">手动查看</option><option value="case_stage_changed">病例阶段变化</option><option value="batch_finished">计算批次完成</option><option value="numeric_gate_failed">数值质量闸门未通过</option></select></div>
+              <div class="pref-actions"><button id="operator-recipes-cancel" class="button button-quiet" type="button" hidden>取消编辑</button><button id="operator-recipes-submit" class="button button-primary" type="submit" disabled>创建草案</button></div>
+            </form>
+          </div>
+        </section>
+      </section>
+
+      <section id="page-activity" class="page" aria-label="操作记录" hidden>
+        <div class="page-heading">
+          <div><h1>操作记录</h1><p>记录工作台操作步骤与处理状态，不记录文本输入、病例文件或影像。</p></div>
+        </div>
         <section class="activity-monitor" aria-labelledby="monitor-title">
           <div class="monitor-heading">
-            <h2 id="monitor-title">本机操作记录</h2>
+            <h2 id="monitor-title">最近操作</h2>
             <span id="monitor-status" role="status" aria-live="polite">等待连接</span>
             <button id="monitor-refresh" class="button button-quiet" type="button">刷新记录</button>
           </div>
-          <p id="monitor-summary">操作记录仅保存在本机。</p>
+          <p id="monitor-summary">等待读取操作记录。</p>
           <label class="check"><input id="monitor-errors-only" type="checkbox" />只看失败与错误</label>
           <p id="monitor-error" role="alert" hidden></p>
           <ol id="monitor-events" class="monitor-events" aria-label="最近五十条操作记录"><li>等待读取记录。</li></ol>
@@ -368,27 +783,156 @@
         </div>
       </section>
 
-      <!-- ============ 参考样本 ============ -->
-      <section id="page-sample" class="page" aria-label="参考样本">
-        <div class="notice-banner"><b>注意：</b>下面是项目发起方提供的参考 CFD 结果（他人的病例），只用于查看目标产物形态；它不是本工作台的计算输出，更不是任何用户病例的结果。</div>
-        <div class="card" style="overflow:hidden;">
-          <iframe id="sample-frame" src="/reference-result" style="display:block;width:100%;height:640px;border:0;" title="项目参考 CFD 样本"></iframe>
+      <!-- ============ CFD 复核（仅公网研究入口） ============ -->
+      <section id="page-cfd-review" class="page" aria-label="CFD 复核">
+        <div class="page-heading"><div><h1>CFD 复核</h1><p>查看自动数值检查，登记网格对比和工程师意见。</p></div></div>
+        <div class="notice-banner">当前为共享团队账号：登记姓名不等于验证工程师身份。这里的记录不会改动数值检查，也不会自动开放患者分享。请保留去标识的原始复核报告。</div>
+        <section class="card" aria-labelledby="cfd-review-case-title">
+          <div class="card-head"><h2 id="cfd-review-case-title">选择算例</h2></div>
+          <div class="card-body"><form id="cfd-review-case-form" class="share-case-form"><label for="cfd-review-case-id">病例</label><select id="cfd-review-case-id" class="case-select" required><option value="">选择病例…</option></select><button class="button button-quiet" type="submit">读取复核状态</button></form></div>
+        </section>
+        <div id="cfd-review-content" hidden>
+          <section class="card share-gate" aria-labelledby="cfd-review-numeric-title">
+            <div class="card-head"><h2 id="cfd-review-numeric-title">自动数值检查（只读）</h2></div>
+            <div class="card-body"><p id="cfd-review-run" class="share-help"></p><p id="cfd-review-numeric-status" class="share-status" role="status"></p><div id="cfd-review-checks" class="share-list"></div><button id="cfd-review-copy" class="button button-quiet button-compact" type="button">复制匿名复核摘要</button><p class="share-help">残差、质量守恒、场完整性和网格质量由程序检查，不能靠人工填写改成通过。</p></div>
+          </section>
+          <div class="share-grid">
+            <section class="card" aria-labelledby="cfd-review-mesh-title">
+              <div class="card-head"><h2 id="cfd-review-mesh-title">登记网格对比证据</h2></div>
+              <div class="card-body"><p>填写粗、中、细三个独立算例的结果。记录只作留痕；程序尚不能核实这些外部算例。</p>
+                <form id="cfd-review-mesh-form" class="share-form">
+                  <div class="field"><label for="cfd-review-mesh-reviewer">记录人</label><input id="cfd-review-mesh-reviewer" required minlength="2" maxlength="80" /></div>
+                  <div class="cfd-review-grid-head" aria-hidden="true"><span>网格</span><span>算例编号</span><span>单元数</span><span>压降 Pa</span></div>
+                  <div class="cfd-review-grid-row"><label for="cfd-review-coarse-id">粗</label><input id="cfd-review-coarse-id" aria-label="粗网格算例编号" required maxlength="100" /><input id="cfd-review-coarse-cells" aria-label="粗网格单元数" type="number" min="1" step="1" required /><input id="cfd-review-coarse-dp" aria-label="粗网格压降 Pa" type="number" min="0" step="any" required /></div>
+                  <div class="cfd-review-grid-row"><label for="cfd-review-medium-id">中</label><input id="cfd-review-medium-id" aria-label="中网格算例编号" required maxlength="100" /><input id="cfd-review-medium-cells" aria-label="中网格单元数" type="number" min="1" step="1" required /><input id="cfd-review-medium-dp" aria-label="中网格压降 Pa" type="number" min="0" step="any" required /></div>
+                  <div class="cfd-review-grid-row"><label for="cfd-review-fine-id">细</label><input id="cfd-review-fine-id" aria-label="细网格算例编号" required maxlength="100" /><input id="cfd-review-fine-cells" aria-label="细网格单元数" type="number" min="1" step="1" required /><input id="cfd-review-fine-dp" aria-label="细网格压降 Pa" type="number" min="0" step="any" required /></div>
+                  <div class="field"><label for="cfd-review-mesh-evidence">去标识报告编号或 SHA-256</label><input id="cfd-review-mesh-evidence" required minlength="8" maxlength="200" /></div>
+                  <div class="field"><label for="cfd-review-mesh-note">比较判据与结论</label><textarea id="cfd-review-mesh-note" required minlength="10" maxlength="2000" rows="4"></textarea></div>
+                  <button class="button button-primary" type="submit">保存网格证据记录</button>
+                </form>
+              </div>
+            </section>
+            <section class="card" aria-labelledby="cfd-review-engineer-title">
+              <div class="card-head"><h2 id="cfd-review-engineer-title">登记工程师意见</h2></div>
+              <div class="card-body"><p>请由真实 CFD 工程师复核并保留原始报告；共享登录下的姓名只是登记信息，不是电子签名。</p>
+                <form id="cfd-review-engineer-form" class="share-form">
+                  <div class="field"><label for="cfd-review-engineer-name">工程师姓名</label><input id="cfd-review-engineer-name" required minlength="2" maxlength="80" /></div>
+                  <div class="field"><label for="cfd-review-engineer-decision">意见</label><select id="cfd-review-engineer-decision"><option value="changes_required">需要调整</option><option value="reviewed">已审阅，待独立确认</option></select></div>
+                  <div class="field"><label for="cfd-review-engineer-evidence">去标识报告编号或 SHA-256</label><input id="cfd-review-engineer-evidence" required minlength="8" maxlength="200" /></div>
+                  <div class="field"><label for="cfd-review-engineer-note">复核意见</label><textarea id="cfd-review-engineer-note" required minlength="10" maxlength="2000" rows="5"></textarea></div>
+                  <button class="button button-primary" type="submit">保存工程意见记录</button>
+                </form>
+              </div>
+            </section>
+          </div>
+          <section class="card share-gate" aria-labelledby="cfd-review-history-title"><div class="card-head"><h2 id="cfd-review-history-title">本算例复核记录</h2></div><div id="cfd-review-history" class="card-body share-list" aria-live="polite"></div></section>
         </div>
+        <p id="cfd-review-status" class="share-status" role="status" aria-live="polite"></p>
+      </section>
+
+      <!-- ============ 患者分享管理（仅公网研究入口） ============ -->
+      <section id="page-share" class="page" aria-label="患者分享管理">
+        <div class="page-heading"><div><h1>患者分享管理</h1><p>查看结果闸门；全部通过后才可发布对应的只读模型。</p></div></div>
+        <div class="notice-banner">仅处理已授权、已去标识的病例。当前为共享团队账号，审核人须如实填写；患者链接与访问码需分别交付。</div>
+        <div class="card">
+          <div class="card-head"><h2>选择病例</h2></div>
+          <div class="card-body"><form id="case-form" class="share-case-form"><label for="case-id">病例</label><select id="case-id" class="case-select" required><option value="">选择病例…</option></select><button class="button button-quiet" type="submit">读取记录</button></form><p class="share-help">选择工作台已有病例，无需手动输入病例编号。</p></div>
+        </div>
+        <section id="share-gate" class="card share-gate" aria-labelledby="share-gate-title" hidden>
+          <div class="card-head"><h2 id="share-gate-title">发布条件（只读）</h2></div>
+          <div class="card-body"><p id="share-gate-status" class="share-status" role="status" aria-live="polite"></p><div id="share-gate-checks" class="share-list" aria-label="结果检查项"></div><p class="share-help">这里展示计算与复核状态；下方“记录人工处理”只留痕，不会把未通过的项目改为通过。</p><button id="share-open-cfd-review" class="button button-quiet button-compact" type="button">前往 CFD 复核</button></div>
+        </section>
+        <div id="admin-content" class="share-grid" hidden>
+          <section class="card" aria-labelledby="share-review-title">
+            <div class="card-head"><h2 id="share-review-title">记录人工处理</h2></div>
+            <div class="card-body"><form id="review-form" class="share-form">
+              <div class="field"><label for="operator">操作人</label><input id="operator" required minlength="2" maxlength="80" placeholder="团队成员姓名" /></div>
+              <div class="field"><label for="review-stage">阶段</label><select id="review-stage"><option value="qc">影像质控</option><option value="segment">掩膜与人工纠错</option><option value="surface">几何</option><option value="cfd_prep">求解参数</option><option value="cfd_run">求解</option><option value="cfd_results">结果复核</option></select></div>
+              <div class="field"><label for="review-action">动作</label><select id="review-action"><option value="correction">人工修改</option><option value="qc">质控复核</option><option value="note">处理备注</option></select></div>
+              <div class="field"><label for="review-reason">原因与改动</label><input id="review-reason" required minlength="4" maxlength="1000" placeholder="请勿填写患者身份信息" /></div>
+              <button class="button button-primary" type="submit">保存记录</button>
+            </form><h3 class="share-list-title">处理记录</h3><div id="reviews" class="share-list" aria-live="polite"></div></div>
+          </section>
+          <section class="card" aria-labelledby="share-publish-title">
+            <div class="card-head"><h2 id="share-publish-title">审核并发布固定版本</h2></div>
+            <div class="card-body"><p>发布前再次检查掩膜确认、CFD 数值、网格敏感性和工程复核。新结果不会更改旧链接。</p>
+              <form id="publish-form" class="share-form">
+                <div class="field"><label for="reviewer">审核人</label><input id="reviewer" required minlength="2" maxlength="80" placeholder="团队成员姓名" /></div>
+                <div class="field"><label for="review-note">审核说明</label><input id="review-note" required minlength="10" maxlength="1000" placeholder="写明已复核版本与发布理由" /></div>
+                <div class="field"><label for="days">有效天数</label><input id="days" type="number" min="1" max="30" value="7" required /></div>
+                <button id="publish-submit" class="button button-primary" type="submit" disabled>审核并生成链接</button>
+              </form>
+              <div id="issued" class="share-issued" hidden><p>链接与访问码只在本次生成时显示，请分别交付给对应患者。</p><div class="field"><label for="issued-link">链接</label><input id="issued-link" readonly /></div><div class="field"><label for="issued-code">访问码</label><input id="issued-code" readonly /></div></div>
+              <h3 class="share-list-title">链接记录（含测试）</h3><div id="shares" class="share-list" aria-live="polite"></div>
+            </div>
+          </section>
+          <section class="card share-test" aria-labelledby="share-test-title">
+            <div class="card-head"><h2 id="share-test-title">患者测试分享</h2></div>
+            <div class="card-body"><p>只用于核对链接、访问码和模型能否打开。当前病例的 CFD 检查仍显示未通过；测试分享不会将其改成通过，也不能作为正式患者结果。测试链接 24 小时失效，可随时撤销。</p>
+              <form id="test-publish-form" class="share-form">
+                <div class="field"><label for="test-operator">操作人</label><input id="test-operator" required minlength="2" maxlength="80" placeholder="团队成员姓名" /></div>
+                <div class="field"><label for="test-reason">测试目的</label><input id="test-reason" required minlength="10" maxlength="1000" placeholder="说明仅测试页面与访问流程；勿填写患者身份信息" /></div>
+                <label class="share-consent"><input id="test-recipient-confirmed" type="checkbox" required /><span>已确认患者本人同意接收未验证的测试可视化，并会明确告知其不能用于判断病情或治疗。</span></label>
+                <button id="test-publish-submit" class="button button-quiet" type="submit">生成未验证测试链接</button>
+              </form>
+              <div id="test-issued" class="share-issued" hidden><p>这是未验证的测试链接，不是正式发布。链接和访问码仅在本次显示，请分别交付，完成测试后撤销。</p><div class="field"><label for="test-issued-link">测试链接</label><input id="test-issued-link" readonly /></div><div class="field"><label for="test-issued-code">访问码</label><input id="test-issued-code" readonly /></div></div>
+            </div>
+          </section>
+        </div>
+        <p id="admin-status" class="share-status" role="status" aria-live="polite"></p>
+      </section>
+
+      <!-- ============ 参考病例 ============ -->
+      <section id="page-sample" class="page" aria-label="参考病例管理">
+        <div class="page-heading reference-admin-heading"><div><h1>参考病例</h1><p>将工作台已有病例登记为参考。标签由团队核对，发布固定展示版本；不公开原始 CT、患者身份或研究接口。</p></div><a class="button button-quiet" href="/references" target="_blank" rel="noopener">打开参考病例库</a></div>
+        <section class="card"><div class="card-head"><h2>选择工作台病例</h2></div><div class="card-body">
+          <div class="share-case-form"><label for="ref-admin-case">病例</label><select id="ref-admin-case" class="case-select"><option value="">选择病例…</option></select><button id="ref-admin-refresh" class="button button-quiet" type="button">刷新列表</button></div>
+          <p id="ref-admin-readiness" class="share-help"></p><p id="ref-admin-record" class="share-help"></p>
+        </div></section>
+        <section class="card"><div class="card-head"><h2>核对标签并发布</h2></div><div class="card-body">
+          <form id="ref-admin-form" class="share-form" hidden>
+            <div class="field"><label for="ref-admin-title">公开标题</label><input id="ref-admin-title" required minlength="2" maxlength="80" placeholder="例如：参考病例 01，请勿填写患者姓名" /></div>
+            <div class="field"><label for="ref-admin-description">公开说明</label><textarea id="ref-admin-description" maxlength="600" rows="3" placeholder="简述展示范围，不填写身份信息或诊疗建议"></textarea></div>
+            <fieldset><legend>已核对标签（可多选，不能仅凭模型猜测）</legend><div id="ref-admin-tags"></div></fieldset>
+            <div class="field"><label for="ref-admin-kind">发布内容</label><select id="ref-admin-kind"><option value="anatomy">仅结构 · 气道形态</option><option value="flow">结构＋气流 · 正式参考，需完整 CFD 复核</option><option value="flow_test">结构＋气流 · 未复核测试，24 小时后失效</option></select></div>
+            <label id="ref-admin-test-confirmation" class="share-consent" hidden><input id="ref-admin-test-confirm" type="checkbox" /><span>我确认该未复核气流可在无需登录的参考病例库展示 24 小时，仅用于可视化测试，不作为正常参考或诊疗依据。</span></label>
+            <label class="share-consent"><input id="ref-admin-authorization" type="checkbox" /><span>本病例已取得参考病例库对外展示授权。</span></label>
+            <label class="share-consent"><input id="ref-admin-labels-confirmed" type="checkbox" /><span>已人工核对所选标签与本病例对应关系。</span></label>
+            <div class="field"><label for="ref-admin-reviewer">审核记录人</label><input id="ref-admin-reviewer" required minlength="2" maxlength="80" /></div>
+            <div class="field"><label for="ref-admin-note">内部审核说明</label><textarea id="ref-admin-note" required minlength="10" maxlength="1000" rows="3" placeholder="记录授权和标签核对依据，以及本次展示版本"></textarea></div>
+            <div class="share-case-form"><button class="button button-quiet" type="submit" value="draft">保存草稿</button><button id="ref-admin-publish" class="button button-primary" type="submit" value="publish">核对并发布参考</button><button id="ref-admin-revoke" class="button button-quiet" type="button" hidden>撤回参考</button></div>
+          </form>
+        </div></section><p id="ref-admin-status" class="share-status" role="status" aria-live="polite"></p>
       </section>
     </main>
   </div>
 
   <div class="toast-wrap" id="toasts"></div>
 
-  <script src="/static/access-context.js?v=20261017-upload1"></script>
-  <script src="/static/activity-monitor.js?v=20261014-public1"></script>
+  <script src="/static/access-context.js?v=20261104-deployment1"></script>
+  <script src="/static/activity-monitor.js?v=20261101-activity1"></script>
   <script src="/static/vendor/three.min.js"></script>
   <script src="/static/vendor/STLLoader.js"></script>
   <script src="/static/vendor/OrbitControls.js"></script>
   <!-- Three.js r128 examples/js/controls/TransformControls.js; MIT license in static/vendor/LICENSE-three-r128.txt -->
   <script src="/static/vendor/TransformControls.js"></script>
-  <script src="/static/cfd-viewer.js?v=20261017-section-drag1"></script>
+  <script src="/static/endplane-picker.js?v=20261108-inlet-region-label1"></script>
+  <script src="/static/endplane-tools.js?v=20261109-local-section1"></script>
+  <script src="/static/endplane-opening-markup.js?v=20261109-prototype2"></script>
+  <script src="/static/cfd-viewer.js?v=20261102-preferences1"></script>
   <script src="/static/cfd-sections.js?v=20261017-section-drag1"></script>
-  <script src="/static/app.js?v=20261017-scenario-loop1"></script>
+  <script src="/static/cfd-review-admin.js?v=20261031-review-workflow1"></script>
+  <script src="/static/share-admin.js?v=20261031-test-share1"></script>
+  <script src="/static/reference-admin.js?v=20261102-flow-test1"></script>
+  <script src="/static/access-admin.js?v=20261102-accounts1"></script>
+  <script src="/static/operator-preferences.js?v=20261102-preferences1"></script>
+  <script src="/static/operator-recipes.js?v=20261102-recipes2"></script>
+  <script src="/static/harness-advice.js?v=20261106-agent-page1"></script>
+  <script src="/static/endplane-learning.js?v=20261104-auto2"></script>
+  <script src="/static/segmentation-learning.js?v=20261106-learning1"></script>
+  <script src="/static/segmentation-models.js?v=20261108-draft1"></script>
+  <script src="/static/quick-preview.js?v=20261111-cfd-rebuild1"></script>
+  <script src="/static/app.js?v=20261111-cfd-rebuild3"></script>
+  <script src="/static/orchestration-ui.js?v=20261110-auto-entry2"></script>
 </body>
 </html>

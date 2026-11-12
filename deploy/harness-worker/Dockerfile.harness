@@ -1,0 +1,48 @@
+# Dedicated image. Build with the project root as context and the adjacent
+# Dockerfile-specific ignore file; no case data or credentials enter the build.
+FROM node:24.9.0-bookworm-slim@sha256:3e69116c924bfcba6c6979aff60d966c37aef56d488ce091c69d442ebec9f103 AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/harness-worker/package.json deploy/harness-worker/package-lock.json /opt/harness-runtime/
+RUN npm ci --prefix /opt/harness-runtime --omit=dev --ignore-scripts --no-audit --no-fund \
+    && node -p "require('/opt/harness-runtime/node_modules/@deepseek-ai/dsh/package.json').version" \
+       | grep -Fx '0.2.2-alpha.2'
+
+RUN python3 -m venv /opt/harness-venv
+COPY deploy/harness-worker/requirements.txt /tmp/harness-requirements.txt
+RUN /opt/harness-venv/bin/pip install --no-cache-dir -r /tmp/harness-requirements.txt
+
+# The SDK source is fetched by immutable upstream commit, not from the host's
+# other DeepSeek installations. The separate npm CLI above is its dsh_bin.
+ARG SDK_COMMIT=f3803c96974ad4a94195fb97e5c637e9c2a3afe3
+RUN test "$SDK_COMMIT" = f3803c96974ad4a94195fb97e5c637e9c2a3afe3 \
+    && git clone --filter=blob:none --no-checkout https://github.com/deepseek-ai/deepseek-harness.git /tmp/deepseek-harness \
+    && git -C /tmp/deepseek-harness checkout --detach "$SDK_COMMIT" \
+    && test "$(git -C /tmp/deepseek-harness rev-parse HEAD)" = "$SDK_COMMIT" \
+    && /opt/harness-venv/bin/pip install --no-cache-dir --no-deps /tmp/deepseek-harness/python/sdk \
+    && /opt/harness-venv/bin/python -c "import deepseek_harness; print(deepseek_harness.__file__)"
+
+FROM node:24.9.0-bookworm-slim@sha256:3e69116c924bfcba6c6979aff60d966c37aef56d488ce091c69d442ebec9f103
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 harness \
+    && useradd --uid 10001 --gid 10001 --home-dir /home/harness --create-home --shell /usr/sbin/nologin harness \
+    && mkdir -p /opt/windcatcher/scripts /opt/windcatcher/deploy /work \
+    && chown harness:harness /work
+
+COPY --from=build /opt/harness-venv /opt/harness-venv
+COPY --from=build /opt/harness-runtime /opt/harness-runtime
+COPY scripts/check_harness_profile.py scripts/harness_readonly_sidecar.py scripts/harness_sdk_worker.py scripts/harness_endplane_worker.py scripts/harness_action_selector.py scripts/harness_container_worker.py /opt/windcatcher/scripts/
+COPY deploy/harness-readonly.patch.yml /opt/windcatcher/deploy/harness-readonly.patch.yml
+
+ENV PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+    NARB_DISABLE_NATIVE_CACHE=1 \
+    WINDCATCHER_HARNESS_DSH_BIN=/opt/harness-runtime/node_modules/.bin/dsh \
+    HOME=/home/harness TMPDIR=/tmp
+USER 10001:10001
+WORKDIR /work
+ENTRYPOINT ["/opt/harness-venv/bin/python", "-s", "/opt/windcatcher/scripts/harness_container_worker.py"]

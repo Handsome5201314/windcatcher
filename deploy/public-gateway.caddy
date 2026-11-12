@@ -1,0 +1,24 @@
+# Authentication is handled by the public deployment of cloud:create_app.
+# Patient links retain their own token, access-code and short-session checks.
+windcatcher.tongyimoheai.top {
+    encode zstd gzip
+    header {
+        Cache-Control "no-store"
+        X-Robots-Tag "noindex, nofollow, noarchive"
+        X-Frame-Options "SAMEORIGIN"
+        X-Content-Type-Options "nosniff"
+    }
+    route {
+        @other_origin expression {http.request.header.Origin} != "" && {http.request.header.Origin} != "https://windcatcher.tongyimoheai.top"
+        respond @other_origin "Cross-site requests are not allowed." 403
+        @local_tools path /api/pick-directory /api/environment/install /api/environment/install/* /api/cases/*/open-slicer
+        header @local_tools Content-Type application/json
+        respond @local_tools `{"detail":{"reason":"此功能仅限服务主机本地操作"}}` 403
+        reverse_proxy 127.0.0.1:18765 {
+            header_up -Authorization
+            transport http {
+                dial_timeout 10s
+            }
+        }
+    }
+}

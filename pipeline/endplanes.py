@@ -6,15 +6,27 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
+import os
 import secrets
+import time
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
+from typing import Callable
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 import numpy as np
 from scipy import ndimage
 
 from .cases import case_dir, invalidate_downstream
-from . import oblique
+from . import endplane_history, oblique
 from .config import MIN_OPENING_AREA_MM2
 from .errors import PipelineError
 from .mask_review import has_current_external_air_validation
@@ -23,6 +35,129 @@ from .volume import ANTERIOR_LPS, load_volume
 SCOPES = {"main_airway": "mask.npy", "full_candidate": "candidate_mask.npy"}
 VIEWS = {0: "axial", 1: "coronal", 2: "sagittal"}
 PLAN_NAME = "endplanes.json"
+LOCAL_INLET_FORMAT = "oblique_local_inlet_v2"
+BILATERAL_LOCAL_FORMAT = "oblique_bilateral_local_v3"
+SAVE_LOCK_TIMEOUT_SECONDS = 120
+
+
+def automated_plan_is_valid(plan: dict | None) -> bool:
+    """Validate technical provenance; this does not establish anatomy accuracy."""
+    from .endplane_auto_candidate import BILATERAL_GENERATOR_VERSION
+
+    if not isinstance(plan, dict) or plan.get("format") != BILATERAL_LOCAL_FORMAT:
+        return False
+    if (plan.get("scope") != "main_airway"
+            or plan.get("confirmation_source") != "automated_technical_gate"
+            or plan.get("human_confirmed") is not False
+            or plan.get("generator_version") != BILATERAL_GENERATOR_VERSION
+            or plan.get("complete") is not True
+            or type(plan.get("mask_version")) is not int):
+        return False
+    stats = plan.get("mesh_preflight")
+    if not isinstance(stats, dict) or stats.get("format") != "oblique_mesh_clip_bilateral_local_v3":
+        return False
+    if stats.get("closed_caps") is not True or any(
+        stats.get(key) != 1 for key in ("left_inlet_loops", "right_inlet_loops", "outlet_loops")
+    ) or any(type(stats.get(key)) is not int or stats[key] < 1 for key in (
+        "left_inlet_cap_faces", "right_inlet_cap_faces", "outlet_cap_faces"
+    )):
+        return False
+    source = plan.get("source_voxels")
+    retained = plan.get("retained_voxels")
+    return (type(source) is int and source > 0
+            and type(retained) is int and 0 < retained <= source
+            and (source - retained) / source <= 0.25
+            and all(type(plan.get(f"{side}_deleted_voxels")) is int
+                    and 0 <= plan[f"{side}_deleted_voxels"] / source <= 0.15
+                    for side in ("left", "right", "posterior")))
+
+
+@contextmanager
+def _case_save_lock(case_id: str):
+    """Serialize all endplane writes, including recovery, across processes.
+
+    The lock lives beside the learning ledger rather than inside the case tree,
+    so a failed save does not modify the case's clinical artifacts. OS locks are
+    released automatically if the saving process terminates unexpectedly.
+    """
+    case_dir(case_id)  # Reject path traversal before creating a lock file.
+    lock_dir = endplane_history._path().parent / "locks"
+    lock_name = hashlib.sha256(case_id.encode("utf-8")).hexdigest() + ".lock"
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        handle = (lock_dir / lock_name).open("a+b")
+    except OSError as exc:
+        raise PipelineError(
+            "failed", "端面保存锁无法建立", ["检查本地学习记录目录权限后重试"],
+        ) from exc
+    with handle:
+        deadline = time.monotonic() + SAVE_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} and getattr(exc, "winerror", None) != 33:
+                    raise PipelineError(
+                        "failed", "端面保存锁无法获取", ["检查本地学习记录目录权限后重试"],
+                    ) from exc
+                if time.monotonic() >= deadline:
+                    raise PipelineError(
+                        "blocked", "该病例正在保存另一份端面方案", ["等待当前保存完成后重试"],
+                    ) from exc
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _serialized_save(function):
+    @wraps(function)
+    def wrapped(case_id: str, *args, **kwargs):
+        with _case_save_lock(case_id):
+            return function(case_id, *args, **kwargs)
+    return wrapped
+
+
+def local_inlet_available() -> bool:
+    """Advertise v2 only when validation and meshing backends are both loaded."""
+    from . import surface
+
+    return (callable(getattr(oblique, "validate_local_inlet_pair", None))
+            and callable(getattr(surface, "clip_mesh_by_oblique_planes_local", None)))
+
+
+def bilateral_local_available() -> bool:
+    from . import bilateral_local, local_preview
+
+    return (callable(getattr(oblique, "validate_bilateral_local_planes", None))
+            and callable(getattr(bilateral_local, "clip_mesh_bilateral_local", None))
+            and callable(getattr(local_preview, "build_bilateral_local_mesh", None)))
+
+
+def _require_local_inlet_available() -> None:
+    if not local_inlet_available():
+        raise PipelineError(
+            "blocked", "局部入口几何功能尚未就绪",
+            ["稍后刷新工作台，确认服务端已支持局部入口方案"],
+        )
+
+
+def _require_local_inlet_scope(scope: str) -> None:
+    if scope != "main_airway":
+        raise PipelineError(
+            "blocked", "局部鼻孔入口暂仅支持主鼻腔气流模型",
+            ["切换到主鼻腔气流模型；完整候选范围需先完成大网格性能验证"],
+        )
 
 
 def _scope(scope: str) -> str:
@@ -96,6 +231,16 @@ def load_plan(case_id: str, scope: str) -> dict | None:
     if plan is not None and not isinstance(plan, dict):
         raise PipelineError("failed", "端面方案格式错误", ["重新选择鼻孔端和鼻咽端面"])
     return plan
+
+
+def _reject_local_inlet_downgrade(case_id: str, scope: str) -> None:
+    """An older editor must not silently replace an explicitly saved local inlet."""
+    saved = load_plan(case_id, scope)
+    if saved is not None and saved.get("format") in {LOCAL_INLET_FORMAT, BILATERAL_LOCAL_FORMAT}:
+        raise PipelineError(
+            "blocked", "当前鼻孔端使用局部入口方案，旧版端面操作不能覆盖",
+            ["刷新工作台，并用局部入口模式同时预检、保存两端"],
+        )
 
 
 def plane_areas_mm2(mask: np.ndarray, axis: int, spacing) -> np.ndarray:
@@ -207,6 +352,10 @@ def get_endplanes(case_id: str, scope: str = "main_airway") -> dict:
         "mask_version": version,
         "areas_mm2": [round(float(value), 3) for value in areas],
         "saved": saved,
+        "supported_formats": [
+            "oblique_planes_v1", *([LOCAL_INLET_FORMAT] if scope == "main_airway" and local_inlet_available() else []),
+            *([BILATERAL_LOCAL_FORMAT] if scope == "main_airway" and bilateral_local_available() else []),
+        ],
         "can_save": bool(has_current_external_air_validation(seg) and not seg.get("need_human_confirm", True)),
         "migration_required": migration_required,
         "message": (
@@ -216,10 +365,12 @@ def get_endplanes(case_id: str, scope: str = "main_airway") -> dict:
     }
 
 
+@_serialized_save
 def save_endplanes(
     case_id: str, scope: str, anterior_index: int, posterior_index: int, mask_version: int,
 ) -> dict:
     scope = _scope(scope)
+    _reject_local_inlet_downgrade(case_id, scope)
     root = case_dir(case_id)
     seg = _segmentation(root)
     if type(mask_version) is not int or mask_version != seg.get("mask_version"):
@@ -254,8 +405,21 @@ def save_endplanes(
 
 
 def _persist_plan(case_id: str, root: Path, scope: str, plan: dict, mask_version: int) -> dict:
-    """原子保存方案；先失效旧 STL/CFD，避免新端面配旧产物。"""
+    """原子保存方案；成功保存才确认对应的修正记录。"""
     plans = _plans(root)
+    previous_plan = plans.get(scope)
+    # A prior process may have replaced the plan before its ledger commit.
+    # Compare the pending revision with the actual on-disk plan before a retry.
+    endplane_history.reconcile_pending(case_id, scope, previous_plan)
+    if previous_plan == plan:
+        if _segmentation(root).get("mask_version") != mask_version:
+            raise PipelineError("blocked", "保存期间掩膜版本发生变化", ["刷新 CT 后重新选择端面"])
+        return plan
+    revision_id = endplane_history.begin_revision(
+        case_id, scope, mask_version, previous_plan, plan,
+        source=plan.get("confirmation_source", plan.get("format", "ct_indices_v1")),
+        actor_id=endplane_history.CURRENT_ACTOR_ID.get(),
+    )
     plans[scope] = plan
     path = root / "segment" / PLAN_NAME
     temp = path.with_name(f"{path.name}.{secrets.token_hex(4)}.tmp")
@@ -279,8 +443,18 @@ def _persist_plan(case_id: str, root: Path, scope: str, plan: dict, mask_version
                 "failed", "端面方案写入失败，旧 STL/CFD 已失效",
                 ["检查病例目录的写入权限后重新保存端面，再生成 STL"],
             ) from exc
+    except Exception:
+        endplane_history.abort_revision(revision_id)
+        raise
     finally:
         temp.unlink(missing_ok=True)
+    try:
+        endplane_history.commit_revision(revision_id)
+    except Exception as exc:
+        raise PipelineError(
+            "failed", "端面已保存，但修正记录未完成",
+            ["重新保存相同端面以核对记录，再继续后续建模"],
+        ) from exc
     return plan
 
 
@@ -304,6 +478,54 @@ def _oblique_context(case_id: str, scope: str, mask_version: int):
     return scope, root, volume, mask, axis, sign, view
 
 
+def render_endplane_section(case_id: str, scope: str, plane: dict, mask_version: int, span_mm: float):
+    """Reslice the confirmed scope at the draft plane; no writes or invalidation."""
+    from .endplane_section import render_section
+
+    _, root, volume, mask, _, _, _ = _oblique_context(case_id, scope, mask_version)
+    image = render_section(volume, mask, plane, span_mm)
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "查看截面期间掩膜版本发生变化", ["刷新端面编辑器"])
+    return image
+
+
+def inspect_endplane_targets(case_id: str, scope: str, plane: dict, mask_version: int, span_mm: float, role: str, seeds=None):
+    from .endplane_targets import section_targets
+
+    scope, root, volume, mask, _, _, _ = _oblique_context(case_id, scope, mask_version)
+    if scope != "main_airway":
+        raise PipelineError("blocked", "端面选区仅支持主鼻腔气流模型", ["切换到主气道范围"])
+    result = section_targets(volume, mask, plane, role, span_mm, size=768, seeds=seeds)
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "查看截面期间掩膜版本发生变化", ["刷新端面编辑器"])
+    return {**result, "scope": scope, "mask_version": mask_version}
+
+
+def suggest_bilateral_local_inlet_shift(
+    case_id: str, scope: str, left_inlet_plane: dict, right_inlet_plane: dict,
+    posterior_plane: dict, left_inlet_seed_lps_mm, right_inlet_seed_lps_mm,
+    posterior_seed_lps_mm, mask_version: int, side: str,
+) -> dict:
+    """Read-only outward adjustment of one inlet, subject to exact mesh QC."""
+    from .endplane_auto_candidate import suggest_outward_bilateral_inlet_shift
+
+    _require_local_inlet_scope(scope)
+    scope, root, volume, mask, axis, _, _ = _oblique_context(case_id, scope, mask_version)
+    result = suggest_outward_bilateral_inlet_shift(
+        mask, volume, axis, scope, side=side,
+        left_inlet_plane=left_inlet_plane, right_inlet_plane=right_inlet_plane,
+        posterior_plane=posterior_plane,
+        left_inlet_seed_lps_mm=left_inlet_seed_lps_mm,
+        right_inlet_seed_lps_mm=right_inlet_seed_lps_mm,
+        posterior_seed_lps_mm=posterior_seed_lps_mm,
+    )
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "建议生成期间掩膜版本发生变化", ["刷新端面编辑器后重试"])
+    if result.get("plan") is not None:
+        result["plan"]["mask_version"] = mask_version
+    return {**result, "scope": scope, "mask_version": mask_version}
+
+
 def preview_oblique_endplanes(
     case_id: str, scope: str, anterior_plane: dict, posterior_plane: dict, mask_version: int,
 ) -> dict:
@@ -324,11 +546,231 @@ def preview_oblique_endplanes(
     }
 
 
+def preview_local_inlet_endplanes(
+    case_id: str, scope: str, anterior_plane: dict, posterior_plane: dict,
+    anterior_seed_lps_mm: list[float], mask_version: int,
+) -> dict:
+    """Cheap voxel preflight; exact meshing is an explicit, separate action."""
+    _require_local_inlet_available()
+    _require_local_inlet_scope(scope)
+    scope, root, volume, mask, _, _, _ = _oblique_context(case_id, scope, mask_version)
+    validation = oblique.validate_local_inlet_pair(
+        mask, volume, anterior_plane, posterior_plane, anterior_seed_lps_mm,
+        main_airway=scope == "main_airway",
+    )
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "预检期间掩膜版本发生变化", ["刷新 3D 预览后重新选择两端"])
+    return {
+        **validation, "scope": scope, "mask_version": mask_version,
+        "format": LOCAL_INLET_FORMAT, "can_save": False, "can_preview_mesh": True,
+        "anterior_area_mm2": validation["anterior_area_estimate_mm2"],
+        "posterior_area_mm2": validation["posterior_area_estimate_mm2"],
+        "unselected_region_changed_voxels": validation["anterior_unselected_deleted_voxels"],
+        "voxel_preflight": {
+            "anterior_opening_components": validation["anterior_opening_components"],
+            "unselected_region_changed_voxels": validation["anterior_unselected_deleted_voxels"],
+        },
+        "mesh_preflight": False,
+        "message": "体素预检通过；请显式预览真实裁切网格，再保存两端。",
+    }
+
+
+def preview_bilateral_local_endplanes(
+    case_id: str, scope: str, left_inlet_plane: dict, right_inlet_plane: dict,
+    posterior_plane: dict, left_inlet_seed_lps_mm: list[float],
+    right_inlet_seed_lps_mm: list[float], posterior_seed_lps_mm: list[float],
+    mask_version: int,
+) -> dict:
+    """Voxel-only three-end preflight; no case artifacts or human review writes."""
+    _require_local_inlet_scope(scope)
+    scope, root, volume, mask, _, _, _ = _oblique_context(case_id, scope, mask_version)
+    validation = oblique.validate_bilateral_local_planes(
+        mask, volume, left_inlet_plane, right_inlet_plane, posterior_plane,
+        left_inlet_seed_lps_mm, right_inlet_seed_lps_mm, posterior_seed_lps_mm,
+        main_airway=True,
+    )
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "预检期间掩膜版本发生变化", ["刷新端面编辑器"])
+    return {
+        **validation, "scope": scope, "mask_version": mask_version,
+        "format": BILATERAL_LOCAL_FORMAT, "can_save": False,
+        "can_preview_mesh": True, "mesh_preflight": False,
+        "left_inlet_area_mm2": validation["left_inlet_area_estimate_mm2"],
+        "right_inlet_area_mm2": validation["right_inlet_area_estimate_mm2"],
+        "posterior_area_mm2": validation["posterior_area_estimate_mm2"],
+        "message": "三端体素预检通过；请预览真实网格并人工核对左右入口、鼻咽出口后再保存。",
+    }
+
+
+def _preflight_bilateral_local(
+    case_id: str, scope: str, left_inlet_plane: dict, right_inlet_plane: dict,
+    posterior_plane: dict, left_inlet_seed_lps_mm: list[float],
+    right_inlet_seed_lps_mm: list[float], posterior_seed_lps_mm: list[float],
+    mask_version: int,
+):
+    from . import local_preview
+
+    _require_local_inlet_scope(scope)
+    scope, root, volume, mask, axis, sign, view = _oblique_context(case_id, scope, mask_version)
+    validation = oblique.validate_bilateral_local_planes(
+        mask, volume, left_inlet_plane, right_inlet_plane, posterior_plane,
+        left_inlet_seed_lps_mm, right_inlet_seed_lps_mm, posterior_seed_lps_mm,
+        main_airway=True,
+    )
+    mesh = local_preview.build_bilateral_local_mesh(mask, volume, axis, scope, validation)
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "预检期间掩膜版本发生变化", ["刷新端面编辑器"])
+    return scope, root, validation, mesh, axis, sign, view
+
+
+def render_bilateral_local_preview_model(
+    case_id: str, scope: str, left_inlet_plane: dict, right_inlet_plane: dict,
+    posterior_plane: dict, left_inlet_seed_lps_mm: list[float],
+    right_inlet_seed_lps_mm: list[float], posterior_seed_lps_mm: list[float],
+    mask_version: int,
+) -> bytes:
+    from .local_preview import binary_stl
+
+    _, root, _, (vertices, faces, _), _, _, _ = _preflight_bilateral_local(
+        case_id, scope, left_inlet_plane, right_inlet_plane, posterior_plane,
+        left_inlet_seed_lps_mm, right_inlet_seed_lps_mm, posterior_seed_lps_mm,
+        mask_version,
+    )
+    data = binary_stl(vertices, faces)
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "预览期间掩膜版本发生变化", ["刷新端面编辑器"])
+    return data
+
+
+@_serialized_save
+def save_bilateral_local_endplanes(
+    case_id: str, scope: str, left_inlet_plane: dict, right_inlet_plane: dict,
+    posterior_plane: dict, left_inlet_seed_lps_mm: list[float],
+    right_inlet_seed_lps_mm: list[float], posterior_seed_lps_mm: list[float],
+    mask_version: int,
+) -> dict:
+    """Persist only after exact three-cap mesh preflight and human UI action."""
+    scope, root, validation, mesh, axis, sign, view = _preflight_bilateral_local(
+        case_id, scope, left_inlet_plane, right_inlet_plane, posterior_plane,
+        left_inlet_seed_lps_mm, right_inlet_seed_lps_mm, posterior_seed_lps_mm,
+        mask_version,
+    )
+    plan = {
+        **validation, "format": BILATERAL_LOCAL_FORMAT, "scope": scope,
+        "axis": axis, "view": view, "anterior_sign": sign,
+        "mask_version": mask_version, "complete": True,
+        "mesh_preflight": mesh[2],
+    }
+    return _persist_plan(case_id, root, scope, plan, mask_version)
+
+
+@_serialized_save
+def save_automated_bilateral_endplanes(
+    case_id: str, scope: str, left_inlet_plane: dict, right_inlet_plane: dict,
+    posterior_plane: dict, left_inlet_seed_lps_mm: list[float],
+    right_inlet_seed_lps_mm: list[float], posterior_seed_lps_mm: list[float],
+    mask_version: int, *, generator_version: str,
+    before_persist: Callable[[], None],
+) -> dict:
+    """Save a new technical three-port plan without claiming human review."""
+    from . import endplane_auto_candidate
+
+    if generator_version != endplane_auto_candidate.BILATERAL_GENERATOR_VERSION:
+        raise PipelineError("blocked", "自动端面生成器版本不匹配", ["重新生成自动端面候选"])
+    if not callable(before_persist):
+        raise PipelineError("failed", "自动端面缺少保存前版本复查", ["重新提交当前病例"])
+    root = case_dir(case_id)
+    if _plans(root).get(scope) is not None or any(
+        (root / relative).exists() for relative in (
+            "surface/airway.stl", "surface/surface.json", "cfd/case_meta.json",
+            "report/report.json",
+        )
+    ):
+        raise PipelineError("blocked", "已有端面或下游产物，自动候选不能覆盖", ["在工作台核对当前病例"])
+    scope, root, validation, mesh, axis, sign, view = _preflight_bilateral_local(
+        case_id, scope, left_inlet_plane, right_inlet_plane, posterior_plane,
+        left_inlet_seed_lps_mm, right_inlet_seed_lps_mm, posterior_seed_lps_mm,
+        mask_version,
+    )
+    stats = mesh[2]
+    if (stats.get("format") != "oblique_mesh_clip_bilateral_local_v3"
+            or stats.get("closed_caps") is not True
+            or any(stats.get(name) != 1 for name in (
+                "left_inlet_loops", "right_inlet_loops", "outlet_loops"
+            ))
+            or any(type(stats.get(name)) is not int or stats[name] < 1 for name in (
+                "left_inlet_cap_faces", "right_inlet_cap_faces", "outlet_cap_faces"
+            ))):
+        raise PipelineError("blocked", "自动端面未形成三个独立水密封盖", ["进入局部端面修正"])
+    source_voxels = validation.get("source_voxels")
+    retained_voxels = validation.get("retained_voxels")
+    if (type(source_voxels) is not int or source_voxels <= 0
+            or type(retained_voxels) is not int or retained_voxels <= 0
+            or retained_voxels > source_voxels
+            or (source_voxels - retained_voxels) / source_voxels > 0.25
+            or any(type(validation.get(f"{side}_deleted_voxels")) is not int
+                   or validation[f"{side}_deleted_voxels"] / source_voxels > 0.15
+                   for side in ("left", "right", "posterior"))):
+        raise PipelineError("blocked", "自动裁切移除过多气道体素", ["进入局部端面修正"])
+    before_persist()
+    if _plans(root).get(scope) is not None or _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "自动端面保存前病例版本发生变化", ["刷新病例后重试"])
+    plan = {
+        **validation, "format": BILATERAL_LOCAL_FORMAT, "scope": scope,
+        "axis": axis, "view": view, "anterior_sign": sign,
+        "mask_version": mask_version, "complete": True,
+        "mesh_preflight": stats,
+        "confirmation_source": "automated_technical_gate",
+        "human_confirmed": False,
+        "generator_version": generator_version,
+    }
+    if not automated_plan_is_valid(plan):
+        raise PipelineError("blocked", "自动端面技术验证记录不完整", ["重新生成三端口候选"])
+    return _persist_plan(case_id, root, scope, plan, mask_version)
+
+
+def _preflight_local_inlet(
+    case_id: str, scope: str, anterior_plane: dict, posterior_plane: dict,
+    anterior_seed_lps_mm: list[float], mask_version: int,
+):
+    from . import local_preview
+
+    _require_local_inlet_available()
+    _require_local_inlet_scope(scope)
+    scope, root, volume, mask, axis, sign, view = _oblique_context(case_id, scope, mask_version)
+    validation = oblique.validate_local_inlet_pair(
+        mask, volume, anterior_plane, posterior_plane, anterior_seed_lps_mm,
+        main_airway=scope == "main_airway",
+    )
+    mesh = local_preview.build_local_inlet_mesh(mask, volume, axis, scope, validation)
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "预检期间掩膜版本发生变化", ["刷新 3D 预览后重新选择两端"])
+    return scope, root, validation, mesh, axis, sign, view
+
+
+def render_local_inlet_preview_model(
+    case_id: str, scope: str, anterior_plane: dict, posterior_plane: dict,
+    anterior_seed_lps_mm: list[float], mask_version: int,
+) -> bytes:
+    """Return a real clipped draft STL without touching the case directory."""
+    from .local_preview import binary_stl
+
+    _, root, _, (vertices, faces, _), _, _, _ = _preflight_local_inlet(
+        case_id, scope, anterior_plane, posterior_plane, anterior_seed_lps_mm, mask_version,
+    )
+    data = binary_stl(vertices, faces)
+    if _segmentation(root).get("mask_version") != mask_version:
+        raise PipelineError("blocked", "预览期间掩膜版本发生变化", ["刷新端面编辑器"])
+    return data
+
+
+@_serialized_save
 def save_oblique_endplanes(
     case_id: str, scope: str, anterior_plane: dict, posterior_plane: dict, mask_version: int,
 ) -> dict:
     """保存用户在 3D 中确认的两张可旋转切面，法向均朝删除侧。"""
     scope, root, volume, mask, axis, sign, view = _oblique_context(case_id, scope, mask_version)
+    _reject_local_inlet_downgrade(case_id, scope)
     validation = oblique.validate_plane_pair(
         mask, volume, anterior_plane, posterior_plane, main_airway=scope == "main_airway",
     )
@@ -347,6 +789,26 @@ def save_oblique_endplanes(
         "retained_volume_ml": validation["retained_volume_ml"],
         "anterior_area_estimate_mm2": validation["anterior_area_estimate_mm2"],
         "posterior_area_estimate_mm2": validation["posterior_area_estimate_mm2"],
+    }
+    return _persist_plan(case_id, root, scope, plan, mask_version)
+
+
+@_serialized_save
+def save_local_inlet_endplanes(
+    case_id: str, scope: str, anterior_plane: dict, posterior_plane: dict,
+    anterior_seed_lps_mm: list[float], mask_version: int,
+) -> dict:
+    """Atomically save a local inlet only after voxel and mesh preflight."""
+    scope, root, validation, mesh, axis, sign, view = _preflight_local_inlet(
+        case_id, scope, anterior_plane, posterior_plane, anterior_seed_lps_mm, mask_version,
+    )
+    if (load_plan(case_id, scope) or {}).get("format") == BILATERAL_LOCAL_FORMAT:
+        raise PipelineError("blocked", "双侧局部方案不能被单支方案覆盖", ["刷新工作台并使用双侧端面编辑器"])
+    plan = {
+        **validation, "format": LOCAL_INLET_FORMAT, "scope": scope,
+        "axis": axis, "view": view, "anterior_sign": sign,
+        "mask_version": mask_version, "complete": True,
+        "mesh_preflight": mesh[2],
     }
     return _persist_plan(case_id, root, scope, plan, mask_version)
 
@@ -417,12 +879,14 @@ def _pair_validation(plan: dict, mask: np.ndarray, volume, *, main_airway: bool)
     return result
 
 
+@_serialized_save
 def save_single_endplane(case_id: str, scope: str, side: str, plane: dict, mask_version: int) -> dict:
     """Save one side without discarding its peer or requiring a valid pair yet."""
     if side not in {"anterior", "posterior"}:
         raise PipelineError("failed", "端面方向无效", ["分别选择鼻孔端或鼻咽端"])
     scope = _scope(scope)
     _, root, volume, mask, axis, sign, view = _oblique_context(case_id, scope, mask_version)
+    _reject_local_inlet_downgrade(case_id, scope)
     normalized = oblique.validate_plane_endpoint(plane, side)
     anterior = np.asarray(ANTERIOR_LPS, dtype=float)
     plane_ap = float(np.dot(normalized["point_lps_mm"], anterior))
@@ -470,6 +934,28 @@ def current_plan(
             {"model_scope": scope, "saved_mask_version": plan.get("mask_version"),
              "current_mask_version": segmentation.get("mask_version")},
         )
+    if plan.get("format") == LOCAL_INLET_FORMAT:
+        _require_local_inlet_scope(scope)
+        oblique.validate_local_inlet_pair(
+            mask, volume, plan.get("anterior_plane"), plan.get("posterior_plane"),
+            plan.get("anterior_seed_lps_mm"), main_airway=scope == "main_airway",
+        )
+        return plan
+    if plan.get("format") == BILATERAL_LOCAL_FORMAT:
+        _require_local_inlet_scope(scope)
+        if ((plan.get("confirmation_source") is not None
+             or plan.get("human_confirmed") is False)
+                and not automated_plan_is_valid(plan)):
+            raise PipelineError("blocked", "自动端面技术来源不完整", ["重新生成三端口候选"])
+        oblique.validate_bilateral_local_planes(
+            mask, volume, plan.get("left_inlet_plane"), plan.get("right_inlet_plane"),
+            plan.get("posterior_plane"), plan.get("left_inlet_seed_lps_mm"),
+            plan.get("right_inlet_seed_lps_mm"), plan.get("posterior_seed_lps_mm"),
+            main_airway=True,
+        )
+        if not plan.get("complete") or not (plan.get("mesh_preflight") or {}).get("closed_caps"):
+            raise PipelineError("blocked", "双侧局部端面缺少完整网格预检", ["重新预览并保存三个端面"])
+        return plan
     if plan.get("format") == "oblique_planes_v1":
         if not plan.get("complete", True) and plan.get("validation_error"):
             error = plan["validation_error"]

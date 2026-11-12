@@ -31,6 +31,57 @@ function Read-DotEnv([string]$Path) {
     return $values
 }
 
+function Set-HarnessEnvironment([hashtable]$Settings, [string]$MultiuserMode) {
+    # Never inherit another local program's Harness settings or DeepSeek credential.
+    # Only this project's .env can enable the pilot.
+    foreach ($name in @([Environment]::GetEnvironmentVariables('Process').Keys)) {
+        if ($name -match '^(WINDCATCHER_HARNESS_|DEEPSEEK_)') {
+            [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+        }
+    }
+
+    $enabled = $Settings['WINDCATCHER_HARNESS_ADVICE']
+    $actions = $Settings['WINDCATCHER_HARNESS_ACTIONS']
+    if ($actions -and $actions -notin @('0', '1')) { throw 'WINDCATCHER_HARNESS_ACTIONS must be 0 or 1.' }
+    if ($actions -eq '1' -and $enabled -ne '1') { throw 'Harness actions require the advice pilot.' }
+    if (-not $enabled -or $enabled -eq '0') { return }
+    if ($enabled -ne '1') { throw 'WINDCATCHER_HARNESS_ADVICE must be 0 or 1.' }
+    if ($MultiuserMode -ne '1') { throw 'Harness advice requires personal accounts.' }
+
+    $image = $Settings['WINDCATCHER_HARNESS_IMAGE']
+    $key = $Settings['DEEPSEEK_API_KEY']
+    $model = $Settings['WINDCATCHER_HARNESS_MODEL']
+    $baseUrl = $Settings['WINDCATCHER_HARNESS_BASE_URL']
+    $networkId = $Settings['WINDCATCHER_HARNESS_EGRESS_NETWORK_ID']
+    $proxyImage = $Settings['WINDCATCHER_HARNESS_EGRESS_PROXY_IMAGE']
+    if ($image -cnotmatch '^sha256:[0-9a-f]{64}$') { throw 'Harness requires a pinned worker image ID.' }
+    if (-not $key -or $key.Length -gt 512 -or $key -match '[^\x21-\x7e]') {
+        throw 'Harness requires a dedicated DEEPSEEK_API_KEY in the project .env.'
+    }
+    if ($model -cne 'gpt-6.1-sol') {
+        throw 'Invalid WINDCATCHER_HARNESS_MODEL.'
+    }
+    if ($baseUrl -cne 'https://tongyimohe.aitoken.credit/v1') {
+        throw 'Invalid WINDCATCHER_HARNESS_BASE_URL.'
+    }
+    if ($networkId -or $proxyImage) {
+        if ($networkId -cnotmatch '^[0-9a-f]{64}$' -or $proxyImage -cnotmatch '^sha256:[0-9a-f]{64}$') {
+            throw 'Harness egress network ID and pinned proxy image ID must be configured together.'
+        }
+    }
+
+    [Environment]::SetEnvironmentVariable('WINDCATCHER_HARNESS_ADVICE', '1', 'Process')
+    if ($actions -eq '1') { [Environment]::SetEnvironmentVariable('WINDCATCHER_HARNESS_ACTIONS', '1', 'Process') }
+    [Environment]::SetEnvironmentVariable('WINDCATCHER_HARNESS_IMAGE', $image, 'Process')
+    [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', $key, 'Process')
+    if ($model) { [Environment]::SetEnvironmentVariable('WINDCATCHER_HARNESS_MODEL', $model, 'Process') }
+    if ($baseUrl) { [Environment]::SetEnvironmentVariable('WINDCATCHER_HARNESS_BASE_URL', $baseUrl, 'Process') }
+    if ($networkId) {
+        [Environment]::SetEnvironmentVariable('WINDCATCHER_HARNESS_EGRESS_NETWORK_ID', $networkId, 'Process')
+        [Environment]::SetEnvironmentVariable('WINDCATCHER_HARNESS_EGRESS_PROXY_IMAGE', $proxyImage, 'Process')
+    }
+}
+
 function Write-Event([string]$Message) {
     try {
         Add-Content -LiteralPath (Join-Path $runtime 'supervisor.log') -Value "$(Get-Date -Format o) $Message"
@@ -84,11 +135,29 @@ function Test-Http([string]$Url, [hashtable]$Headers = @{}) {
     }
 }
 
+function Test-PublicHttp([string]$Url, [string]$HostName, [string]$ServerIp) {
+    # The local DNS proxy may return a 198.18/15 fake IP for this host.
+    # Pin only the network destination; curl still verifies the HTTPS name.
+    try {
+        $resolve = $HostName + ':443:' + $ServerIp
+        $result = & curl.exe --noproxy '*' --silent --show-error --max-time 12 --resolve $resolve --output NUL --write-out '%{http_code} %{ssl_verify_result}' $Url 2>&1
+        $exitCode = $LASTEXITCODE
+        $summary = ($result | Out-String).Trim()
+        if ($exitCode -ne 0 -or $summary -notmatch '^(\d{3}) 0$') {
+            return [pscustomobject]@{ Healthy = $false; StatusCode = $null; Error = "HTTPS probe failed (exit $exitCode)" }
+        }
+        $statusCode = [int]$matches[1]
+        return [pscustomobject]@{ Healthy = ($statusCode -ge 200 -and $statusCode -lt 400); StatusCode = $statusCode; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Healthy = $false; StatusCode = $null; Error = "HTTPS probe error: $($_.Exception.GetType().Name)" }
+    }
+}
+
 function Stop-OwnedServer([int]$Port) {
     $listenerPid = Get-ListeningProcess $Port
     if (-not $listenerPid) { return }
     $process = Get-CimInstance Win32_Process -Filter "ProcessId=$listenerPid"
-    if ($process -and $process.CommandLine.Contains($python) -and $process.CommandLine -match 'uvicorn.*server:app') {
+    if ($process -and $process.CommandLine.Contains($python) -and $process.CommandLine -match 'uvicorn.*(server:app|cloud:create_app)') {
         Stop-Process -Id $listenerPid -Force -ErrorAction SilentlyContinue
         Write-Event "Stopped unhealthy local application process $listenerPid."
     } else {
@@ -107,6 +176,33 @@ $tunnel = $null
 try {
     $public = Read-DotEnv (Join-Path $appRoot '.env')
     $infra = Read-DotEnv $public['WINDCATCHER_INFRA_ENV']
+    foreach ($name in @('WINDCATCHER_PUBLIC_USERNAME', 'WINDCATCHER_PUBLIC_PASSWORD', 'WINDCATCHER_PUBLIC_SESSION_SECRET', 'WINDCATCHER_MCP_TOKEN')) {
+        if (-not $public[$name]) { throw "Missing public access configuration: $name" }
+        [Environment]::SetEnvironmentVariable($name, $public[$name], 'Process')
+    }
+    if ($public['WINDCATCHER_PUBLIC_PASSWORD'].Length -lt 16 -or $public['WINDCATCHER_PUBLIC_SESSION_SECRET'].Length -lt 32) {
+        throw 'Public password must have at least 16 characters and session secret at least 32.'
+    }
+    if ($public['WINDCATCHER_MCP_TOKEN'] -notmatch '^[A-Za-z0-9_-]{43,128}$') {
+        throw 'Local MCP token must be a 43-128 character base64url value.'
+    }
+    [Environment]::SetEnvironmentVariable('WINDCATCHER_MCP_TOKEN', $public['WINDCATCHER_MCP_TOKEN'], 'Process')
+    [Environment]::SetEnvironmentVariable('WINDCATCHER_DEPLOYMENT', 'public', 'Process')
+    $multiuserMode = $public['WINDCATCHER_MULTIUSER']
+    if ($multiuserMode -and $multiuserMode -notin @('0', '1')) { throw 'WINDCATCHER_MULTIUSER must be 0 or 1.' }
+    if ($multiuserMode -eq '1' -and -not $public['WINDCATCHER_IDENTITY_DIR']) {
+        throw 'Personal accounts require an explicit WINDCATCHER_IDENTITY_DIR.'
+    }
+    foreach ($name in @('WINDCATCHER_MULTIUSER', 'WINDCATCHER_IDENTITY_DIR', 'WINDCATCHER_PREFERENCES_DIR', 'WINDCATCHER_RECIPES_DIR', 'WINDCATCHER_MONITOR_DIR', 'WINDCATCHER_LEARNING_DIR', 'WINDCATCHER_AUTOMATION_DIR', 'WINDCATCHER_SHARE_DIR', 'WINDCATCHER_AI_ALLOWED_HOSTS')) {
+        [Environment]::SetEnvironmentVariable($name, $public[$name], 'Process')
+    }
+    Set-HarnessEnvironment $public $multiuserMode
+    foreach ($name in @('WINDCATCHER_CLOUD_USERNAME', 'WINDCATCHER_CLOUD_PASSWORD', 'WINDCATCHER_CLOUD_SESSION_SECRET', 'WINDCATCHER_CLOUD_PUBLIC_ORIGIN')) {
+        [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    }
+    $origin = $public['WINDCATCHER_PUBLIC_URL'].TrimEnd('/')
+    if (-not $origin.StartsWith('https://')) { throw 'Public origin must be HTTPS.' }
+    [Environment]::SetEnvironmentVariable('WINDCATCHER_PUBLIC_URL', $origin, 'Process')
     $key = $infra['ALIBABA_SSH_KEY']
     if (-not (Test-Path -LiteralPath $key)) { throw 'Configured SSH key does not exist.' }
     $localPort = [int]$public['WINDCATCHER_LOCAL_PORT']
@@ -114,6 +210,14 @@ try {
     $target = "$($infra['ALIBABA_SSH_USER'])@$($infra['ALIBABA_SERVER_IP'])"
     $python = Join-Path $appRoot '.venv\Scripts\python.exe'
     $ssh = (Get-Command ssh.exe).Source
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { throw 'curl.exe is required for verified public health checks.' }
+    $publicHost = ([Uri]$origin).Host
+    $publicHealthUrl = "$origin/static/patient-view.js"
+    $serverIp = $infra['ALIBABA_SERVER_IP']
+    $parsedIp = $null
+    if (-not $serverIp -or -not [Net.IPAddress]::TryParse($serverIp, [ref]$parsedIp)) {
+        throw 'Configured public server IP is invalid.'
+    }
     if (Test-Path -LiteralPath $stopPath) { exit 0 }
     $forward = "127.0.0.1:${remotePort}:127.0.0.1:${localPort}"
     foreach ($oldTunnel in Get-CimInstance Win32_Process -Filter "Name='ssh.exe'") {
@@ -123,9 +227,6 @@ try {
         }
     }
     Write-Event 'Supervisor started.'
-    $publicHeaders = @{}
-    $publicCredential = "$($public['WINDCATCHER_PUBLIC_USERNAME']):$($public['WINDCATCHER_PUBLIC_PASSWORD'])"
-    $publicHeaders['Authorization'] = "Basic $([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($publicCredential)))"
     $lastPublicCheck = [DateTime]::MinValue
     $failureCount = 0
     $restartAfter = [DateTime]::MinValue
@@ -134,13 +235,13 @@ try {
     $localFailures = 0
     while (-not (Test-Path -LiteralPath $stopPath)) {
         $serverPid = Get-ListeningProcess $localPort
-        $localResult = if ($serverPid) { Test-Http "http://127.0.0.1:$localPort/" } else { [pscustomobject]@{ Healthy = $false; StatusCode = $null; Error = 'not listening' } }
+        $localResult = if ($serverPid) { Test-Http "http://127.0.0.1:$localPort/healthz" } else { [pscustomobject]@{ Healthy = $false; StatusCode = $null; Error = 'not listening' } }
         $localHealthy = [bool]$localResult.Healthy
         if ($localHealthy) { $localFailures = 0 } else { $localFailures++ }
         if (-not $localHealthy -and (-not $serverPid -or $localFailures -ge 3) -and (Get-Date) -ge $restartAfter) {
             Write-Event "Local health failed: HTTP $($localResult.StatusCode); $($localResult.Error)."
             if ($serverPid) { Stop-OwnedServer $localPort }
-            Start-Process -FilePath $python -ArgumentList @('-m', 'uvicorn', 'server:app', '--host', '127.0.0.1', '--port', $localPort, '--proxy-headers', '--forwarded-allow-ips', '127.0.0.1') -WorkingDirectory $appRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $runtime 'server.stdout.log') -RedirectStandardError (Join-Path $runtime 'server.stderr.log') | Out-Null
+            Start-Process -FilePath $python -ArgumentList @('-m', 'uvicorn', 'cloud:create_app', '--factory', '--host', '127.0.0.1', '--port', $localPort, '--proxy-headers', '--forwarded-allow-ips', '127.0.0.1', '--no-access-log') -WorkingDirectory $appRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $runtime 'server.stdout.log') -RedirectStandardError (Join-Path $runtime 'server.stderr.log') | Out-Null
             Write-Event 'Started local application.'
             $restartAfter = (Get-Date).AddSeconds(10)
             $localFailures = 0
@@ -163,7 +264,7 @@ try {
             }
         }
         if ((Get-Date) -ge $lastPublicCheck) {
-            $publicResult = Test-Http $public['WINDCATCHER_PUBLIC_URL'] $publicHeaders
+            $publicResult = Test-PublicHttp $publicHealthUrl $publicHost $serverIp
             $lastPublicCheck = (Get-Date).AddSeconds(30)
             if ($publicResult.Healthy) {
                 $failureCount = 0

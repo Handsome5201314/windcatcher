@@ -23,7 +23,8 @@ async def main():
             initialized = await session.initialize()
             listed = await session.list_tools()
             names = {tool.name for tool in listed.tools}
-            assert names == {"service_status", "list_cfd_cases", "inspect_cfd_case", "submit_cfd_batch", "get_cfd_batch", "cancel_queued_cfd"}
+            assert names == {"service_status", "list_cfd_cases", "inspect_cfd_case", "inspect_endplane_learning", "propose_endplanes", "auto_propose_endplanes", "submit_cfd_batch", "get_cfd_batch", "cancel_queued_cfd"}
+            assert "record_endplane_feedback" not in names
             status = await session.call_tool("service_status", {})
             status_data = content_json(status)
             assert status_data["worker_alive"] is True

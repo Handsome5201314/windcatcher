@@ -19,7 +19,7 @@ const context = vm.createContext({
   } },
   localStorage: { getItem() { return null; }, setItem() {} },
 });
-vm.runInContext(["escapeHtml", "renderCfdProgress", "cfdParallelStorageKey", "getCfdParallelConfig", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdMeshRows", "cfdResourceCard"].map(productionFunction).join("\n"), context);
+vm.runInContext(["escapeHtml", "renderCfdProgress", "cfdParallelStorageKey", "getCfdParallelConfig", "cfdComputeTargetStorageKey", "getCfdComputeTarget", "setCfdComputeTarget", "cfdGpuAvailability", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdMeshRows", "cfdResourceCard"].map(productionFunction).join("\n"), context);
 
 test("unknown iteration percentage is indeterminate, never zero percent", () => {
   const html = context.renderCfdProgress({ current_step: "snappyHexMesh", progress: { completed: 1, total: 7, current_step_percent: null }, elapsed_seconds: 65 }, {}, "running");
@@ -86,6 +86,85 @@ test("actual run plan inherits prepared profile only when the MPI counts match",
   assert.match(context.cfdResourceCard(data), /当前算例：历史配置 · 8 个 MPI 子域/);
   data.stages.cfd_run.data.run_status.parallel.requested_subdomains = 16;
   assert.equal(JSON.stringify(data), before);
+});
+
+test("failed CFD run shows rebuild even when the MPI plan is unchanged", () => {
+  const data = {
+    case_id: "failed-case",
+    stages: {
+      cfd_prep: { status: "ok", data: { parallel: { profile: "strongest", requested_subdomains: 16 } } },
+      cfd_run: { status: "failed", data: {} },
+    },
+  };
+  const html = context.cfdResourceCard(data);
+  assert.match(html, /上次气流求解失败/);
+  assert.match(html, /id="act-cfd-rebuild"[^>]*>重新生成 CFD 算例/);
+  assert.doesNotMatch(context.cfdResourceCard({ ...data, stages: { ...data.stages, cfd_run: { status: "pending" } } }), /id="act-cfd-rebuild"/);
+  const running = context.cfdResourceCard({ ...data, stages: { ...data.stages, cfd_run: { status: "running" } } }, { locked: true });
+  assert.doesNotMatch(running, /id="act-cfd-rebuild"/);
+  const regenerated = context.cfdResourceCard({ ...data, stages: {
+    cfd_prep: { ...data.stages.cfd_prep, updated_at: "2026-11-11T14:00:00+08:00" },
+    cfd_run: { ...data.stages.cfd_run, updated_at: "2026-11-11T13:00:00+08:00",
+      data: { run_status: { parallel: { requested_subdomains: 8 } } } },
+  } });
+  assert.match(regenerated, /当前算例：最强 · 16 个 MPI 子域/);
+  assert.doesNotMatch(regenerated, /id="act-cfd-rebuild"/);
+});
+
+test("failed case rebuild button sends the prepared case to CFD preparation", () => {
+  const stages = Object.fromEntries(
+    ["import", "qc", "anonymize", "segment", "surface", "cfd_prep", "cfd_run", "report"]
+      .map((name) => [name, { status: "ok", data: {} }]),
+  );
+  stages.surface.data = { model_scope: "main_airway" };
+  stages.cfd_prep.data = { parallel: { profile: "strongest", requested_subdomains: 16 } };
+  stages.cfd_run.status = "failed";
+  stages.report.status = "pending";
+  const data = { case_id: "failed-case", synthetic: false, stages };
+  const listeners = new Map();
+  const rebuild = { addEventListener(name, listener) { listeners.set(name, listener); } };
+  const box = { innerHTML: "", querySelectorAll: () => [], querySelector: (selector) => selector === "#act-cfd-rebuild" ? rebuild : null };
+  let request, stage;
+  Object.assign(context, {
+    STAGE_ORDER: Object.keys(stages),
+    $: (id) => id === "case-actions" ? box : { addEventListener() {} },
+    requiresMaskReview: () => false,
+    endplaneSaved: () => true,
+    modelScopeParams: () => ({ params: { model_scope: "main_airway" } }),
+    runAction: (_button, action, name) => { stage = name; return action(); },
+    api: (path, options) => { request = { path, options }; return Promise.resolve({}); },
+  });
+  context.state.clientRunningStage = null;
+  vm.runInContext(productionFunction("renderActions"), context);
+  context.renderActions(data);
+  assert.match(box.innerHTML, /id="act-cfd-rebuild"[^>]*>重新生成 CFD 算例/);
+  assert.match(box.innerHTML, /id="act-primary"[^>]*>开始气流求解/);
+  listeners.get("click")({ currentTarget: rebuild });
+  assert.equal(stage, "cfd_prep");
+  assert.equal(request.path, "/api/cases/failed-case/cfd-prep");
+  assert.equal(request.options.method, "POST");
+  assert.equal(request.options.body.params.parallel_profile, "strongest");
+});
+
+test("simple preview rebuild button clicks the same workbench action", () => {
+  let handlers, rendered, opened = 0, clicked = 0;
+  const primary = { textContent: "开始气流求解", disabled: false, classList: { contains: () => false } };
+  const rebuild = { disabled: false, click: () => { clicked += 1; } };
+  const preview = {
+    bind(next) { handlers = next; },
+    render(_data, options) { rendered = options; },
+    openAdvanced() { opened += 1; },
+  };
+  const ui = vm.createContext({
+    window: { WindcatcherQuickPreview: preview },
+    $: (id) => id === "act-primary" ? primary : id === "act-cfd-rebuild" ? rebuild : null,
+  });
+  vm.runInContext(productionFunction("syncQuickPreview"), ui);
+  ui.syncQuickPreview({ case_id: "failed-case" });
+  assert.equal(rendered.rebuild.visible, true);
+  handlers.onRebuild();
+  assert.equal(opened, 1);
+  assert.equal(clicked, 1);
 });
 
 test("runtime CPU evidence distinguishes container capacity from host hardware", () => {
@@ -157,7 +236,7 @@ test("mesh cache availability is separate from the decision to reuse", () => {
   assert.equal(context.cfdMeshRows({ mesh }).find(([key]) => key === "下次复用")[1], "检查证据已保存");
 });
 
-function renderCfdDetailFixture(runStatus) {
+function renderCfdDetailFixture(runStatus, prep = {}) {
   const panel = { innerHTML: "", querySelector() { return null; } };
   const detailContext = vm.createContext({
     $: () => panel,
@@ -165,13 +244,46 @@ function renderCfdDetailFixture(runStatus) {
     effectiveStageStatus: (_stage, status) => status,
     fmt: (value, suffix = "") => value == null ? null : `${value}${suffix}`,
   });
-  vm.runInContext(["escapeHtml", "kvList", "renderCfdProgress", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdMeshRows", "renderScenarioPanel", "renderDetails"].map(productionFunction).join("\n"), detailContext);
+  vm.runInContext(["escapeHtml", "kvList", "renderCfdProgress", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdSolverExecutionSummary", "cfdMeshRows", "renderScenarioPanel", "renderDetails"].map(productionFunction).join("\n"), detailContext);
   const stages = Object.fromEntries(["qc", "anonymize", "segment", "surface", "report"].map((key) => [key, { status: "pending" }]));
-  stages.cfd_prep = { status: "ok", data: { parallel: { profile: "balanced", requested_subdomains: 12 } } };
+  stages.cfd_prep = { status: "ok", data: { parallel: { profile: "balanced", requested_subdomains: 12 }, ...prep } };
   stages.cfd_run = { status: "running", data: { run_status: runStatus } };
   detailContext.renderDetails({ case_id: "mesh-case", stages });
   return panel.innerHTML;
 }
+
+test("pressure-driven CFD does not invent a fixed flow or print null velocity", () => {
+  const html = renderCfdDetailFixture({}, { inlet_mode: "pressure", total_flow_lpm: null, mean_inlet_velocity_mps: null });
+  assert.match(html, /压力边界/);
+  assert.match(html, /未预设/);
+  assert.doesNotMatch(html, /<dd>null<|15 L\/min/);
+  const historical = renderCfdDetailFixture({});
+  assert.doesNotMatch(historical, /<dd>null<|压力边界|15 L\/min/);
+  const flow = renderCfdDetailFixture({}, { total_flow_lpm: 12, mean_inlet_velocity_mps: 1.5 });
+  assert.match(flow, /12 L\/min/);
+  assert.match(flow, /1.5 m\/s/);
+});
+
+test("workbench velocity card uses recorded boundary data instead of hardcoded 15 L/min", () => {
+  const cards = new Map();
+  const metricsContext = vm.createContext({
+    externalAirCleanupState: () => ({ pending: false }), requiresMaskReview: () => false,
+    round: value => value, verdictText: value => value,
+    fmt: (value, suffix = "") => value == null ? null : `${value}${suffix}`,
+    configureMetricCard: (id, data) => cards.set(id, data),
+  });
+  vm.runInContext(productionFunction("renderMetrics"), metricsContext);
+  for (const prep of [{ inlet_mode: "pressure", total_flow_lpm: null, mean_inlet_velocity_mps: null }, { total_flow_lpm: 12, mean_inlet_velocity_mps: 1.5 }, {}]) {
+    metricsContext.renderMetrics({ stages: { cfd_prep: { status: "ok", data: prep }, cfd_run: { status: "warn" } } });
+    const card = cards.get("mt-velocity");
+    assert.doesNotMatch(card.status, /15 L\/min/);
+    if (prep.inlet_mode === "pressure") {
+      assert.match(card.status, /压力边界/);
+      assert.equal(card.empty, "未预设");
+    } else if (prep.total_flow_lpm) assert.match(card.status, /12 L\/min/);
+    else assert.match(card.status, /未记录/);
+  }
+});
 
 test("CFD details show mesh execution evidence without deriving it from solver resources", () => {
   const runtime = { backend: "docker", cpu: { logical_cores: 24, physical_cores: 12 } };
@@ -210,7 +322,7 @@ test("CFD details use the same prepared profile and show the log-based failure a
     effectiveStageStatus: (_stage, status) => status,
     fmt: (value, suffix = "") => value == null ? null : `${value}${suffix}`,
   });
-  vm.runInContext(["escapeHtml", "kvList", "renderCfdProgress", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdMeshRows", "renderScenarioPanel", "renderDetails"].map(productionFunction).join("\n"), detailContext);
+  vm.runInContext(["escapeHtml", "kvList", "renderCfdProgress", "cfdParallelLabel", "cfdEffectiveParallelPlan", "cfdRuntimeRows", "cfdSolverExecutionSummary", "cfdMeshRows", "renderScenarioPanel", "renderDetails"].map(productionFunction).join("\n"), detailContext);
   const stages = Object.fromEntries(["qc", "anonymize", "segment", "surface", "report"].map((key) => [key, { status: "pending" }]));
   stages.cfd_prep = { status: "ok", data: { parallel: { profile: "strongest", requested_subdomains: 16 } } };
   stages.cfd_run = { status: "failed", data: { run_status: {

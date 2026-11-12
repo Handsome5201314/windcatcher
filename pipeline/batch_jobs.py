@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import threading
@@ -18,6 +19,84 @@ from pathlib import Path
 from .errors import PipelineError
 
 LOGGER = logging.getLogger(__name__)
+_MUTATION_LOCK = threading.RLock()
+_MUTATION_OWNERS: dict[str, tuple[int, int]] = {}
+_LEASE_LOCK = threading.RLock()
+_HELD_LEASES: dict[Path, "ProcessLease"] = {}
+
+
+def _try_reserve_case(case_id: str) -> bool:
+    """One in-process owner across both queues and HTTP case mutations."""
+    owner = threading.get_ident()
+    with _MUTATION_LOCK:
+        current = _MUTATION_OWNERS.get(case_id)
+        if current is not None and current[0] != owner:
+            return False
+        _MUTATION_OWNERS[case_id] = (owner, 1 if current is None else current[1] + 1)
+        return True
+
+
+def _release_case(case_id: str) -> None:
+    with _MUTATION_LOCK:
+        owner, count = _MUTATION_OWNERS[case_id]
+        if owner != threading.get_ident():
+            raise RuntimeError("case reservation released by another thread")
+        if count == 1:
+            del _MUTATION_OWNERS[case_id]
+        else:
+            _MUTATION_OWNERS[case_id] = (owner, count - 1)
+
+
+class ProcessLease:
+    """Exclusive service-process lease, held before recovery and until workers stop."""
+
+    def __init__(self, path: Path):
+        self.path = path.resolve()
+        self.stream = None
+
+    def acquire(self) -> None:
+        with _LEASE_LOCK:
+            if self.stream is not None:
+                return
+            if self.path in _HELD_LEASES:
+                raise PipelineError("blocked", "该数据目录已有工作台服务进程",
+                                    ["保持单进程单 worker，先关闭旧服务"])
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            stream = self.path.open("a+b")
+            try:
+                if stream.seek(0, os.SEEK_END) == 0:
+                    stream.write(b"\0")
+                    stream.flush()
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                stream.close()
+                raise PipelineError("blocked", "该数据目录已有工作台服务进程",
+                                    ["保持单进程单 worker，先关闭旧服务"]) from exc
+            self.stream = stream
+            _HELD_LEASES[self.path] = self
+
+    def release(self) -> None:
+        with _LEASE_LOCK:
+            if self.stream is None:
+                return
+            try:
+                self.stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self.stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.stream.close()
+                self.stream = None
+                _HELD_LEASES.pop(self.path, None)
 
 
 def _now():
@@ -29,8 +108,10 @@ def _json(value):
 
 
 class BatchQueue:
-    def __init__(self, path: Path, preflight, execute):
+    def __init__(self, path: Path, preflight, execute, *, snapshot=None, execute_with_progress=False):
         self.path, self.preflight, self.execute = path, preflight, execute
+        self.snapshot = snapshot or preflight
+        self.execute_with_progress = execute_with_progress
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.stopping = threading.Event()
@@ -64,15 +145,20 @@ class BatchQueue:
     @contextmanager
     def mutation(self, case_id):
         """Shared by HTTP mutations and the worker, including non-solver writes."""
-        with self.lock:
-            if case_id in self.reserved:
-                raise PipelineError("blocked", "该病例正在执行批量任务或保存操作", ["等待当前任务结束后重试"])
-            self.reserved.add(case_id)
+        if not _try_reserve_case(case_id):
+            raise PipelineError("blocked", "该病例正在执行批量任务或保存操作", ["等待当前任务结束后重试"])
         try:
-            yield
-        finally:
             with self.lock:
-                self.reserved.discard(case_id)
+                if case_id in self.reserved:
+                    raise PipelineError("blocked", "该病例正在执行批量任务或保存操作", ["等待当前任务结束后重试"])
+                self.reserved.add(case_id)
+            try:
+                yield
+            finally:
+                with self.lock:
+                    self.reserved.discard(case_id)
+        finally:
+            _release_case(case_id)
 
     def _set(self, db, item_id, status, result):
         db.execute("UPDATE items SET status=?, result_json=?, updated_at=? WHERE id=?",
@@ -94,7 +180,7 @@ class BatchQueue:
                 try:
                     if item["case_id"] in self.reserved:
                         raise PipelineError("blocked", "该病例正在执行其他操作", ["等待完成后重新提交"])
-                    snapshot = self.preflight(item)
+                    snapshot = self.snapshot(item)
                 except PipelineError as exc:
                     status, result = "blocked" if exc.status == "blocked" else "failed", exc.to_dict()
                 cursor = db.execute("INSERT INTO items(batch_id,position,case_id,input_json,snapshot_json,status,result_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -140,6 +226,7 @@ class BatchQueue:
         self.wake.set()
         if self.thread:
             self.thread.join(timeout=2)
+        return not self.thread or not self.thread.is_alive()
 
     def _run_one(self):
         with self.lock, self._db() as db:
@@ -149,13 +236,27 @@ class BatchQueue:
             case_id = row["case_id"]
             if case_id in self.reserved:
                 return False
-            self.reserved.add(case_id)
-            self._set(db, row["id"], "running", None)
+            if not _try_reserve_case(case_id):
+                return False
+            try:
+                self.reserved.add(case_id)
+                self._set(db, row["id"], "running", None)
+            except Exception:
+                self.reserved.discard(case_id)
+                _release_case(case_id)
+                raise
         try:
             item = json.loads(row["input_json"])
-            if self.preflight(item) != json.loads(row["snapshot_json"]):
+            if self.snapshot(item) != json.loads(row["snapshot_json"]):
                 raise PipelineError("blocked", "排队期间输入或审核版本已变化，未执行求解", ["复核当前输入，再用新幂等键提交"])
-            result = self.execute(item)
+            def progress(value):
+                # Execution holds the case reservation, never the queue/DB lock.
+                # Readers and queued-item cancellation remain available.
+                with self.lock, self._db() as db:
+                    db.execute("UPDATE items SET result_json=?, updated_at=? WHERE id=? AND status='running'",
+                               (_json(value), _now(), row["id"]))
+            result = (self.execute(item, progress) if self.execute_with_progress
+                      else self.execute(item))
             status = result.pop("task_status")
             if status not in {"solved", "blocked", "failed"}:
                 raise ValueError("invalid task outcome")
@@ -170,6 +271,7 @@ class BatchQueue:
         finally:
             with self.lock:
                 self.reserved.discard(case_id)
+            _release_case(case_id)
         return True
 
     def _worker(self):

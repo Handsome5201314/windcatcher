@@ -2,17 +2,22 @@
 
 事实报告始终由 :mod:`pipeline.report` 本地生成。本模块只读取报告中的
 白名单统计字段，并把脱敏后的结构化数据发送给用户配置的 OpenAI 兼容接口。
-API 密钥优先从环境变量读取，也可由环境页暂存到当前服务进程内存；绝不写入配置文件、日志或病例产物。
+本机/共享模式的 API 密钥可从环境变量读取，也可由环境页暂存到进程内存。
+个人账号模式只使用该账号提交的进程内密钥；绝不写入配置文件、日志或病例产物。
 """
 
 from __future__ import annotations
 
+import ipaddress
+import http.client
 import json
 import os
 import re
+import socket
 import threading
 import urllib.error
 import urllib.request
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
@@ -21,6 +26,7 @@ from .config import APP_DIR
 
 CONFIG_PATH = APP_DIR / "cases" / ".ai-report-config.json"
 API_KEY_ENV = "WINDCATCHER_AI_API_KEY"
+ALLOWED_HOSTS_ENV = "WINDCATCHER_AI_ALLOWED_HOSTS"
 DEFAULT_MODEL = "gpt-4o-mini"
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_MODELS = 500
@@ -28,6 +34,9 @@ MAX_API_KEY_LENGTH = 4096
 _SESSION_KEY_LOCK = threading.Lock()
 _SESSION_API_KEY = ""
 _SESSION_API_BASE_URL = ""
+CURRENT_USER_ID: ContextVar[str | None] = ContextVar("windcatcher_ai_user_id", default=None)
+_USER_SESSION_KEYS: dict[str, tuple[str, str]] = {}
+_USER_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 
 
 class AIReportError(Exception):
@@ -59,9 +68,133 @@ def _valid_url(value: str) -> str:
     return normalized
 
 
+def _personal_provider_url(value: str, *, resolve: bool = False) -> str:
+    """Restrict personal-account outbound requests to admin-approved public HTTPS hosts."""
+    normalized = _valid_url(value)
+    if CURRENT_USER_ID.get() is None:
+        return normalized
+    parsed = urlparse(normalized)
+    host = parsed.hostname or ""
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise AIReportError("AI 服务端口无效", 400) from exc
+    if parsed.scheme != "https" or port not in (None, 443):
+        raise AIReportError("个人账号的 AI 服务必须使用 HTTPS 标准端口", 400)
+    if (not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host, re.ASCII)
+            or "." not in host or ".." in host):
+        raise AIReportError("AI 服务域名无效", 400)
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise AIReportError("个人账号不能连接 IP 地址", 400)
+    raw_hosts = os.environ.get(ALLOWED_HOSTS_ENV, "")
+    allowed = {part.strip().lower() for part in raw_hosts.split(",") if part.strip()}
+    if not allowed:
+        raise AIReportError("管理员尚未配置 AI 服务允许域名", 403)
+    if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", item, re.ASCII)
+           or "." not in item or ".." in item for item in allowed):
+        raise AIReportError("AI 服务允许域名配置无效", 503)
+    if host not in allowed:
+        raise AIReportError("该 AI 服务域名未获管理员允许", 403)
+    if resolve:
+        _resolve_public_addresses(host)
+    return normalized
+
+
+def _resolve_public_addresses(host: str) -> tuple[tuple[int, int, int, tuple], ...]:
+    """Resolve once and retain only vetted socket addresses for the connection."""
+    try:
+        answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise AIReportError("无法解析 AI 服务域名", 502) from exc
+    if not answers:
+        raise AIReportError("无法解析 AI 服务域名", 502)
+    addresses = []
+    for family, socktype, protocol, _, sockaddr in answers:
+        try:
+            address = ipaddress.ip_address(sockaddr[0])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise AIReportError("AI 服务域名解析结果无效", 502) from exc
+        if not address.is_global:
+            raise AIReportError("AI 服务域名解析到非公网地址", 403)
+        if (socktype != socket.SOCK_STREAM or
+                family not in (socket.AF_INET, socket.AF_INET6) or
+                family != (socket.AF_INET if address.version == 4 else socket.AF_INET6)):
+            raise AIReportError("AI 服务域名解析结果无效", 502)
+        addresses.append((family, socktype, protocol, sockaddr))
+    return tuple(addresses)
+
+
+class _RejectRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        raise AIReportError("AI 服务重定向已被拒绝", 502)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, addresses: tuple[tuple[int, int, int, tuple], ...], **kwargs):
+        super().__init__(host, **kwargs)
+        self.addresses = addresses
+
+    def connect(self) -> None:
+        if self._tunnel_host:
+            raise OSError("个人 AI 请求不得通过代理转发")
+        last_error = None
+        for family, socktype, protocol, sockaddr in self.addresses:
+            sock = None
+            try:
+                sock = socket.socket(family, socktype, protocol)
+                sock.settimeout(self.timeout)
+                if self.source_address:
+                    sock.bind(self.source_address)
+                sock.connect(sockaddr)
+                # TLS still verifies the certificate against the approved DNS name.
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+                return
+            except OSError as exc:
+                if sock is not None:
+                    sock.close()
+                last_error = exc
+        raise last_error or OSError("AI 服务没有可连接的公网地址")
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, addresses: tuple[tuple[int, int, int, tuple], ...]):
+        super().__init__()
+        self.addresses = addresses
+
+    def https_open(self, request):
+        return self.do_open(
+            lambda host, **kwargs: _PinnedHTTPSConnection(host, self.addresses, **kwargs),
+            request, context=self._context,
+        )
+
+
+def _open_provider_request(request: urllib.request.Request, timeout: int):
+    if CURRENT_USER_ID.get() is None:
+        return urllib.request.urlopen(request, timeout=timeout)
+    normalized = _personal_provider_url(request.full_url)
+    addresses = _resolve_public_addresses(urlparse(normalized).hostname or "")
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _RejectRedirect(), _PinnedHTTPSHandler(addresses),
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def _config_path() -> Path:
+    user_id = CURRENT_USER_ID.get()
+    if user_id is None:
+        return CONFIG_PATH
+    if not _USER_ID_PATTERN.fullmatch(user_id):
+        raise AIReportError("账号标识无效", 403)
+    return CONFIG_PATH.parent / ".ai-report-users" / f"{user_id}.json"
+
+
 def _read_saved_config() -> dict:
     try:
-        value = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        value = json.loads(_config_path().read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
@@ -70,14 +203,21 @@ def _read_saved_config() -> dict:
 def get_config() -> dict:
     """返回不含密钥的安全配置状态。"""
     saved = _read_saved_config()
-    raw_url = os.environ.get("WINDCATCHER_AI_API_URL") or saved.get("base_url") or ""
+    user_id = CURRENT_USER_ID.get()
+    raw_url = (os.environ.get("WINDCATCHER_AI_API_URL") if user_id is None else None) or saved.get("base_url") or ""
     try:
         base_url = _valid_url(raw_url) if raw_url else ""
     except AIReportError:
         base_url = ""
-    model = str(os.environ.get("WINDCATCHER_AI_MODEL") or saved.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    model = str((os.environ.get("WINDCATCHER_AI_MODEL") if user_id is None else None) or saved.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     key_configured = bool(_active_api_key(base_url))
-    configured = bool(base_url and key_configured)
+    provider_error = None
+    if user_id is not None and base_url:
+        try:
+            _personal_provider_url(base_url)
+        except AIReportError as exc:
+            provider_error = exc.reason
+    configured = bool(base_url and key_configured and not provider_error)
     return {
         "status": "available" if configured else "unavailable",
         "configured": configured,
@@ -85,13 +225,13 @@ def get_config() -> dict:
         "base_url": base_url,
         "model": model,
         "api_key_configured": key_configured,
-        "reason": "已配置，可生成 AI 解读" if configured else "请填写 API URL 和 API 密钥",
-        "key_env": API_KEY_ENV,
+        "reason": "已配置，可生成 AI 解读" if configured else provider_error or "请填写 API URL 和 API 密钥",
+        "key_env": API_KEY_ENV if user_id is None else "",
     }
 
 
 def set_session_api_key(api_key: str | None, base_url: str) -> None:
-    """Keep a submitted key bound to one API base URL in this process only."""
+    """Keep a submitted key bound to one user and URL in this process only."""
     normalized_base = _valid_url(base_url)
     normalized = str(api_key or "").strip()
     if len(normalized) > MAX_API_KEY_LENGTH:
@@ -99,30 +239,49 @@ def set_session_api_key(api_key: str | None, base_url: str) -> None:
     if not normalized:
         return
     with _SESSION_KEY_LOCK:
+        user_id = CURRENT_USER_ID.get()
+        if user_id is not None:
+            if not _USER_ID_PATTERN.fullmatch(user_id):
+                raise AIReportError("账号标识无效", 403)
+            _USER_SESSION_KEYS[user_id] = (normalized_base, normalized)
+            return
         global _SESSION_API_BASE_URL, _SESSION_API_KEY
         _SESSION_API_KEY = normalized
         _SESSION_API_BASE_URL = normalized_base
 
 
 def _active_api_key(base_url: str | None = None) -> str:
-    """Use a saved session key for the same base URL, then env fallback."""
+    """Use only the current user's key in personal mode; retain legacy fallback."""
     normalized_base = _valid_url(base_url) if base_url else None
     with _SESSION_KEY_LOCK:
+        user_id = CURRENT_USER_ID.get()
+        if user_id is not None:
+            if not _USER_ID_PATTERN.fullmatch(user_id):
+                raise AIReportError("账号标识无效", 403)
+            saved = _USER_SESSION_KEYS.get(user_id)
+            return saved[1] if saved and (normalized_base is None or saved[0] == normalized_base) else ""
         if _SESSION_API_KEY and (normalized_base is None or _SESSION_API_BASE_URL == normalized_base):
             return _SESSION_API_KEY
     return os.environ.get(API_KEY_ENV, "").strip()
 
 
+def forget_user_key(user_id: str) -> None:
+    """Discard a disabled account's transient key without touching its config."""
+    with _SESSION_KEY_LOCK:
+        _USER_SESSION_KEYS.pop(user_id, None)
+
+
 def save_config(base_url: str, model: str | None = None, api_key: str | None = None) -> dict:
-    """保存非敏感连接配置；api_key 仅保存在当前服务进程内存。"""
-    normalized = _valid_url(base_url)
+    """保存非敏感连接配置；api_key 仅保存在该账号的进程内存。"""
+    normalized = _personal_provider_url(base_url)
     if api_key is not None and len(str(api_key or "").strip()) > MAX_API_KEY_LENGTH:
         raise AIReportError("API 密钥长度不正确", 400)
     model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     if len(model) > 160 or not re.fullmatch(r"[A-Za-z0-9_.:/-]+", model):
         raise AIReportError("模型名称格式不正确", 400, ["模型名称只允许字母、数字、点、下划线、冒号、斜线和短横线"])
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps({"base_url": normalized, "model": model}, ensure_ascii=False, indent=2), encoding="utf-8")
+    path = _config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"base_url": normalized, "model": model}, ensure_ascii=False, indent=2), encoding="utf-8")
     if api_key is not None:
         set_session_api_key(api_key, normalized)
     return get_config()
@@ -148,7 +307,7 @@ def list_models(base_url: str, api_key: str) -> dict:
     small public subset of each model record so provider metadata cannot leak
     into the UI or logs.
     """
-    normalized = _valid_url(base_url)
+    normalized = _personal_provider_url(base_url)
     normalized_key = str(api_key or "").strip() or _active_api_key(normalized)
     if not normalized_key:
         raise AIReportError("请填写 API 密钥", 400, ["密钥仅用于本次获取模型，不会保存到病例或配置文件"])
@@ -161,7 +320,7 @@ def list_models(base_url: str, api_key: str) -> dict:
         headers={"Authorization": f"Bearer {normalized_key}", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _open_provider_request(request, timeout=30) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         detail = _redact_api_key(exc.read(800).decode("utf-8", errors="replace"), normalized_key)
@@ -318,11 +477,11 @@ def _call_model(config: dict, messages: list[dict]) -> dict:
     api_key = _active_api_key(config["base_url"])
     if not api_key:
         raise AIReportError("未配置 AI API 密钥", 409, ["到环境页填写 API 密钥并点击获取模型或保存连接配置"])
-    endpoint = _valid_url(config["base_url"]) + "/chat/completions"
+    endpoint = _personal_provider_url(config["base_url"]) + "/chat/completions"
     body = json.dumps({"model": config["model"], "temperature": 0, "messages": messages}, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(endpoint, data=body, method="POST", headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with _open_provider_request(request, timeout=90) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         detail = _redact_api_key(exc.read(800).decode("utf-8", errors="replace"), api_key)

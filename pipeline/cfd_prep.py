@@ -18,6 +18,8 @@ from .config import MIN_OPENING_AREA_MM2, SOP_DEFAULTS, resolve_parallel_plan
 from .errors import PipelineError
 from .volume import ANTERIOR_LPS, load_volume
 
+CFD_TEMPLATE_VERSION = "openfoam-simplefoam-boundary-v3"
+
 def _openings_by_end(geom_qc: dict) -> tuple[list[dict], list[dict], list[dict]]:
     """按端分组可用开口，并把离散化毛刺排除在边界条件之外。"""
     anterior, posterior, tiny = [], [], []
@@ -257,30 +259,38 @@ boundary
 """
 
 
-def _snappy_dict(location_m, cell_mm: float, layers: bool) -> str:
-    layer_block = ""
-    if layers:
-        layer_block = """
-    addLayers
-    {
-        relativeSizes true;
-        layers { wall { nSurfaceLayers 3; } }
-        expansionRatio 1.2;
-        finalLayerThickness 0.5;
-        minThickness 0.1;
-        nGrow 0;
-        featureAngle 60;
-        nRelaxIter 3;
-        nSmoothSurfaceNormals 1;
-        nSmoothThickness 5;
-        maxFaceThicknessRatio 0.5;
-        maxThicknessToMedialRatio 0.3;
-        minMedianAxisAngle 90;
-        nBufferCellsNoExtrude 0;
-        nLayerIter 50;
-    }
+def _snappy_dict(location_m, cell_mm: float, layers: bool, *, inlet_patches: tuple[str, ...] = ("inlet",)) -> str:
+    # OpenFOAM 2606 reads this dictionary even when addLayers is false.
+    layer_block = """addLayersControls
+{
+    relativeSizes true;
+    layers { wall { nSurfaceLayers 3; } }
+    expansionRatio 1.2;
+    finalLayerThickness 0.5;
+    minThickness 0.1;
+    nGrow 0;
+    featureAngle 60;
+    slipFeatureAngle 30;
+    nRelaxIter 3;
+    nSmoothSurfaceNormals 1;
+    nSmoothNormals 3;
+    nSmoothThickness 5;
+    maxFaceThicknessRatio 0.5;
+    maxThicknessToMedialRatio 0.3;
+    minMedialAxisAngle 90;
+    nBufferCellsNoExtrude 0;
+    nLayerIter 50;
+}
 """
     level = 2 if cell_mm >= 0.8 else 3
+    inlet_geometry = "\n".join(
+        f"    {patch}.stl\n    {{{{\n        type triSurfaceMesh;\n        name {patch};\n    }}}}"
+        for patch in inlet_patches
+    ).replace("{{", "{").replace("}}", "}")
+    inlet_refinement = "\n".join(
+        f"        {patch} {{ level ({level} {level + 1}); patchInfo {{ type patch; }} }}"
+        for patch in inlet_patches
+    )
     return f"""/* 由风见生成：snappyHexMesh 设置 */
 FoamFile
 {{
@@ -302,11 +312,7 @@ geometry
         type triSurfaceMesh;
         name wall;
     }}
-    inlet.stl
-    {{
-        type triSurfaceMesh;
-        name inlet;
-    }}
+{inlet_geometry}
     outlet.stl
     {{
         type triSurfaceMesh;
@@ -330,7 +336,7 @@ castellatedMeshControls
     refinementSurfaces
     {{
         wall   {{ level ({level} {level + 1}); patchInfo {{ type wall; }} }}
-        inlet  {{ level ({level} {level + 1}); patchInfo {{ type patch; }} }}
+{inlet_refinement}
         outlet {{ level ({level} {level + 1}); patchInfo {{ type patch; }} }}
     }}
     resolveFeatureAngle 30;
@@ -392,6 +398,38 @@ def _write(path: Path, cls: str, name: str, body: str) -> None:
     path.write_text(HEADER.format(cls=cls, name=name) + "\n" + body, encoding="utf-8")
 
 
+def _control_dict_for_inlets(template: str, inlet_patches: tuple[str, ...], openfoam_flavour: str = "org") -> str:
+    if inlet_patches not in {("inlet",), ("inlet_left", "inlet_right")}:
+        raise ValueError("unsupported inlet patch layout")
+    if inlet_patches == ("inlet_left", "inlet_right"):
+        for token, next_token in (("inletFlowRate", "outletFlowRate"),
+                                  ("inletPressure", "outletPressure")):
+            start = template.index(f"    {token}\n")
+            end = template.index(f"    {next_token}\n", start)
+            block = template[start:end]
+            replacement = "".join(
+                block.replace(token, f"inlet{side}"
+                              + ("FlowRate" if token.endswith("FlowRate") else "Pressure"))
+                .replace("patch           inlet;", f"patch           inlet_{side.lower()};")
+                for side in ("Left", "Right")
+            )
+            template = template[:start] + replacement + template[end:]
+    if openfoam_flavour == "esi":
+        old = "        select          patch;\n        patch           "
+        if template.count(old) != template.count("type            surfaceFieldValue;"):
+            raise ValueError("surfaceFieldValue patch selection is incomplete")
+        template = template.replace(old, "        regionType      patch;\n        name            ")
+    elif openfoam_flavour != "org":
+        raise ValueError("unsupported OpenFOAM flavour")
+    return template
+
+
+def _default_openfoam_flavour() -> str:
+    from .openfoam_runner import configured_image_flavour
+
+    return configured_image_flavour()
+
+
 def prepare_case(case_id: str, params: dict | None = None) -> dict:
     """生成 OpenFOAM 算例目录，返回工况与产物清单。"""
     from .cases import case_dir, get_case, update_stage
@@ -399,7 +437,7 @@ def prepare_case(case_id: str, params: dict | None = None) -> dict:
     p = dict(SOP_DEFAULTS)
     p.update(
         {
-            "openfoam_flavour": "org",        # org=OpenFOAM.org(v11) / esi=OpenFOAM ESI(v2312)
+            "openfoam_flavour": _default_openfoam_flavour(),
             "turbulence_model": "laminar",    # SOP：入门先层流，定量分析再 kOmegaSST
             "inlet_mode": "flowRate",         # flowRate / pressure
             "inlet_pressure_pa": 18.0,        # 吸气：入口相对出口为正压差；出口参考压力为 0
@@ -440,11 +478,69 @@ def prepare_case(case_id: str, params: dict | None = None) -> dict:
             surface_meta = {}
     seg_path = root / "segment" / "segmentation.json"
     seg = json.loads(seg_path.read_text(encoding="utf-8")) if seg_path.exists() else {}
-    endplane_meta = None
+    endplane_meta = surface_meta.get("endplanes")
+    oblique_clip = surface_meta.get("oblique_clip")
+    endplane_source = endplane_meta.get("source") if isinstance(endplane_meta, dict) else None
+    clip_format = oblique_clip.get("format") if isinstance(oblique_clip, dict) else None
+    bilateral_sources = {
+        "user_confirmed_bilateral_local_oblique_planes",
+        "automated_bilateral_local_oblique_planes",
+    }
+    bilateral_local = (
+        endplane_source in bilateral_sources
+        and clip_format == "oblique_mesh_clip_bilateral_local_v3"
+        and endplane_meta.get("format") == "oblique_bilateral_local_v3"
+    )
+    if endplane_source == "automated_bilateral_local_oblique_planes":
+        from . import endplanes
+        saved_plan = endplanes.load_plan(case_id, "main_airway")
+        if (not endplanes.automated_plan_is_valid(saved_plan)
+                or endplane_meta != {**saved_plan, "source": endplane_source}):
+            raise PipelineError(
+                "blocked", "自动端面来源或当前方案不一致，不能生成 CFD 算例",
+                ["重新生成并核对三端口与 STL"],
+            )
+    if (
+        endplane_source in bilateral_sources
+        or clip_format == "oblique_mesh_clip_bilateral_local_v3"
+    ) and not bilateral_local:
+        raise PipelineError(
+            "blocked", "双侧局部端面与曲面裁切版本不匹配，不能生成 CFD 算例",
+            ["重新生成双侧曲面与几何质检"],
+        )
+    if bilateral_local:
+        # Two pressure inlets share the same reference pressure; their flow
+        # split must be measured, never inferred from cap area or assumed 50/50.
+        if not params or "inlet_mode" not in params:
+            p["inlet_mode"] = "pressure"
+        if p["inlet_mode"] == "flowRate":
+            try:
+                left_flow_fraction = float(p["left_flow_fraction"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PipelineError(
+                    "blocked", "双侧定流量工况必须显式给出左侧入口流量比例",
+                    ["指定 0 到 1 之间的 left_flow_fraction，或改用双侧等压入口工况"],
+                ) from exc
+            if not np.isfinite(left_flow_fraction) or not 0 < left_flow_fraction < 1:
+                raise PipelineError("blocked", "左侧入口流量比例必须在 0 到 1 之间")
+        elif p["inlet_mode"] != "pressure":
+            raise PipelineError("blocked", "双侧入口工况仅支持 pressure 或明确分流比例的 flowRate")
+        if p["inlet_mode"] == "pressure" and p["turbulence_model"] != "laminar":
+            raise PipelineError("blocked", "双侧压力入口的湍流初值未定义，先采用层流算例")
+        if p["inlet_mode"] == "pressure" and inlet_pressure_pa <= 0:
+            raise PipelineError("blocked", "吸气算例的双侧入口压力必须高于出口参考压力 0 Pa")
+    if (endplane_source == "user_confirmed_local_oblique_planes"
+            or clip_format == "oblique_mesh_clip_local_v2"):
+        raise PipelineError(
+            "blocked", "局部入口仅代表所选单支段几何，尚未定义其 CFD 工况，不能生成算例",
+            ["先复核单支段入口的边界条件和流量；不要按双侧鼻呼吸工况计算"],
+            {"stage": "surface", "endplane_source": endplane_source, "clip_format": clip_format},
+        )
     if not get_case(case_id).get("synthetic", False):
-        endplane_meta = surface_meta.get("endplanes")
         if not isinstance(endplane_meta, dict) or endplane_meta.get("source") not in {
             "user_confirmed_ct_planes", "user_confirmed_oblique_planes",
+            "user_confirmed_bilateral_local_oblique_planes",
+            "automated_bilateral_local_oblique_planes",
         }:
             raise PipelineError(
                 "blocked",
@@ -544,21 +640,46 @@ def prepare_case(case_id: str, params: dict | None = None) -> dict:
             ],
             {"openings_by_end": geom_qc.get("openings_by_end")},
         )
+    if bilateral_local:
+        sides = [item.get("side") for item in anterior]
+        if (
+            sorted(sides) != ["left", "right"]
+            or len(posterior) != 1
+            or posterior[0].get("side") != "outlet"
+            or geom_qc.get("boundary_edges") != 0
+            or geom_qc.get("connected_components") != 1
+        ):
+            raise PipelineError(
+                "blocked", "双侧 CFD 需要左右鼻孔各一个入口、鼻咽一个出口，且气道连通水密",
+                ["核对三个端面的定位与几何质检；存在额外孔或断开组件时不得求解"],
+                {"openings": geom_qc.get("openings"), "boundary_edges": geom_qc.get("boundary_edges"),
+                 "connected_components": geom_qc.get("connected_components")},
+            )
 
     vertices = np.load(root / "surface" / "vertices.npy")
     faces = np.load(root / "surface" / "faces.npy")
-    oblique_caps = endplane_meta.get("source") == "user_confirmed_oblique_planes" if isinstance(endplane_meta, dict) else False
+    oblique_caps = (
+        endplane_meta.get("source") == "user_confirmed_oblique_planes" if isinstance(endplane_meta, dict) else False
+    ) or bilateral_local
     inlet_cap_indices = outlet_cap_indices = np.zeros((0,), dtype=np.int32)
+    left_cap_indices = right_cap_indices = np.zeros((0,), dtype=np.int32)
     if oblique_caps:
         try:
-            inlet_cap_indices = np.asarray(np.load(root / "surface" / "inlet_triangles.npy"), dtype=np.int32).reshape(-1)
+            if bilateral_local:
+                left_cap_indices = np.asarray(np.load(root / "surface" / "inlet_left_triangles.npy"), dtype=np.int32).reshape(-1)
+                right_cap_indices = np.asarray(np.load(root / "surface" / "inlet_right_triangles.npy"), dtype=np.int32).reshape(-1)
+                inlet_cap_indices = np.concatenate([left_cap_indices, right_cap_indices])
+            else:
+                inlet_cap_indices = np.asarray(np.load(root / "surface" / "inlet_triangles.npy"), dtype=np.int32).reshape(-1)
             outlet_cap_indices = np.asarray(np.load(root / "surface" / "outlet_triangles.npy"), dtype=np.int32).reshape(-1)
         except (OSError, ValueError) as exc:
             raise PipelineError("blocked", "3D 端面封盖记录缺失", ["重新生成 STL 与几何质检后再生成 CFD 算例"]) from exc
         all_cap_indices = np.concatenate([inlet_cap_indices, outlet_cap_indices])
         if (
             len(inlet_cap_indices) == 0 or len(outlet_cap_indices) == 0
+            or (bilateral_local and (len(left_cap_indices) == 0 or len(right_cap_indices) == 0))
             or np.any(all_cap_indices < 0) or np.any(all_cap_indices >= len(faces))
+            or len(set(int(value) for value in all_cap_indices)) != len(all_cap_indices)
         ):
             raise PipelineError("blocked", "3D 端面没有形成完整入口/出口封盖", ["调整两张切面后重新生成 STL 与几何质检"])
         cap_set = set(int(value) for value in all_cap_indices)
@@ -566,6 +687,9 @@ def prepare_case(case_id: str, params: dict | None = None) -> dict:
         wall_tris = vertices[faces[wall_indices]]
         inlet_tris = vertices[faces[inlet_cap_indices]]
         outlet_tris = vertices[faces[outlet_cap_indices]]
+        if bilateral_local:
+            left_tris = vertices[faces[left_cap_indices]]
+            right_tris = vertices[faces[right_cap_indices]]
     else:
         wall_tris = np.stack([vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]], axis=1)
 
@@ -591,16 +715,35 @@ def prepare_case(case_id: str, params: dict | None = None) -> dict:
         outlet_area_mm2 = float(np.sum(0.5 * np.linalg.norm(np.cross(outlet_tris[:, 1] - outlet_tris[:, 0], outlet_tris[:, 2] - outlet_tris[:, 0]), axis=1)))
 
     # 清洗封闭壳（焊接/去退化/去重/统一朝向），再交给 STL 写出
-    cleaned, clean_stats = _clean_shell(
+    regions = (
+        {"wall": wall_tris, "inlet_left": left_tris, "inlet_right": right_tris, "outlet": outlet_tris}
+        if bilateral_local else
         {"wall": wall_tris, "inlet": inlet_tris, "outlet": outlet_tris}
     )
+    cleaned, clean_stats = _clean_shell(regions)
+    if bilateral_local and not clean_stats.get("closed"):
+        raise PipelineError(
+            "blocked", "双侧入口清洗后不是连通水密壳，不能生成 CFD 算例",
+            ["检查左右鼻孔及鼻咽三个封盖与壁面的焊接"], clean_stats,
+        )
     wall_tris = cleaned["wall"]
-    inlet_tris = cleaned["inlet"]
+    if bilateral_local:
+        left_tris = cleaned["inlet_left"]
+        right_tris = cleaned["inlet_right"]
+        if not len(left_tris) or not len(right_tris) or not len(cleaned["outlet"]):
+            raise PipelineError("blocked", "双侧入口或鼻咽封盖在网格清洗后消失，不能生成 CFD 算例")
+        inlet_tris = np.concatenate([left_tris, right_tris])
+    else:
+        inlet_tris = cleaned["inlet"]
     outlet_tris = cleaned["outlet"]
 
     stl_dir = root / "cfd" / "constant" / "triSurface"
     _write_ascii_stl(stl_dir / "wall.stl", "wall", wall_tris)
-    _write_ascii_stl(stl_dir / "inlet.stl", "inlet", inlet_tris)
+    if bilateral_local:
+        _write_ascii_stl(stl_dir / "inlet_left.stl", "inlet_left", left_tris)
+        _write_ascii_stl(stl_dir / "inlet_right.stl", "inlet_right", right_tris)
+    else:
+        _write_ascii_stl(stl_dir / "inlet.stl", "inlet", inlet_tris)
     _write_ascii_stl(stl_dir / "outlet.stl", "outlet", outlet_tris)
     merged = np.concatenate(
         [wall_tris, inlet_tris, outlet_tris], axis=0
@@ -614,7 +757,14 @@ def prepare_case(case_id: str, params: dict | None = None) -> dict:
     outlet_area_m2 = outlet_area_mm2 * 1e-6
     if inlet_area_m2 <= 0:
         raise PipelineError("failed", "入口面积为 0，无法计算入口速度", ["检查鼻孔端开口是否正确保留"])
-    mean_velocity = flow_m3s / inlet_area_m2
+    mean_velocity = (flow_m3s / inlet_area_m2) if not (bilateral_local and p["inlet_mode"] == "pressure") else None
+    if bilateral_local:
+        inlet_areas_mm2 = {
+            patch: float(np.sum(0.5 * np.linalg.norm(
+                np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0]), axis=1,
+            )))
+            for patch, tris in (("inlet_left", left_tris), ("inlet_right", right_tris))
+        }
 
     # locationInMesh：掩膜内部最大内切点（米）
     volume = load_volume(case_id)
@@ -637,40 +787,33 @@ def prepare_case(case_id: str, params: dict | None = None) -> dict:
     (cfd_root / "system" / "blockMeshDict").write_text(
         _blockmesh_dict(min_xyz, max_xyz, float(p["background_cell_mm"])), encoding="utf-8"
     )
+    inlet_patches = ("inlet_left", "inlet_right") if bilateral_local else ("inlet",)
     (cfd_root / "system" / "snappyHexMeshDict").write_text(
-        _snappy_dict(location_m, float(p["background_cell_mm"]), bool(p["add_layers"])), encoding="utf-8"
+        _snappy_dict(location_m, float(p["background_cell_mm"]), bool(p["add_layers"]), inlet_patches=inlet_patches),
+        encoding="utf-8",
     )
 
-    inlet_u = (
-        f"""    inlet
+    branch_flows = (
+        {"inlet_left": flow_m3s * left_flow_fraction,
+         "inlet_right": flow_m3s * (1.0 - left_flow_fraction)}
+        if bilateral_local and p["inlet_mode"] == "flowRate"
+        else {"inlet": flow_m3s}
+    )
+    inlet_u = ""
+    inlet_p = ""
+    for patch in inlet_patches:
+        if p["inlet_mode"] == "flowRate":
+            inlet_u += f"""    {patch}
     {{
         type            flowRateInletVelocity;
-        volumetricFlowRate {flow_m3s:.8g};
+        volumetricFlowRate {branch_flows[patch]:.8g};
         value           uniform (0 0 0);
     }}
 """
-        if p["inlet_mode"] == "flowRate"
-        else f"""    inlet
-    {{
-        type            pressureInletVelocity;
-        value           uniform (0 0 0);
-    }}
-"""
-    )
-    inlet_p = (
-        """    inlet
-    {
-        type            zeroGradient;
-    }
-"""
-        if p["inlet_mode"] == "flowRate"
-        else f"""    inlet
-    {{
-        type            fixedValue;
-        value           uniform {inlet_pressure_pa / rho:.6g};
-    }}
-"""
-    )
+            inlet_p += f"    {patch} {{ type zeroGradient; }}\n"
+        else:
+            inlet_u += f"    {patch} {{ type pressureInletVelocity; value uniform (0 0 0); }}\n"
+            inlet_p += f"    {patch} {{ type fixedValue; value uniform {inlet_pressure_pa / rho:.6g}; }}\n"
 
     _write(
         cfd_root / "0" / "U",
@@ -726,12 +869,15 @@ boundaryField
         # 湍流场初值需由 CFD 工程师确认，这里给出常用量级并明确标注
         k_value = 1.5 * (mean_velocity * 0.05) ** 2
         omega_value = max(mean_velocity / 0.01, 1.0)
+        k_inlets = "\n".join(f"    {patch} {{ type fixedValue; value uniform {k_value:.6g}; }}" for patch in inlet_patches)
+        omega_inlets = "\n".join(f"    {patch} {{ type fixedValue; value uniform {omega_value:.6g}; }}" for patch in inlet_patches)
+        nut_inlets = "\n".join(f"    {patch} {{ type calculated; value uniform 0; }}" for patch in inlet_patches)
         _write(cfd_root / "0" / "k", "volScalarField", "k",
                f"""dimensions [0 2 -2 0 0 0 0];
 internalField uniform {k_value:.6g};
 boundaryField
 {{
-    inlet  {{ type fixedValue; value uniform {k_value:.6g}; }}
+{k_inlets}
     outlet {{ type zeroGradient; }}
     wall   {{ type kqRWallFunction; value uniform {k_value:.6g}; }}
     background {{ type zeroGradient; }}
@@ -742,22 +888,22 @@ boundaryField
 internalField uniform {omega_value:.6g};
 boundaryField
 {{
-    inlet  {{ type fixedValue; value uniform {omega_value:.6g}; }}
+{omega_inlets}
     outlet {{ type zeroGradient; }}
     wall   {{ type omegaWallFunction; value uniform {omega_value:.6g}; }}
     background {{ type zeroGradient; }}
 }}
 """)
         _write(cfd_root / "0" / "nut", "volScalarField", "nut",
-               """dimensions [0 2 -1 0 0 0 0];
+               f"""dimensions [0 2 -1 0 0 0 0];
 internalField uniform 0;
 boundaryField
-{
-    inlet  { type calculated; value uniform 0; }
-    outlet { type calculated; value uniform 0; }
-    wall   { type nutkWallFunction; value uniform 0; }
-    background { type calculated; value uniform 0; }
-}
+{{
+{nut_inlets}
+    outlet {{ type calculated; value uniform 0; }}
+    wall   {{ type nutkWallFunction; value uniform 0; }}
+    background {{ type calculated; value uniform 0; }}
+}}
 """)
 
     if p["openfoam_flavour"] == "org":
@@ -807,7 +953,7 @@ RAS
         cfd_root / "system" / "controlDict",
         "dictionary",
         "controlDict",
-        """application     simpleFoam;
+        _control_dict_for_inlets("""application     simpleFoam;
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
@@ -891,7 +1037,7 @@ functions
         fields          (p);
     }
 }
-""",
+""", inlet_patches, p["openfoam_flavour"]),
     )
 
     _write(
@@ -903,7 +1049,10 @@ gradSchemes { default Gauss linear; }
 divSchemes
 {
     default         none;
-    div(phi,U)      bounded Gauss linearUpwind grad(U);
+    // Use a bounded first-order transport scheme for the initial stable run.
+    // Higher-order linearUpwind is more accurate when converged, but this
+    // geometry previously developed a late pressure/continuity blow-up.
+    div(phi,U)      bounded Gauss upwind;
     div((nuEff*dev2(T(grad(U))))) Gauss linear;
     div(phi,k)      bounded Gauss upwind;
     div(phi,omega)  bounded Gauss upwind;
@@ -963,11 +1112,11 @@ relaxationFactors
 {{
     equations
     {{
-        U               0.7;
+        U               0.4;
     }}
     fields
     {{
-        p               0.3;
+        p               0.2;
     }}
 }}
 """,
@@ -1003,6 +1152,7 @@ docker run --rm -v "$CASE_DIR":/case -w /case "$IMAGE" bash -c \\
 
     meta = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "template_version": CFD_TEMPLATE_VERSION,
         "solver": "simpleFoam",
         "parallel": {
             **parallel_plan,
@@ -1012,8 +1162,21 @@ docker run --rm -v "$CASE_DIR":/case -w /case "$IMAGE" bash -c \\
         "openfoam_flavour": p["openfoam_flavour"],
         "turbulence_model": turbulence,
         "inlet_mode": p["inlet_mode"],
-        "total_flow_lpm": flow_lpm,
-        "total_flow_m3s": flow_m3s,
+        "boundary_layout": "bilateral_local_v3" if bilateral_local else "combined_inlet_v1",
+        "geometry_basis": (
+            "internal_bilateral_nasal_airway_with_stable_opening_planes"
+            if bilateral_local else "internal_nasal_airway_with_stable_opening_planes"
+        ),
+        "external_air_domain": {
+            "mode": "not_used_in_primary_baseline",
+            "experimental_location": "expert_workflow",
+            "reason": "外部空气域会引入远场边界、域尺寸和切断位置等额外参数",
+        },
+        "inlet_patches": list(inlet_patches),
+        "total_flow_lpm": None if bilateral_local and p["inlet_mode"] == "pressure" else flow_lpm,
+        "total_flow_m3s": None if bilateral_local and p["inlet_mode"] == "pressure" else flow_m3s,
+        "inlet_areas_mm2": {key: round(value, 3) for key, value in inlet_areas_mm2.items()} if bilateral_local else None,
+        "left_flow_fraction": left_flow_fraction if bilateral_local and p["inlet_mode"] == "flowRate" else None,
         "inlet_area_mm2": round(inlet_area_mm2, 2),
         "inlet_area_m2": inlet_area_m2,
         "outlet_area_mm2": round(outlet_area_mm2, 2),
@@ -1039,11 +1202,17 @@ docker run --rm -v "$CASE_DIR":/case -w /case "$IMAGE" bash -c \\
             "note": "算例按所选 OpenFOAM 分支生成；尚未求解验证。"
             "边界条件与求解设置需由 CFD 工程师复核，且需做粗/中/细网格敏感性检查。",
         },
-        "notes": [
-            "入口为双侧鼻孔合计流量；若只模拟单侧，请将 total_flow_lpm 设为 7.5",
-            "稳态求解 ≠ 呼吸周期动态仿真",
-            "开口封盖采用平面扇形三角化，凹形环需在 ParaView / Blender 中复核",
-        ],
+        "notes": (
+            ["左右入口采用相同相对压力；左右流量由求解结果测量，不假设固定比例",
+             "稳态压力工况不是患者真实呼吸周期或指定总流量"]
+            if bilateral_local and p["inlet_mode"] == "pressure" else
+            ["左右定流量入口使用显式给定的分流比例，不能由面积自动推断",
+             "稳态求解不是患者真实呼吸周期"]
+            if bilateral_local else
+            ["入口为双侧鼻孔合计流量；若只模拟单侧，请将 total_flow_lpm 设为 7.5",
+             "稳态求解 ≠ 呼吸周期动态仿真",
+             "开口封盖采用平面扇形三角化，凹形环需在 ParaView / Blender 中复核"]
+        ),
     }
     (cfd_root / "case_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1051,10 +1220,13 @@ docker run --rm -v "$CASE_DIR":/case -w /case "$IMAGE" bash -c \\
         case_id,
         "cfd_prep",
         "ok",
-        message=f"已生成 OpenFOAM 算例（入口面积 {inlet_area_mm2:.1f} mm²，平均速度 {mean_velocity:.2f} m/s）；尚未求解",
+        message=(f"已生成双侧 OpenFOAM 算例（左右入口面积合计 {inlet_area_mm2:.1f} mm²）；尚未求解"
+                 if bilateral_local and mean_velocity is None else
+                 f"已生成 OpenFOAM 算例（入口面积 {inlet_area_mm2:.1f} mm²，平均速度 {mean_velocity:.2f} m/s）；尚未求解"),
         artifacts=[
             "cfd/constant/triSurface/wall.stl",
-            "cfd/constant/triSurface/inlet.stl",
+            *(["cfd/constant/triSurface/inlet_left.stl", "cfd/constant/triSurface/inlet_right.stl"]
+              if bilateral_local else ["cfd/constant/triSurface/inlet.stl"]),
             "cfd/constant/triSurface/outlet.stl",
             "cfd/constant/triSurface/nasal_cfd.stl",
             "cfd/system/blockMeshDict",
@@ -1065,9 +1237,11 @@ docker run --rm -v "$CASE_DIR":/case -w /case "$IMAGE" bash -c \\
             "cfd/case_meta.json",
         ],
         data={
-            "total_flow_lpm": flow_lpm,
+            "template_version": CFD_TEMPLATE_VERSION,
+            "inlet_mode": meta["inlet_mode"],
+            "total_flow_lpm": None if bilateral_local and p["inlet_mode"] == "pressure" else flow_lpm,
             "inlet_area_mm2": round(inlet_area_mm2, 2),
-            "mean_inlet_velocity_mps": round(mean_velocity, 3),
+            "mean_inlet_velocity_mps": round(mean_velocity, 3) if mean_velocity is not None else None,
             "solver": "simpleFoam",
             "parallel": meta["parallel"],
             "solver_gpu_note": meta.get("parallel", {}).get("capabilities", {}).get("solver_gpu_note"),

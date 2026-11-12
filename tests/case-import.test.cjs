@@ -185,6 +185,6 @@ test("the form reserves synthetic mode for artificial CT and excludes public hum
   assert.ok(help, "the synthetic option must explain when anatomical selection is skipped");
   assert.match(label[1], /仅用于人工生成的合成测试 CT/);
   assert.doesNotMatch(label[1], /公开|脱敏/);
-  assert.match(help[1], /合成测试模式会跳过人工端面选择/);
+  assert.match(help[1], /合成测试可自动生成端面，也可手动选面验收/);
   assert.match(help[1], /真实人体 CT，包括公开或已脱敏的数据，请不要勾选/);
 });

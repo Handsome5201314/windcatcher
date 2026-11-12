@@ -18,22 +18,25 @@ import tempfile
 import threading
 import time
 from contextlib import ExitStack, asynccontextmanager
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from pipeline import activity_monitor, ai_report, automation, batch_jobs, capabilities, cfd_postprocess_jobs, cfd_prep, dicom_qc, endplanes, geom_qc, installers, mask_review, openfoam_runner, plug_models, preview, report, scenario_cfd, scenario_jobs, scenarios, segmentation, selection_preview, slicer_review, surface
+from pipeline import activity_monitor, ai_report, automation, batch_jobs, capabilities, cfd_postprocess_jobs, cfd_prep, dicom_qc, endplane_auto_candidate, endplane_candidates, endplane_history, endplane_learning, endplanes, formal_ports, geom_qc, gpu_solver, installers, mask_review, openfoam_runner, orchestration, orchestration_batch, plug_models, preview, report, scenario_cfd, scenario_jobs, scenarios, segmentation, selection_preview, slicer_review, surface
 from pipeline.anonymize import anonymize_series
-from pipeline.cases import artifact_path, case_dir, create_case, delete_case, get_case, list_cases, recover_interrupted_cases, update_job, update_stage
+from pipeline.cases import INTERRUPTED_MESSAGE, artifact_path, begin_case_deletion, case_dir, create_case, delete_case, deletion_pending, get_case, list_cases, recover_interrupted_cases, update_job, update_stage
 from pipeline.config import APP_DIR, CASES_DIR, PROJECT_ROOT, detect_compute_capabilities
 from pipeline.errors import PipelineError
 from pipeline.fetch_direct import fetch_direct
+from pipeline import uploads
 from pipeline.volume import load_series, save_volume
 
 REFERENCE_HTML = PROJECT_ROOT / "原始资料" / "原始鼻腔CFD_交互查看_v3.html"
@@ -47,13 +50,21 @@ _CFD_VALIDATION_CACHE: dict[str, tuple[tuple, dict]] = {}
 _CFD_SUMMARY_CACHE: dict[str, tuple[tuple, dict]] = {}
 _CFD_VALIDATION_LOCK = threading.Lock()
 _MONITOR_LOGGER = logging.getLogger("windcatcher.monitor")
+_MONITOR_RETENTION_CHECK_SECONDS = 3600
+CURRENT_CASE_OWNER_BINDER: ContextVar[object | None] = ContextVar(
+    "windcatcher_case_owner_binder", default=None)
+CURRENT_UPLOAD_RECOVERER: ContextVar[object | None] = ContextVar(
+    "windcatcher_upload_recoverer", default=None)
+CURRENT_UPLOAD_PENDING_CASE_ID: ContextVar[str | None] = ContextVar(
+    "windcatcher_upload_pending_case_id", default=None)
 _MONITOR_FAILURE: str | None = None
 
 
 def _cleanup_upload_staging() -> None:
-    """Remove incomplete browser uploads left by a stopped server."""
+    """Remove abandoned multipart requests; keep resumable chunk sessions."""
     try:
         CASES_DIR.mkdir(parents=True, exist_ok=True)
+        # Chunk sessions have their own TTL and may be resumed after restart.
         for staging in CASES_DIR.glob(".windcatcher-upload-*"):
             if staging.is_dir() and not staging.is_symlink():
                 shutil.rmtree(staging, ignore_errors=True)
@@ -72,8 +83,28 @@ def _record_activity(event: dict) -> int | None:
     _MONITOR_FAILURE = None
     return event_id
 
+
+async def _monitor_retention_loop(stop: asyncio.Event) -> None:
+    """Prune personal operation metadata even when no requests arrive."""
+    while not stop.is_set():
+        retry_after = _MONITOR_RETENTION_CHECK_SECONDS
+        try:
+            await run_in_threadpool(activity_monitor.prune_expired_events)
+            from pipeline.segmentation_learning import prune_expired_cases
+            await run_in_threadpool(prune_expired_cases)
+            from pipeline.segmentation_model_jobs import prune as prune_model_candidates
+            await run_in_threadpool(prune_model_candidates)
+        except Exception as exc:
+            _MONITOR_LOGGER.error("Activity retention cleanup failed: %s", type(exc).__name__)
+            retry_after = min(60, _MONITOR_RETENTION_CHECK_SECONDS)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=retry_after)
+        except asyncio.TimeoutError:
+            pass
+
+
 @asynccontextmanager
-async def app_lifespan(application: FastAPI):
+async def _app_lifespan_impl(application: FastAPI):
     # 只在本进程首次启动、开始接收请求前恢复。重复进入 lifespan 时不能改写本进程正在执行的任务。
     if not getattr(application.state, "interrupted_cases_recovered", False):
         _cleanup_upload_staging()
@@ -85,12 +116,80 @@ async def app_lifespan(application: FastAPI):
     queue = batch_jobs.BatchQueue(Path(os.environ.get("WINDCATCHER_AUTOMATION_DIR", str(APP_DIR / ".local-automation"))) / "jobs.sqlite3", automation.preflight, automation.execute)
     application.state.batch_queue = queue
     queue.start()
+    def authorize_orchestration(actor_id: str, case_id: str) -> bool:
+        checker = getattr(application.state, "orchestration_authorize", None)
+        if os.environ.get("WINDCATCHER_MULTIUSER") == "1":
+            return bool(callable(checker) and checker(actor_id, case_id))
+        return True
+
+    class OrchestrationQueue(batch_jobs.BatchQueue):
+        def _run_one(self):
+            # Take the existing case mutation reservation *before* comparing
+            # the queued snapshot. This closes the gap where a human edit
+            # could land between version check and the first model action.
+            with self.lock, self._db() as db:
+                row = db.execute("SELECT case_id FROM items WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+            if row is None:
+                return False
+            try:
+                with queue.mutation(row["case_id"]):
+                    return super()._run_one()
+            except PipelineError:
+                return False
+
+    orchestration_queue = OrchestrationQueue(
+        Path(os.environ.get("WINDCATCHER_AUTOMATION_DIR", str(APP_DIR / ".local-automation"))) / "orchestration.sqlite3",
+        lambda item: orchestration_batch.preflight(item, authorize_orchestration),
+        lambda item, progress: orchestration_batch.execute(item, authorize_orchestration, progress),
+        snapshot=lambda item: orchestration_batch.submission_snapshot(item, authorize_orchestration),
+        execute_with_progress=True,
+    )
+    application.state.orchestration_queue = orchestration_queue
+    orchestration_queue.start()
+    retention_stop = asyncio.Event() if os.environ.get("WINDCATCHER_MULTIUSER") == "1" else None
+    retention_task = (asyncio.create_task(_monitor_retention_loop(retention_stop))
+                      if retention_stop is not None else None)
     try:
         yield
     finally:
-        queue.stop()
-        application.state.batch_queue = None
-        await run_in_threadpool(_record_activity, {"kind": "lifecycle", "action": "server_stopped"})
+        try:
+            if retention_stop is not None:
+                retention_stop.set()
+                await retention_task
+        finally:
+            orchestration_queue.stop()
+            application.state.orchestration_queue = None
+            queue.stop()
+            application.state.batch_queue = None
+            await run_in_threadpool(_record_activity, {"kind": "lifecycle", "action": "server_stopped"})
+
+
+@asynccontextmanager
+async def app_lifespan(application: FastAPI):
+    # The lease must be held before recovery marks interrupted work failed.
+    # A second uvicorn worker (or old process still solving) cannot touch the
+    # same case store while this service is alive.
+    automation_dir = Path(os.environ.get("WINDCATCHER_AUTOMATION_DIR", str(APP_DIR / ".local-automation")))
+    lease = batch_jobs.ProcessLease(automation_dir / "service.lock")
+    lease.acquire()
+    queues = []
+    started = False
+    try:
+        async with _app_lifespan_impl(application):
+            queues = [application.state.batch_queue, application.state.orchestration_queue]
+            started = True
+            yield
+    finally:
+        if not started:
+            queues = [getattr(application.state, name, None)
+                      for name in ("batch_queue", "orchestration_queue")]
+            for queue in queues:
+                if queue is not None:
+                    queue.stop()
+        if all(queue is None or not queue.health()["worker_alive"] for queue in queues):
+            lease.release()
+        else:
+            _MONITOR_LOGGER.error("Service lease retained: worker still running after shutdown timeout")
 
 
 app = FastAPI(title="风见 · 鼻腔气流工作台", docs_url=None, redoc_url=None, lifespan=app_lifespan)
@@ -100,39 +199,49 @@ app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 @app.middleware("http")
 async def local_only_headers(request, call_next):
     mutation_case = None
+    postprocess_mutation_reserved = False
     scenario_mutation_case = None
     batch_reservation = ExitStack()
     # Only a real case id participates in the per-case mutation lock;
     # collection routes such as /api/cases/upload must not share a fake id.
     match = re.fullmatch(r"/api/cases/(case-\d{8}-\d{6}-[0-9a-f]{4})(/.*)?", request.url.path)
     suffix = match.group(2) or "" if match else ""
+    orchestration_advance = suffix == "/orchestration/advance"
+    if match and deletion_pending(match.group(1)) and not (request.method == "DELETE" and not suffix):
+        return JSONResponse(status_code=404, content={"detail": {"reason": "病例正在删除，仅可重试删除"}})
     if match and request.method in {"POST", "PUT", "DELETE"} and suffix not in {
-        "/cfd-postprocess", "/cfd-postprocess/cancel", "/segment/endplanes/preview",
+        "/cfd-postprocess", "/cfd-postprocess/cancel", "/segment/endplanes/preview", "/segment/endplanes/section",
+        "/segment/endplanes/section-targets", "/segment/endplanes/suggest-single-port",
     }:
         mutation_case = match.group(1)
         try:
             queue = getattr(app.state, "batch_queue", None)
             if queue:
                 batch_reservation.enter_context(queue.mutation(mutation_case))
-            cfd_postprocess_jobs.reserve_mutation(mutation_case)
+            # Section preview only reads the source fields. Keep other write
+            # reservations, but let postprocessing read those fields alongside it.
+            if suffix != "/cfd-sections/preview" and not orchestration_advance:
+                cfd_postprocess_jobs.reserve_mutation(mutation_case)
+                postprocess_mutation_reserved = True
         except PipelineError as exc:
             batch_reservation.close()
             return JSONResponse(status_code=409, content=exc.to_dict())
         # The long-running scenario solver owns its own lock.  All other case
         # mutations must wait for it, otherwise a new placement could race the
         # version that the solver is reading.
-        if not re.fullmatch(r"/scenarios/[^/]+/cfd-run", suffix):
+        if not orchestration_advance and not re.fullmatch(r"/scenarios/[^/]+/cfd-run", suffix):
             try:
                 scenario_jobs.reserve_mutation(mutation_case)
                 scenario_mutation_case = mutation_case
             except PipelineError as exc:
-                cfd_postprocess_jobs.release_mutation(mutation_case)
+                if postprocess_mutation_reserved:
+                    cfd_postprocess_jobs.release_mutation(mutation_case)
                 batch_reservation.close()
                 return JSONResponse(status_code=409, content=exc.to_dict())
     try:
         response = await call_next(request)
     finally:
-        if mutation_case:
+        if postprocess_mutation_reserved:
             cfd_postprocess_jobs.release_mutation(mutation_case)
         if scenario_mutation_case:
             scenario_jobs.release_mutation(scenario_mutation_case)
@@ -321,6 +430,20 @@ class StageBody(BaseModel):
     path: str | None = None
     params: dict | None = None
     backend: str | None = None
+    compute_target: Literal["cpu", "gpu"] = "cpu"
+
+
+class AdvanceCaseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    retry: bool = Field(default=False, strict=True)
+
+
+class OrchestrationBatchBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_key: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    case_ids: list[str] = Field(min_length=1, max_length=50)
+    use_harness: bool = Field(default=True, strict=True)
+    retry_failed: bool = Field(default=False, strict=True)
 
 
 class FetchBody(BaseModel):
@@ -360,16 +483,90 @@ class MaskEditBody(BaseModel):
 class EndplanesBody(BaseModel):
     scope: str
     mask_version: int
+    format: str | None = None
     anterior_index: int | None = None
     posterior_index: int | None = None
     anterior_plane: dict | None = None
     posterior_plane: dict | None = None
+    anterior_seed_lps_mm: list[float] | None = Field(default=None, min_length=3, max_length=3)
+    left_inlet_plane: dict | None = None
+    right_inlet_plane: dict | None = None
+    left_inlet_seed_lps_mm: list[float] | None = Field(default=None, min_length=3, max_length=3)
+    right_inlet_seed_lps_mm: list[float] | None = Field(default=None, min_length=3, max_length=3)
+    posterior_seed_lps_mm: list[float] | None = Field(default=None, min_length=3, max_length=3)
+
+
+class EndplaneShiftBody(EndplanesBody):
+    side: Literal["left", "right"]
+
+
+def _bilateral_endplane_args(body: EndplanesBody) -> tuple:
+    fields = (
+        body.left_inlet_plane, body.right_inlet_plane, body.posterior_plane,
+        body.left_inlet_seed_lps_mm, body.right_inlet_seed_lps_mm,
+        body.posterior_seed_lps_mm,
+    )
+    if (any(value is None for value in fields) or body.anterior_plane is not None
+            or body.anterior_seed_lps_mm is not None or body.anterior_index is not None
+            or body.posterior_index is not None):
+        raise PipelineError(
+            "failed", "双鼻孔局部端面需要左右鼻孔及鼻咽的三张切面和三个定位点，不能混用旧版字段",
+            ["分别放置左右鼻孔和鼻咽端面，再重新预检"],
+        )
+    return fields
+
+
+def _has_bilateral_fields(body: EndplanesBody) -> bool:
+    return any(value is not None for value in (
+        body.left_inlet_plane, body.right_inlet_plane,
+        body.left_inlet_seed_lps_mm, body.right_inlet_seed_lps_mm,
+        body.posterior_seed_lps_mm,
+    ))
 
 
 class SingleEndplaneBody(BaseModel):
     scope: str
     mask_version: int
     plane: dict
+    format: str | None = None
+    anterior_seed_lps_mm: list[float] | None = Field(default=None, min_length=3, max_length=3)
+
+
+class EndplaneSectionBody(SingleEndplaneBody):
+    span_mm: float = Field(default=120.0, ge=10, le=400, allow_inf_nan=False)
+
+
+class EndplaneTargetsBody(EndplaneSectionBody):
+    role: Literal["anterior", "posterior"]
+    seeds: list[list[float]] = Field(default_factory=list, max_length=2)
+
+
+class EndplaneLearningProposalBody(BaseModel):
+    """结构化端面候选请求；候选只写独立学习账本，不写病例端面。"""
+
+    model_config = ConfigDict(extra="forbid")
+    scope: Literal["main_airway", "full_candidate"]
+    mask_version: int = Field(ge=0, le=2**31 - 1, strict=True)
+    plan: dict | None = None
+    source: str = Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,99}$")
+    source_version: str = Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,99}$")
+
+
+class EndplaneAutoProposalBody(BaseModel):
+    """Request read-only geometry candidates for the current confirmed mask."""
+
+    model_config = ConfigDict(extra="forbid")
+    scope: Literal["main_airway", "full_candidate"]
+    mask_version: int = Field(ge=0, le=2**31 - 1, strict=True)
+
+
+class EndplaneLearningFeedbackBody(BaseModel):
+    """人工接受、修正或否决候选；反馈不直接保存正式端面。"""
+
+    model_config = ConfigDict(extra="forbid")
+    proposal_id: str = Field(pattern=r"^proposal-[0-9a-f]{32}$")
+    status: Literal["accepted", "adjusted", "rejected"]
+    feedback: dict | None = None
 
 
 class CfdSectionPreviewBody(BaseModel):
@@ -879,7 +1076,6 @@ def _store_uploaded_files(files: list[UploadFile], relative_paths: list[str] | N
                     f"上传文件为空：{relative.as_posix()}",
                     ["确认 DICOM 序列文件可正常读取后重试"],
                 )
-        _collapse_upload_root(staging)
         return staging
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
@@ -1027,7 +1223,7 @@ async def api_capabilities():
     result = capabilities.probe_capabilities()
     # Keep environment detection (installed tools) separate from compute
     # detection (what the local machine can actually run in parallel).
-    result["compute"] = detect_compute_capabilities()
+    result["compute"] = {**detect_compute_capabilities(), "gpu_solver": gpu_solver.probe_gpu_solver()}
     result["ai_interpretation"] = ai_report.get_config()
     return result
 
@@ -1129,20 +1325,88 @@ async def api_upload_case(request: Request, background_tasks: BackgroundTasks):
             "error": True, "status": "failed", "reason": "没有收到 DICOM 文件",
             "remediation": ["点击选择按钮，选择包含同一套 DICOM 序列的文件夹"],
         })
+    return _register_uploaded_case(staging, synthetic, anonymize, background_tasks)
+
+
+def _uploaded_case_result(case_id: str) -> dict:
+    return {
+        "case_id": case_id,
+        "status": "running",
+        "message": "已接收上传病例，正在执行输入质控；页面会持续更新阶段进度",
+    }
+
+
+def _recover_shared_upload(upload_id: str) -> dict | None:
+    """Find a committed chunk upload when the shared gateway has no identity DB."""
+    for receipt in CASES_DIR.glob("case-*/import/chunked-upload.json"):
+        root = receipt.parent.parent
+        if root.is_symlink() or receipt.is_symlink():
+            continue
+        try:
+            if json.loads(receipt.read_text(encoding="utf-8")).get("upload_id") != upload_id:
+                continue
+            if (root / "case.json").is_file() and (root / "import" / "dicom").is_dir():
+                return _uploaded_case_result(root.name)
+        except (OSError, ValueError, AttributeError):
+            continue
+    return None
+
+
+def _resume_interrupted_upload(upload_id: str, result: dict, background_tasks: BackgroundTasks) -> None:
+    """Retry only a task explicitly marked interrupted at server startup."""
+    case_id = result["case_id"]
+    root = case_dir(case_id)
+    receipt = root / "import" / "chunked-upload.json"
+    source = root / "import" / "dicom"
+    with uploads.LOCK:
+        job = get_case(case_id).get("job", {})
+        if job.get("status") != "failed" or job.get("message") != INTERRUPTED_MESSAGE:
+            return
+        if not receipt.is_file() or not source.is_dir():
+            raise HTTPException(409, detail={"reason": "中断的上传缺少原始文件，无法恢复导入"})
+        try:
+            options = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise HTTPException(409, detail={"reason": "上传恢复记录损坏，无法恢复导入"}) from exc
+        if options.get("upload_id") != upload_id or type(options.get("anonymize")) is not bool:
+            raise HTTPException(409, detail={"reason": "上传恢复记录不匹配，无法恢复导入"})
+        update_job(case_id, "running", "import", "正在恢复中断的上传导入任务")
+        background_tasks.add_task(_prepare_case, case_id, source, options["anonymize"])
+
+
+def _register_uploaded_case(staging: Path, synthetic: bool, anonymize: bool, background_tasks: BackgroundTasks,
+                            upload_id: str | None = None):
+    """One registration path for multipart and gateway-sized chunk streams."""
+    _collapse_upload_root(staging)
     case_id = None
+    pending_case_id = CURRENT_UPLOAD_PENDING_CASE_ID.get() if upload_id is not None else None
+    owner_bound = pending_case_id is not None
     try:
-        case_id = create_case("browser_upload", "<浏览器上传的 DICOM 文件夹>", synthetic=synthetic)
+        case_id = pending_case_id or create_case("browser_upload", "<浏览器上传的 DICOM 文件夹>", synthetic=synthetic)
+        if upload_id is not None:
+            receipt = case_dir(case_id) / "import" / "chunked-upload.json"
+            if pending_case_id is not None:
+                if json.loads(receipt.read_text(encoding="utf-8")).get("upload_id") != upload_id:
+                    raise ValueError("pending upload receipt does not match the owned case")
+            else:
+                receipt.write_text(json.dumps({"upload_id": upload_id, "anonymize": anonymize}), encoding="utf-8")
         source = case_dir(case_id) / "import" / "dicom"
         source.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staging), str(source))
-        staging = None
         update_stage(case_id, "import", "running", message="已接收上传文件，等待读取 DICOM")
         update_job(case_id, "running", "import", "已接收上传文件，等待读取 DICOM")
+        # Bind before moving patient bytes. If identity storage fails, the
+        # resumable upload stays in its owner-protected staging directory.
+        bind_owner = CURRENT_CASE_OWNER_BINDER.get()
+        if bind_owner is not None:
+            bind_owner(case_id)
+            owner_bound = True
+        shutil.move(str(staging), str(source))
+        staging = None
         background_tasks.add_task(_prepare_case, case_id, source, anonymize)
     except Exception as exc:
-        if staging:
+        if staging and upload_id is None:
             shutil.rmtree(staging, ignore_errors=True)
-        if case_id:
+        if case_id and not owner_bound:
             shutil.rmtree(case_dir(case_id), ignore_errors=True)
         raise HTTPException(status_code=500, detail={
             "error": True,
@@ -1150,11 +1414,72 @@ async def api_upload_case(request: Request, background_tasks: BackgroundTasks):
             "reason": "服务端登记上传病例失败",
             "remediation": ["检查服务主机磁盘空间后重试"],
         }) from exc
-    return {
-        "case_id": case_id,
-        "status": "running",
-        "message": "已接收上传病例，正在执行输入质控；页面会持续更新阶段进度",
-    }
+    return _uploaded_case_result(case_id)
+
+
+class UploadFileSpec(BaseModel):
+    path: str = Field(min_length=1, max_length=_UPLOAD_MAX_PATH_CHARS)
+    size: int = Field(gt=0, le=_UPLOAD_MAX_FILE_BYTES, strict=True)
+
+
+class UploadStartBody(BaseModel):
+    files: list[UploadFileSpec] = Field(min_length=1, max_length=_UPLOAD_MAX_FILES)
+    synthetic: bool = False
+    anonymize: bool = True
+
+
+async def _upload_operation(function, *args):
+    try:
+        return await run_in_threadpool(function, *args)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=exc.status, detail={"reason": exc.reason}) from exc
+    except OSError as exc:
+        _MONITOR_LOGGER.error("Upload staging storage failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=507, detail={"reason": "上传暂存存储失败，请稍后重试或清理空间"}) from exc
+
+
+@app.post("/api/uploads")
+async def api_start_upload(body: UploadStartBody):
+    files = []
+    seen = set()
+    try:
+        for item in body.files:
+            path = _safe_upload_path(item.path).as_posix()
+            if path.casefold() in seen:
+                raise _UploadRejected("上传文件名重复", ["重新选择一套 DICOM 序列"])
+            seen.add(path.casefold())
+            files.append({"path": path, "size": item.size})
+    except _UploadRejected as exc:
+        raise HTTPException(status_code=exc.status_code, detail={"reason": exc.reason}) from exc
+    if sum(item["size"] for item in files) > _UPLOAD_MAX_TOTAL_BYTES:
+        raise HTTPException(status_code=413, detail={"reason": "本次上传超过 2 GB"})
+    return await _upload_operation(uploads.create, CASES_DIR, files, body.synthetic, body.anonymize)
+
+
+@app.post("/api/uploads/{upload_id}/chunks")
+async def api_upload_chunk(upload_id: str, request: Request, offset: int = Query(ge=0)):
+    data = bytearray()
+    async for chunk in request.stream():
+        data.extend(chunk)
+        if len(data) > uploads.CHUNK_BYTES:
+            raise HTTPException(status_code=413, detail={"reason": "单次上传分块不能超过 4 MiB"})
+    return await _upload_operation(uploads.append, CASES_DIR, upload_id, offset, bytes(data))
+
+
+@app.post("/api/uploads/{upload_id}/complete")
+async def api_complete_upload(upload_id: str, background_tasks: BackgroundTasks):
+    def register(staging, synthetic, anonymize):
+        return _register_uploaded_case(staging, synthetic, anonymize, background_tasks, upload_id)
+    recover = CURRENT_UPLOAD_RECOVERER.get()
+    result = await _upload_operation(uploads.complete, CASES_DIR, upload_id, register,
+                                     recover or (lambda: _recover_shared_upload(upload_id)))
+    await run_in_threadpool(_resume_interrupted_upload, upload_id, result, background_tasks)
+    return result
+
+
+@app.post("/api/uploads/{upload_id}/cancel")
+async def api_cancel_upload(upload_id: str):
+    return await _upload_operation(uploads.cancel, CASES_DIR, upload_id)
 
 
 @app.get("/api/cases")
@@ -1383,11 +1708,21 @@ async def api_download_scenario(
 @app.delete("/api/cases/{case_id}")
 async def api_delete_case(case_id: str):
     try:
+        from pipeline import patient_shares, reference_cases
+        begin_case_deletion(case_id)
+        patient_shares.revoke_case(case_id)
+        reference_cases.revoke_case(case_id)
         delete_case(case_id)
     except PipelineError as exc:
         status_code = 409 if exc.status == "blocked" else 400
         raise HTTPException(status_code=status_code, detail=exc.to_dict()) from exc
     return {"case_id": case_id, "status": "deleted", "message": "病例及其本地产物已删除"}
+
+
+from pipeline.segmentation_learning_routes import create_router as _segmentation_learning_router
+app.include_router(_segmentation_learning_router(lambda case_id: _require_case(case_id)))
+from pipeline.segmentation_model_routes import create_router as _segmentation_model_router
+app.include_router(_segmentation_model_router(lambda case_id: _require_case(case_id)))
 
 
 @app.post("/api/cases/{case_id}/segment")
@@ -1564,6 +1899,201 @@ async def api_get_endplanes(case_id: str, scope: str = "main_airway"):
         raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
 
 
+@app.get("/api/cases/{case_id}/segment/ports/formal")
+async def api_get_formal_ports(case_id: str, scope: str = "main_airway"):
+    """Expose current real CFD caps; browser annotation drafts cannot qualify."""
+    _require_case(case_id)
+    try:
+        return await asyncio.to_thread(formal_ports.get_formal_port_state, case_id, scope)
+    except PipelineError as exc:
+        raise HTTPException(status_code=409 if exc.status == "blocked" else 500,
+                            detail=exc.to_dict()) from exc
+
+
+def _learning_actor_id() -> str | None:
+    """Return the authenticated actor captured by the endplane history context."""
+    return endplane_history.CURRENT_ACTOR_ID.get()
+
+
+async def _require_current_learning_mask(case_id: str, scope: str, mask_version: int) -> dict:
+    """Require the current mask and the same human-confirmed state as the editor."""
+    try:
+        current = await asyncio.to_thread(endplanes.get_endplanes, case_id, scope)
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
+    actual = current.get("mask_version") if isinstance(current, dict) else None
+    if type(actual) is not int or actual != mask_version:
+        raise HTTPException(status_code=409, detail={
+            "status": "stale_mask_version",
+            "reason": "掩膜版本已变化，端面候选不能继续使用",
+            "expected_mask_version": mask_version,
+            "current_mask_version": actual,
+            "remediation": ["刷新病例并基于当前已确认掩膜重新生成候选"],
+        })
+    if current.get("can_save") is not True:
+        raise HTTPException(status_code=409, detail={
+            "status": "unconfirmed_mask",
+            "reason": "当前掩膜尚未清理并人工确认，不能登记候选或记录复核反馈",
+            "remediation": ["先清理体外空气并人工确认当前掩膜，再登记候选或复核"],
+        })
+    return current
+
+
+@app.get("/api/cases/{case_id}/segment/endplanes/learning")
+async def api_get_endplane_learning(case_id: str, scope: str = "main_airway"):
+    """病例查看授权通过后，读取该病例候选供人工复核。"""
+    _require_case(case_id)
+    try:
+        proposals = await asyncio.to_thread(
+            endplane_learning.list_case_proposals, case_id, scope,
+        )
+        for proposal in proposals:
+            proposal["feedback"] = await asyncio.to_thread(
+                endplane_learning.list_case_feedback, case_id, proposal["proposal_id"],
+            )
+        return {"case_id": case_id, "scope": scope, "proposals": proposals}
+    except endplane_learning.LearningError as exc:
+        raise HTTPException(status_code=400, detail={"reason": str(exc)}) from exc
+
+
+@app.post("/api/cases/{case_id}/segment/endplanes/learning/propose")
+async def api_propose_endplane_candidate(case_id: str, body: EndplaneLearningProposalBody):
+    """生成只读端面候选并写入独立账本；绝不保存病例正式端面。"""
+    _require_case(case_id)
+    await _require_current_learning_mask(case_id, body.scope, body.mask_version)
+    try:
+        if body.plan is None:
+            return endplane_candidates.propose_candidate(body.scope, body.mask_version)
+        plan = endplane_candidates.validate_candidate_plan(body.scope, body.mask_version, body.plan)
+        proposal = await asyncio.to_thread(
+            endplane_learning.create_proposal,
+            case_id, body.scope, body.mask_version, plan, body.source,
+            source_version=body.source_version, actor_id=_learning_actor_id(),
+        )
+        return {"status": "available", "proposal_id": proposal["proposal_id"],
+                "proposal": proposal, "human_review_required": True, "committed": False}
+    except endplane_candidates.CandidateInputError as exc:
+        raise HTTPException(status_code=422, detail={"reason": str(exc)}) from exc
+    except endplane_learning.LearningError as exc:
+        raise HTTPException(status_code=422, detail={"reason": str(exc)}) from exc
+
+
+@app.post("/api/cases/{case_id}/segment/endplanes/learning/auto-propose")
+async def api_auto_propose_endplane_candidate(case_id: str, body: EndplaneAutoProposalBody):
+    """Run the local geometry provider and register proposals, never saved endplanes."""
+    _require_case(case_id)
+    await _require_current_learning_mask(case_id, body.scope, body.mask_version)
+    result = await asyncio.to_thread(
+        endplane_auto_candidate.generate_auto_candidates, case_id, body.scope, body.mask_version,
+    )
+    if (not isinstance(result, dict) or result.get("scope") != body.scope
+            or result.get("mask_version") != body.mask_version):
+        raise HTTPException(status_code=502, detail={"reason": "本机候选器返回了错误的病例范围或掩膜版本"})
+    if result.get("status") == "unavailable":
+        if result.get("candidates") != [] or not isinstance(result.get("reason"), str):
+            raise HTTPException(status_code=502, detail={"reason": "本机候选器不可用响应无效"})
+        return {"status": "unavailable", "reason": result["reason"],
+                "scope": body.scope, "mask_version": body.mask_version,
+                "proposal_id": None, "human_review_required": True, "committed": False}
+    candidates = result.get("candidates")
+    version = result.get("generator_version")
+    if (result.get("status") != "available" or not isinstance(candidates, list)
+            or not 1 <= len(candidates) <= 2 or version != endplane_auto_candidate.GENERATOR_VERSION):
+        raise HTTPException(status_code=502, detail={"reason": "本机候选器返回格式无效"})
+    try:
+        labels = set()
+        validated = []
+        for candidate in candidates:
+            label = candidate.get("label") if isinstance(candidate, dict) else None
+            if label not in {"left", "right", "single"} or label in labels:
+                raise endplane_candidates.CandidateInputError("invalid or duplicate local candidate label")
+            labels.add(label)
+            validated.append((label, endplane_candidates.validate_candidate_plan(
+                body.scope, body.mask_version, candidate.get("plan"))))
+        # The source mask may have changed during the geometry calculation.
+        await _require_current_learning_mask(case_id, body.scope, body.mask_version)
+        proposals = await asyncio.to_thread(
+            endplane_learning.create_proposals, case_id, body.scope, body.mask_version,
+            [(f"local_mask_geometry_{label}", plan) for label, plan in validated],
+            source_version=version, actor_id=_learning_actor_id(),
+        )
+        return {"status": "available", "proposal_id": proposals[0]["proposal_id"],
+                "proposal": proposals[0], "proposals": proposals,
+                "human_review_required": True, "committed": False}
+    except (endplane_candidates.CandidateInputError, endplane_learning.LearningError) as exc:
+        raise HTTPException(status_code=502, detail={"reason": "本机候选器未能产生有效候选"}) from exc
+
+
+@app.post("/api/cases/{case_id}/segment/endplanes/learning/auto-propose-bilateral")
+async def api_auto_propose_bilateral_endplanes(case_id: str, body: EndplaneAutoProposalBody):
+    """Record one preflighted three-opening draft, never save formal geometry."""
+    _require_case(case_id)
+    await _require_current_learning_mask(case_id, body.scope, body.mask_version)
+    result = await asyncio.to_thread(
+        endplane_auto_candidate.generate_bilateral_candidate,
+        case_id, body.scope, body.mask_version,
+    )
+    if (not isinstance(result, dict) or result.get("scope") != body.scope
+            or result.get("mask_version") != body.mask_version):
+        raise HTTPException(status_code=502, detail={"reason": "三端候选器返回了错误的病例范围或掩膜版本"})
+    if result.get("status") == "unavailable":
+        if result.get("candidates") != [] or not isinstance(result.get("reason"), str):
+            raise HTTPException(status_code=502, detail={"reason": "三端候选器不可用响应无效"})
+        return {"status": "unavailable", "reason": result["reason"],
+                "scope": body.scope, "mask_version": body.mask_version,
+                "proposal_id": None, "human_review_required": True, "committed": False}
+    candidates = result.get("candidates")
+    if (result.get("status") != "available"
+            or result.get("generator_version") != endplane_auto_candidate.BILATERAL_GENERATOR_VERSION
+            or not isinstance(candidates, list) or len(candidates) != 1
+            or not isinstance(candidates[0], dict) or candidates[0].get("label") != "bilateral"):
+        raise HTTPException(status_code=502, detail={"reason": "三端候选器返回格式无效"})
+    try:
+        plan = endplane_candidates.validate_candidate_plan(
+            body.scope, body.mask_version, candidates[0].get("plan"),
+        )
+        if plan.get("format") != endplanes.BILATERAL_LOCAL_FORMAT:
+            raise endplane_candidates.CandidateInputError("three-opening proposal must be bilateral")
+        # A long exact mesh preflight cannot authorize a stale proposal.
+        await _require_current_learning_mask(case_id, body.scope, body.mask_version)
+        proposal = await asyncio.to_thread(
+            endplane_learning.create_proposal,
+            case_id, body.scope, body.mask_version, plan, "bilateral_mask_geometry",
+            source_version=endplane_auto_candidate.BILATERAL_GENERATOR_VERSION,
+            actor_id=_learning_actor_id(),
+        )
+        return {"status": "available", "proposal_id": proposal["proposal_id"],
+                "proposal": proposal, "human_review_required": True, "committed": False}
+    except (endplane_candidates.CandidateInputError, endplane_learning.LearningError) as exc:
+        raise HTTPException(status_code=502, detail={"reason": "三端候选器未能产生有效候选"}) from exc
+
+
+@app.post("/api/cases/{case_id}/segment/endplanes/learning/feedback")
+async def api_record_endplane_feedback(case_id: str, body: EndplaneLearningFeedbackBody):
+    """记录人工反馈；接受或修正也不会修改病例正式端面文件。"""
+    _require_case(case_id)
+    actor_id = _learning_actor_id()
+    proposal = await asyncio.to_thread(
+        endplane_learning.get_case_proposal, case_id, body.proposal_id,
+    )
+    if proposal is None or proposal.get("case_id") != case_id:
+        raise HTTPException(status_code=404, detail={"reason": "端面候选不存在或不属于当前病例"})
+    await _require_current_learning_mask(case_id, proposal["scope"], proposal["mask_version"])
+    if proposal["status"] != "proposed":
+        raise HTTPException(status_code=409, detail={"reason": "此候选已记录终态反馈，请刷新查看"})
+    try:
+        if body.status == "adjusted" and isinstance(body.feedback, dict) and "adjusted_plan" in body.feedback:
+            endplane_candidates.validate_candidate_plan(proposal["scope"], proposal["mask_version"],
+                                                       body.feedback["adjusted_plan"])
+        return await asyncio.to_thread(
+            endplane_learning.record_case_feedback,
+            case_id, body.proposal_id, body.status, reviewer_id=actor_id or "local-operator",
+            feedback=body.feedback,
+        )
+    except (endplane_learning.LearningError, endplane_candidates.CandidateInputError) as exc:
+        raise HTTPException(status_code=422, detail={"reason": str(exc)}) from exc
+
+
 @app.get("/api/cases/{case_id}/segment/selection-model")
 async def api_selection_model(case_id: str, scope: str = "main_airway", mask_version: int | None = None):
     """当前已确认掩膜的只读 3D 选端预览；与正式 STL/CFD 产物隔离。"""
@@ -1580,11 +2110,81 @@ async def api_selection_model(case_id: str, scope: str = "main_airway", mask_ver
         raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
 
 
+@app.post("/api/cases/{case_id}/segment/endplanes/section")
+async def api_endplane_section(case_id: str, body: EndplaneSectionBody):
+    """Authenticated, read-only oblique CT image for the current draft plane."""
+    _require_case(case_id)
+    try:
+        image = await asyncio.to_thread(
+            endplanes.render_endplane_section, case_id, body.scope, body.plane, body.mask_version, body.span_mm,
+        )
+        output = BytesIO()
+        image.save(output, format="PNG")
+        return Response(content=output.getvalue(), media_type="image/png", headers={
+            "Cache-Control": "no-store", "X-Mask-Version": str(body.mask_version), "X-Model-Scope": body.scope,
+        })
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
+
+
+@app.post("/api/cases/{case_id}/segment/endplanes/section-targets")
+async def api_endplane_targets(case_id: str, body: EndplaneTargetsBody):
+    _require_case(case_id)
+    try:
+        result = await asyncio.to_thread(
+            endplanes.inspect_endplane_targets, case_id, body.scope, body.plane,
+            body.mask_version, body.span_mm, body.role, body.seeds,
+        )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
+
+
+@app.post("/api/cases/{case_id}/segment/endplanes/suggest-single-port")
+async def api_suggest_single_port(case_id: str, body: EndplaneShiftBody):
+    """Read-only outward shift suggestion; does not save or certify a port."""
+    _require_case(case_id)
+    try:
+        if body.format != endplanes.BILATERAL_LOCAL_FORMAT:
+            raise PipelineError("failed", "端面微调仅支持双侧局部方案", ["切换为双侧局部端面后重试"])
+        result = await asyncio.to_thread(
+            endplanes.suggest_bilateral_local_inlet_shift, case_id, body.scope,
+            *_bilateral_endplane_args(body), body.mask_version, body.side,
+        )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
+
+
 @app.post("/api/cases/{case_id}/segment/endplanes/preview")
 async def api_preview_oblique_endplanes(case_id: str, body: EndplanesBody):
     """只预检可旋转切面的技术可用性；不保存方案或修改阶段。"""
     _require_case(case_id)
     try:
+        if body.format == endplanes.BILATERAL_LOCAL_FORMAT:
+            return await asyncio.to_thread(
+                endplanes.preview_bilateral_local_endplanes,
+                case_id, body.scope, *_bilateral_endplane_args(body), body.mask_version,
+            )
+        if _has_bilateral_fields(body):
+            raise PipelineError("failed", "双鼻孔定位点必须使用双侧局部端面格式", ["选择双侧局部裁切后重新预检"])
+        if body.format == endplanes.LOCAL_INLET_FORMAT:
+            if (body.anterior_seed_lps_mm is None or body.anterior_plane is None
+                    or body.posterior_plane is None or body.anterior_index is not None
+                    or body.posterior_index is not None):
+                raise PipelineError(
+                    "failed", "局部入口预检需要鼻孔种子和两张完整切面，不能混用 CT 层号",
+                    ["在鼻孔支段选点，分别设置两端，然后重新预检"],
+                )
+            return await asyncio.to_thread(
+                endplanes.preview_local_inlet_endplanes, case_id, body.scope,
+                body.anterior_plane, body.posterior_plane, body.anterior_seed_lps_mm, body.mask_version,
+            )
+        if body.format not in (None, "oblique_planes_v1") or body.anterior_seed_lps_mm is not None:
+            raise PipelineError(
+                "failed", "局部入口种子必须搭配明确的 oblique_local_inlet_v2 格式",
+                ["选择局部入口模式，或移除种子后使用旧版切面预检"],
+            )
         if body.anterior_plane is None or body.posterior_plane is None or body.anterior_index is not None or body.posterior_index is not None:
             raise PipelineError(
                 "failed", "3D 切面预检需要鼻孔端与鼻咽端的点和法向",
@@ -1598,11 +2198,68 @@ async def api_preview_oblique_endplanes(case_id: str, body: EndplanesBody):
         raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
 
 
+@app.post("/api/cases/{case_id}/segment/endplanes/preview-model")
+async def api_preview_local_inlet_model(case_id: str, body: EndplanesBody):
+    """Read-only binary STL of the exact draft local inlet clip."""
+    _require_case(case_id)
+    try:
+        if body.format == endplanes.BILATERAL_LOCAL_FORMAT:
+            data = await asyncio.to_thread(
+                endplanes.render_bilateral_local_preview_model,
+                case_id, body.scope, *_bilateral_endplane_args(body), body.mask_version,
+            )
+            return Response(content=data, media_type="model/stl", headers={
+                "Cache-Control": "no-store", "X-Mask-Version": str(body.mask_version),
+                "X-Model-Scope": body.scope,
+            })
+        if (body.format != endplanes.LOCAL_INLET_FORMAT or body.anterior_seed_lps_mm is None
+                or body.anterior_plane is None or body.posterior_plane is None
+                or body.anterior_index is not None or body.posterior_index is not None):
+            raise PipelineError(
+                "failed", "局部网格预览需要鼻孔种子和两张完整切面，不能混用 CT 层号",
+                ["在鼻孔支段选点，分别设置两端，再预览真实裁切网格"],
+            )
+        data = await asyncio.to_thread(
+            endplanes.render_local_inlet_preview_model, case_id, body.scope,
+            body.anterior_plane, body.posterior_plane, body.anterior_seed_lps_mm, body.mask_version,
+        )
+        return Response(content=data, media_type="model/stl", headers={
+            "Cache-Control": "no-store", "X-Mask-Version": str(body.mask_version),
+            "X-Model-Scope": body.scope,
+        })
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
+
+
 @app.post("/api/cases/{case_id}/segment/endplanes")
 async def api_save_endplanes(case_id: str, body: EndplanesBody):
     """保存 CT 层面或 3D 可旋转切面；旧下游产物随之失效。"""
     _require_case(case_id)
     try:
+        if body.format == endplanes.BILATERAL_LOCAL_FORMAT:
+            return await asyncio.to_thread(
+                endplanes.save_bilateral_local_endplanes,
+                case_id, body.scope, *_bilateral_endplane_args(body), body.mask_version,
+            )
+        if _has_bilateral_fields(body):
+            raise PipelineError("failed", "双鼻孔定位点必须使用双侧局部端面格式", ["选择双侧局部裁切后重新保存"])
+        if body.format == endplanes.LOCAL_INLET_FORMAT:
+            if (body.anterior_seed_lps_mm is None or body.anterior_plane is None
+                    or body.posterior_plane is None or body.anterior_index is not None
+                    or body.posterior_index is not None):
+                raise PipelineError(
+                    "failed", "局部入口保存需要鼻孔种子和两张完整切面，不能混用 CT 层号",
+                    ["在鼻孔支段选点，完成双端预检后原子保存"],
+                )
+            return await asyncio.to_thread(
+                endplanes.save_local_inlet_endplanes, case_id, body.scope,
+                body.anterior_plane, body.posterior_plane, body.anterior_seed_lps_mm, body.mask_version,
+            )
+        if body.format not in (None, "oblique_planes_v1") or body.anterior_seed_lps_mm is not None:
+            raise PipelineError(
+                "failed", "局部入口种子必须搭配明确的 oblique_local_inlet_v2 格式",
+                ["选择局部入口模式，或移除种子后使用旧版端面方案"],
+            )
         has_planes = body.anterior_plane is not None or body.posterior_plane is not None
         has_indices = body.anterior_index is not None or body.posterior_index is not None
         if has_planes and not has_indices and body.anterior_plane is not None and body.posterior_plane is not None:
@@ -1610,7 +2267,7 @@ async def api_save_endplanes(case_id: str, body: EndplanesBody):
                 endplanes.save_oblique_endplanes,
                 case_id, body.scope, body.anterior_plane, body.posterior_plane, body.mask_version,
             )
-        if has_indices and not has_planes and body.anterior_index is not None and body.posterior_index is not None:
+        if body.format is None and has_indices and not has_planes and body.anterior_index is not None and body.posterior_index is not None:
             return await asyncio.to_thread(
                 endplanes.save_endplanes,
                 case_id, body.scope, body.anterior_index, body.posterior_index, body.mask_version,
@@ -1628,11 +2285,116 @@ async def api_save_single_endplane(case_id: str, side: str, body: SingleEndplane
     """保存一侧端面；联合完整性在另一个端面保存后核验。"""
     _require_case(case_id)
     try:
+        if body.format not in (None, "oblique_planes_v1") or body.anterior_seed_lps_mm is not None:
+            raise PipelineError(
+                "failed", "局部鼻孔入口需要双端原子保存，单端接口不接受种子",
+                ["完成两端局部预检后调用双端保存接口"],
+            )
         return await asyncio.to_thread(
             endplanes.save_single_endplane, case_id, body.scope, side, body.plane, body.mask_version,
         )
     except PipelineError as exc:
         raise HTTPException(status_code=400, detail=exc.to_dict()) from exc
+
+
+@app.post("/api/cases/{case_id}/orchestration/advance")
+async def api_advance_case(case_id: str, body: AdvanceCaseBody, request: Request):
+    """Advance one authorized case only through surface/QC and CFD preparation."""
+    _require_case(case_id)
+    if os.environ.get("WINDCATCHER_MULTIUSER") == "1":
+        principal = getattr(request.state, "principal", None)
+        if not isinstance(principal, dict) or principal.get("kind") != "human":
+            raise HTTPException(403, detail={"reason": "逐例执行需要已授权的操作者账号"})
+    result = await asyncio.to_thread(orchestration.advance_case, case_id, retry=body.retry)
+    if result["status"] != "prepared":
+        raise HTTPException(409 if result["status"] == "blocked" else 500, detail=result)
+    return result
+
+
+def _orchestration_queue():
+    queue = getattr(app.state, "orchestration_queue", None)
+    if queue is None or not queue.health()["worker_alive"]:
+        raise HTTPException(503, detail={"reason": "逐例编排队列未运行，请检查服务日志"})
+    return queue
+
+
+def _orchestration_actor(request: Request) -> str:
+    principal = getattr(request.state, "principal", None)
+    if os.environ.get("WINDCATCHER_MULTIUSER") == "1":
+        if not isinstance(principal, dict) or principal.get("kind") != "human":
+            raise HTTPException(403, detail={"reason": "逐例编排需要已登录操作者"})
+        return principal["id"]
+    return "local-operator"
+
+
+def _orchestration_result(batch: dict) -> dict:
+    """Remove internal actor IDs from the response and UI payload."""
+    items = []
+    for item in batch["items"]:
+        result = item.get("result")
+        if isinstance(result, dict):
+            result = {"actions": [], "llm_usage": {"status": "unknown",
+                      "total_tokens": None, "cost_usd": None},
+                      "next_action": "review_preflight", **result}
+        items.append({**item, "input": {
+            "case_id": item["input"]["case_id"],
+            "use_harness": item["input"]["use_harness"],
+            "retry_failed": item["input"].get("retry_failed", False),
+        }, "result": result})
+    return {**batch, "items": items, "poll_after_seconds": 3 if batch["status"] != "completed" else None}
+
+
+def _orchestration_batch_for_actor(batch_id: str, request: Request) -> dict:
+    actor_id = _orchestration_actor(request)
+    try:
+        batch = _orchestration_queue().get(batch_id)
+    except PipelineError as exc:
+        raise HTTPException(404, detail={"reason": "批次不存在或无权访问"}) from exc
+    checker = getattr(app.state, "orchestration_authorize", None)
+    if not batch["items"] or any(
+        item["input"].get("actor_id") != actor_id
+        or (os.environ.get("WINDCATCHER_MULTIUSER") == "1"
+            and (not callable(checker) or not checker(actor_id, item["input"]["case_id"])))
+        for item in batch["items"]
+    ):
+        raise HTTPException(404, detail={"reason": "批次不存在或无权访问"})
+    return batch
+
+
+@app.post("/api/orchestration/batches", status_code=202)
+async def api_orchestration_submit(body: OrchestrationBatchBody, request: Request):
+    """Queue explicitly named cases in request order; never import or guess CT."""
+    actor_id = _orchestration_actor(request)
+    if len(set(body.case_ids)) != len(body.case_ids) or any(
+        orchestration_batch.CASE_ID.fullmatch(case_id) is None for case_id in body.case_ids
+    ):
+        raise HTTPException(422, detail={"reason": "病例清单无效或包含重复编号"})
+    checker = getattr(app.state, "orchestration_authorize", None)
+    if os.environ.get("WINDCATCHER_MULTIUSER") == "1" and (
+        not callable(checker) or any(not checker(actor_id, case_id) for case_id in body.case_ids)
+    ):
+        raise HTTPException(404, detail={"reason": "病例不存在或无权编辑"})
+    items = [{"case_id": case_id, "actor_id": actor_id,
+              "use_harness": body.use_harness, "retry_failed": body.retry_failed}
+             for case_id in body.case_ids]
+    try:
+        batch = await asyncio.to_thread(_orchestration_queue().submit,
+                                        f"{actor_id}:{body.request_key}", items)
+    except PipelineError as exc:
+        raise HTTPException(409, detail=exc.to_dict()) from exc
+    return _orchestration_result(batch)
+
+
+@app.get("/api/orchestration/batches/{batch_id}")
+async def api_orchestration_batch(batch_id: str, request: Request):
+    return _orchestration_result(await asyncio.to_thread(
+        _orchestration_batch_for_actor, batch_id, request))
+
+
+@app.post("/api/orchestration/batches/{batch_id}/cancel")
+async def api_orchestration_cancel(batch_id: str, request: Request):
+    _orchestration_batch_for_actor(batch_id, request)
+    return _orchestration_result(await asyncio.to_thread(_orchestration_queue().cancel, batch_id))
 
 
 @app.post("/api/cases/{case_id}/surface")
@@ -1677,7 +2439,8 @@ async def api_cfd_run(case_id: str, body: StageBody):
         raise HTTPException(status_code=409, detail={"status": "blocked", "reason": "该病例已有气流求解在运行，请查看当前进度"})
     update_stage(case_id, "cfd_run", "running", message="正在准备气流求解，请保持页面打开查看进度")
     try:
-        result = await asyncio.to_thread(openfoam_runner.run_case, case_id, backend=body.backend)
+        result = await asyncio.to_thread(openfoam_runner.run_case, case_id, backend=body.backend,
+                                         compute_target=body.compute_target)
         result["gate"] = await asyncio.to_thread(openfoam_runner.check_result_gate, case_id)
         return result
     except PipelineError as exc:

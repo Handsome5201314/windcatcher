@@ -155,6 +155,15 @@ def test_batch_boundary_and_invalid_events_are_rejected_before_writing():
     assert accepted.json()["accepted"] == monitor.get_status()["total_events"] == 50
 
 
+def test_batch_is_atomic_when_database_cannot_write(monkeypatch):
+    def broken(events):
+        raise sqlite3.OperationalError("private-path")
+
+    monkeypatch.setattr(monitor, "record_events", broken)
+    assert _request("POST", "/api/monitor/events", json={"events": [_ui_event()]}).status_code == 503
+    assert monitor.get_status()["total_events"] == 0
+
+
 @pytest.mark.parametrize("path,method", [("/api/monitor/status", "GET"), ("/api/monitor/events", "GET"), ("/api/monitor/events", "POST")])
 def test_external_origin_is_rejected_for_every_monitor_endpoint(path, method):
     kwargs = {"json": {"events": [_ui_event()]}} if method == "POST" else {}

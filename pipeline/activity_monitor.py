@@ -7,6 +7,8 @@ import math
 import os
 import re
 import sqlite3
+import time
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -15,11 +17,24 @@ from pathlib import Path
 from .config import APP_DIR, STAGES
 
 DIRECTORY_ENV = "WINDCATCHER_MONITOR_DIR"
-RETENTION_DAYS = 14
-MAX_EVENTS = 50_000
+# Legacy/local history keeps its established behavior. Personal-account mode
+# expires operation metadata after a bounded window.
+RETENTION_DAYS = None
+MULTIUSER_RETENTION_DAYS = 180
+MAX_EVENTS = None
+SCHEMA_VERSION = 1
+APP_VERSION = "2026.11.01.activity1"
+RETENTION_LAST_ERROR: str | None = None
 _DATABASE_NAME = "activity.sqlite3"
 _KINDS = {"lifecycle", "ui", "navigation", "viewer", "request", "error", "stage"}
-_ROUTES = {"work", "cases", "env", "method", "sample", "results"}
+_ROUTES = {"work", "cases", "env", "method", "sample", "results", "activity", "share", "cfd-review"}
+_BROWSER_ACTIONS = {
+    "session_started", "queue_dropped", "click", "submit", "change", "input",
+    "pointer", "wheel", "route", "page_opened", "feedback", "api_outcome",
+    "response", "network_error", "javascript", "unhandled_rejection",
+    "action_started", "action_finished", "action_failed", "mask_edit",
+    "plane_selected", "plane_adjusted", "ct_view_changed",
+}
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_:.-]{0,99}\Z", re.ASCII)
 _CASE_ID = re.compile(r"(?:case-\d{8}-\d{6}-[0-9a-f]{4}|synthetic(?:-[A-Za-z0-9_-]{1,64})?)\Z", re.ASCII)
 _ENUM_DETAILS = {
@@ -55,35 +70,82 @@ def _database_path() -> Path:
     return (Path(directory) if directory else APP_DIR / ".local-monitor") / _DATABASE_NAME
 
 
+def _ensure_wal(connection: sqlite3.Connection) -> None:
+    """Another fresh connection can hold the lock needed to enter WAL mode."""
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if mode.lower() == "wal":
+                return
+            mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if mode.lower() == "wal":
+                return
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            if code is None or code & 0xff not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                raise
+        if time.monotonic() >= deadline:
+            raise sqlite3.OperationalError("activity database could not enter WAL mode")
+        time.sleep(0.025)
+
+
 @contextmanager
 def _connect():
     path = _database_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=0.5)
+    connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
     try:
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=500")
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                action TEXT NOT NULL,
-                route TEXT,
-                case_id TEXT,
-                session_id TEXT,
-                request_id TEXT,
-                target TEXT,
-                details TEXT NOT NULL,
-                is_error INTEGER NOT NULL
-            )
-        """)
-        connection.execute("CREATE INDEX IF NOT EXISTS events_timestamp ON events(timestamp)")
-        connection.execute("CREATE INDEX IF NOT EXISTS events_case_id ON events(case_id, id)")
+        # Setting WAL on every request can race with another connection's
+        # first write or migration. Wait before acquiring locks, and only
+        # change journal mode if this database has not entered WAL yet.
+        connection.execute("PRAGMA busy_timeout=10000")
+        _ensure_wal(connection)
+        if _retention_days() is not None:
+            # Overwrite deleted SQLite cells where possible; WAL and older backups
+            # still require separate lifecycle controls.
+            connection.execute("PRAGMA secure_delete=ON")
+        # Serialize the one-time migration, including when processes start together.
+        if connection.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+                _migrate(connection)
+            connection.commit()
         yield connection
     finally:
         connection.close()
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            action TEXT NOT NULL,
+            route TEXT,
+            case_id TEXT,
+            session_id TEXT,
+            request_id TEXT,
+            target TEXT,
+            details TEXT NOT NULL,
+            is_error INTEGER NOT NULL
+        )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS events_timestamp ON events(timestamp)")
+    connection.execute("CREATE INDEX IF NOT EXISTS events_case_id ON events(case_id, id)")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+    for name, definition in {
+        "event_id": "TEXT",
+        "schema_version": "INTEGER NOT NULL DEFAULT 0",
+        "app_version": "TEXT NOT NULL DEFAULT 'legacy'",
+    }.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE events ADD COLUMN {name} {definition}")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_event_id ON events(event_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS events_session ON events(session_id, id)")
+    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 def _identifier(value) -> str | None:
@@ -136,17 +198,49 @@ def _details(value) -> dict:
     return result
 
 
+def _retention_days() -> int | None:
+    return MULTIUSER_RETENTION_DAYS if os.environ.get("WINDCATCHER_MULTIUSER") == "1" else RETENTION_DAYS
+
+
 def _prune(connection: sqlite3.Connection, now: datetime) -> None:
-    connection.execute("DELETE FROM events WHERE timestamp < ?", (_timestamp(now - timedelta(days=RETENTION_DAYS)),))
-    connection.execute("""
+    retention_days = _retention_days()
+    if retention_days is not None:
+        connection.execute("DELETE FROM events WHERE timestamp < ?", (_timestamp(now - timedelta(days=retention_days)),))
+    if MAX_EVENTS is not None:
+        connection.execute("""
         DELETE FROM events WHERE id <= (
             SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?
         )
-    """, (MAX_EVENTS,))
+        """, (MAX_EVENTS,))
 
 
-def record_event(event: dict) -> int:
-    """保存一个操作事件并返回本机递增编号；存储异常交由调用方处理。"""
+def prune_expired_events() -> int:
+    """Remove expired personal metadata and truncate committed WAL frames.
+
+    This is safe to run while the service is idle. Historical backup files are
+    managed separately and are never modified by this operation.
+    """
+    global RETENTION_LAST_ERROR
+    if _retention_days() is None:
+        return 0
+    try:
+        with _connect() as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                previous_changes = connection.total_changes
+                _prune(connection, _now())
+                removed = connection.total_changes - previous_changes
+            checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint is None or checkpoint[0]:
+                raise sqlite3.OperationalError("activity retention WAL checkpoint is busy")
+    except Exception as exc:
+        RETENTION_LAST_ERROR = type(exc).__name__
+        raise
+    RETENTION_LAST_ERROR = None
+    return removed
+
+
+def _prepare_event(event: dict) -> tuple:
     if not isinstance(event, dict):
         raise ValueError("活动事件必须是对象")
     kind = event.get("kind")
@@ -166,20 +260,51 @@ def record_event(event: dict) -> int:
     session_id = _identifier(event.get("session_id", context.get("session_id")))
     request_id = _identifier(event.get("request_id", context.get("request_id")))
     is_error = kind == "error" or details.get("outcome") in {"failed", "error", "blocked", "network_error"} or details.get("status") in {"failed", "error", "blocked"} or details.get("status_code", 0) >= 400
-    now = _now()
+    event_id = event.get("event_id")
+    if event_id is not None:
+        try:
+            event_id = str(uuid.UUID(event_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("活动事件去重编号无效") from exc
+    return (
+        _timestamp(_now()), kind, action, route, case_id, session_id, request_id,
+        _identifier(event.get("target")), json.dumps(details, ensure_ascii=True, allow_nan=False),
+        int(is_error), event_id, SCHEMA_VERSION, APP_VERSION,
+    )
+
+
+def record_event(event: dict) -> int:
+    """保存事件；同一 UUID 重送返回原编号，不覆盖首次收到的内容。"""
+    return record_events([event])[0]
+
+
+def record_events(events: list[dict]) -> list[int]:
+    """整批验证、原子提交，防止部分写入后重试造成数据重复。"""
+    prepared = [_prepare_event(event) for event in events]
+    ids = []
     with _connect() as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
-        cursor = connection.execute("""
-            INSERT INTO events (timestamp, kind, action, route, case_id, session_id, request_id, target, details, is_error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            _timestamp(now), kind, action, route, case_id,
-            session_id, request_id,
-            _identifier(event.get("target")), json.dumps(details, ensure_ascii=True, allow_nan=False), int(is_error),
-        ))
-        event_id = int(cursor.lastrowid)
-        _prune(connection, now)
-    return event_id
+        for values in prepared:
+            cursor = connection.execute("""
+                INSERT INTO events (timestamp, kind, action, route, case_id, session_id,
+                    request_id, target, details, is_error, event_id, schema_version, app_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO NOTHING
+            """, values)
+            row_id = cursor.lastrowid if cursor.rowcount else connection.execute(
+                "SELECT id FROM events WHERE event_id = ?", (values[10],)).fetchone()[0]
+            ids.append(int(row_id))
+        _prune(connection, _now())
+    return ids
+
+
+def validate_browser_events(events: list[dict]) -> list[dict]:
+    """浏览器只能提交固定操作枚举；上下文与 details 仍按白名单重建。"""
+    for event in events:
+        if event.get("kind") not in _KINDS or event.get("action") not in _BROWSER_ACTIONS:
+            raise ValueError("操作事件格式无效")
+        _prepare_event(event)
+    return events
 
 
 def query_events(
@@ -239,15 +364,84 @@ def query_events(
     }
 
 
+def query_recipe_signals(owner_id: str) -> list[dict]:
+    """Read only recent successful stage hints bound to a personal account.
+
+    The public gateway binds browser event session_id to the authenticated
+    principal before ingestion. This query is available only in personal mode.
+    """
+    if _retention_days() != MULTIUSER_RETENTION_DAYS:
+        raise ValueError("personal operation history is not enabled")
+    if not isinstance(owner_id, str) or not re.fullmatch(r"[0-9a-f]{32}", owner_id, re.ASCII):
+        raise ValueError("invalid operation history owner")
+    with _connect() as connection, connection:
+        now = _now()
+        _prune(connection, now)
+        rows = connection.execute("""
+            SELECT id,timestamp,kind,action,case_id,session_id,details
+            FROM events
+            WHERE session_id=? AND kind='stage' AND action='action_finished'
+              AND case_id IS NOT NULL AND is_error=0
+              AND timestamp >= ? AND timestamp <= ?
+            ORDER BY id DESC LIMIT 2000
+        """, (owner_id, _timestamp(now - timedelta(days=MULTIUSER_RETENTION_DAYS)),
+              _timestamp(now))).fetchall()
+    signals = []
+    for row in reversed(rows):
+        try:
+            details = json.loads(row["details"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("stored operation metadata is invalid") from exc
+        if not isinstance(details, dict):
+            raise RuntimeError("stored operation metadata is invalid")
+        signals.append({**dict(row), "details": details})
+    return signals
+
+
 def get_status() -> dict:
     with _connect() as connection, connection:
         _prune(connection, _now())
         total = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         latest = connection.execute("SELECT id, timestamp FROM events ORDER BY id DESC LIMIT 1").fetchone()
-    return {
+    status = {
         "status": "recording", "total_events": total,
         "last_event_at": latest[1] if latest else None,
         "last_event_id": int(latest[0]) if latest else 0,
-        "retention_days": RETENTION_DAYS, "max_events": MAX_EVENTS,
+        "retention_days": _retention_days(), "max_events": MAX_EVENTS,
+        "schema_version": SCHEMA_VERSION, "app_version": APP_VERSION,
         "database_path": ".local-monitor/activity.sqlite3",
     }
+    if RETENTION_LAST_ERROR is not None:
+        status.update(status="unavailable", retention_error_type=RETENTION_LAST_ERROR)
+    return status
+
+
+def backup_database(destination: str | Path) -> Path:
+    """以 SQLite 在线备份 API 创建新快照，包含 WAL 中已提交的数据。"""
+    source_path = _database_path().resolve()
+    destination_path = Path(destination).expanduser().resolve()
+    if source_path == destination_path:
+        raise ValueError("backup destination cannot replace the live database")
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    with _connect() as source:
+        try:
+            with destination_path.open("xb"):
+                pass
+        except FileExistsError:
+            raise FileExistsError("backup destination already exists") from None
+        try:
+            if _retention_days() is not None:
+                # No read may have occurred since these events expired. Exclude
+                # them from this new snapshot and commit before SQLite backup.
+                with source:
+                    source.execute("BEGIN IMMEDIATE")
+                    _prune(source, _now())
+            target = sqlite3.connect(destination_path, timeout=0.5)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        except Exception:
+            destination_path.unlink(missing_ok=True)
+            raise
+    return destination_path

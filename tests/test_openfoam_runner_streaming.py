@@ -9,12 +9,55 @@ from pipeline import cases, openfoam_runner
 from pipeline.config import openfoam_mpi_processes, resolve_parallel_plan
 from pipeline.openfoam_runner import (
     _error_diagnosis,
+    _docker_command_config,
+    _docker_no_fields_option,
+    _reconstruct_mesh_command,
+    configured_image_flavour,
+    _docker_shell_config,
     _mesh_summary,
     _run_streaming,
     _solver_progress,
     _write_status,
     read_latest_status,
 )
+
+
+def test_microfluidica_openfoam_uses_its_profile_wrapper():
+    entrypoint, env_source = _docker_shell_config("microfluidica/openfoam:latest")
+    assert entrypoint == "/openfoam/bash"
+    assert env_source == ""
+
+
+def test_default_openfoam_image_keeps_openfoam11_environment():
+    entrypoint, env_source = _docker_shell_config("openfoam/openfoam11-paraview510:11")
+    assert entrypoint == "bash"
+    assert "/opt/openfoam11/etc/bashrc" in env_source
+
+
+def test_pinned_microfluidica_digest_keeps_vendor_profile_selection():
+    image, entrypoint, env_source = _docker_command_config(
+        "microfluidica/openfoam:latest", "sha256:" + "a" * 64
+    )
+    assert image.startswith("sha256:")
+    assert entrypoint == "/openfoam/bash"
+    assert env_source == ""
+
+
+def test_microfluidica_uses_current_openfoam_flag_spelling():
+    assert _docker_no_fields_option("microfluidica/openfoam:latest") == "-no-fields"
+    assert _docker_no_fields_option("openfoam/openfoam11-paraview510:11") == "-noFields"
+    assert configured_image_flavour("microfluidica/openfoam:latest") == "esi"
+    assert configured_image_flavour("openfoam/openfoam11-paraview510:11") == "org"
+    assert _reconstruct_mesh_command("microfluidica/openfoam:latest") == "reconstructParMesh -constant -time 0"
+    assert _reconstruct_mesh_command("openfoam/openfoam11-paraview510:11") == "reconstructPar -constant -noFields -time 0"
+
+
+def test_foam_fatal_diagnosis_skips_version_tag_and_reports_real_message():
+    output = ("[3] --> FOAM FATAL IO ERROR: (openfoam-2606)\n"
+              "[3] Entry 'addLayersControls' not found (or not a dictionary) in dictionary \"stream\"\n")
+    reason, _ = _error_diagnosis("snappyHexMesh", {"returncode": 1}, output, 7200)
+    assert "addLayersControls" in reason
+    assert reason != "snappyHexMesh 返回 OpenFOAM 致命错误：(openfoam-2606)"
 
 
 def test_streaming_writes_log_and_heartbeat_while_process_is_alive(tmp_path):

@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import struct
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from pipeline import cases, endplanes, segmentation, surface
+from pipeline import cases, endplanes, local_preview, oblique, segmentation, surface
 from pipeline.errors import PipelineError
-from pipeline.volume import Volume, save_volume
+from pipeline.volume import Volume, load_volume, save_volume
 from fastapi import HTTPException
-from server import EndplanesBody, api_get_endplanes, api_save_endplanes
+from server import (
+    EndplanesBody, SingleEndplaneBody, api_get_endplanes, api_preview_oblique_endplanes,
+    api_preview_local_inlet_model, api_save_endplanes, api_save_single_endplane,
+)
+from server import EndplaneSectionBody, api_endplane_section
 
 
 @pytest.fixture
@@ -71,6 +82,33 @@ def test_get_profile_is_read_only_and_uses_ct_anterior_direction(confirmed_case)
     assert response["saved"] is None
     assert response["can_save"] is True
     assert sorted(path.relative_to(root).as_posix() for path in root.rglob("*")) == before
+
+
+def test_draft_section_is_read_only_and_versioned(confirmed_case):
+    case_id, root, _record, _mask = confirmed_case
+    before = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    response = asyncio.run(api_endplane_section(case_id, EndplaneSectionBody(
+        scope="main_airway", mask_version=3,
+        plane={"point_lps_mm": [4, -10, 6], "normal_lps": [0, -1, 0.4]}, span_mm=30,
+    )))
+    assert response.media_type == "image/png"
+    assert response.body.startswith(b"\x89PNG")
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-mask-version"] == "3"
+    assert response.headers["x-model-scope"] == "main_airway"
+    after = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert after == before
+
+
+def test_draft_section_cannot_bypass_version_or_human_review(confirmed_case):
+    case_id, root, record, _mask = confirmed_case
+    plane = {"point_lps_mm": [4, -10, 6], "normal_lps": [0, -1, 0]}
+    with pytest.raises(PipelineError, match="版本已变化"):
+        endplanes.render_endplane_section(case_id, "main_airway", plane, 2, 30)
+    record["need_human_confirm"] = True
+    (root / "segment" / "segmentation.json").write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(PipelineError, match="人工确认"):
+        endplanes.render_endplane_section(case_id, "main_airway", plane, 3, 30)
 
 
 @pytest.mark.parametrize(
@@ -243,6 +281,275 @@ def test_api_get_and_post_share_zero_based_contract(confirmed_case):
     assert caught.value.status_code == 400
 
 
+def _local_inlet_request(**overrides):
+    values = {
+        "format": endplanes.LOCAL_INLET_FORMAT, "scope": "main_airway", "mask_version": 3,
+        "anterior_plane": {"point_lps_mm": [4, -20, 6], "normal_lps": [0, -1, 0]},
+        "posterior_plane": {"point_lps_mm": [4, -8, 6], "normal_lps": [0, 1, 0]},
+        "anterior_seed_lps_mm": [4, -23, 6],
+    }
+    values.update(overrides)
+    return EndplanesBody(**values)
+
+
+def _local_inlet_validation(_mask, _volume, anterior, posterior, seed, *, main_airway):
+    assert main_airway is True
+    return {
+        "anterior_plane": anterior, "posterior_plane": posterior,
+        "anterior_seed_lps_mm": seed, "source_voxels": 320, "retained_voxels": 280,
+        "retained_components": 1, "retained_volume_ml": 0.28,
+        "anterior_deleted_voxels": 40, "anterior_unselected_positive_voxels": 8,
+        "anterior_unselected_deleted_voxels": 0, "anterior_candidate_components": 2,
+        "anterior_opening_components": 1, "anterior_area_estimate_mm2": 16.0,
+        "posterior_area_estimate_mm2": 16.0,
+    }
+
+
+def test_local_inlet_v2_previews_without_writing_and_saves_exact_seed(confirmed_case, monkeypatch):
+    case_id, root, record, mask = confirmed_case
+    monkeypatch.setattr(oblique, "validate_local_inlet_pair", _local_inlet_validation, raising=False)
+    mesh_stats = {"format": "oblique_mesh_clip_local_v2", "closed_caps": True,
+                  "inlet_loops": 1, "outlet_loops": 1,
+                  "inlet_cap_faces": 1, "outlet_cap_faces": 1}
+    monkeypatch.setattr(local_preview, "build_local_inlet_mesh", lambda *_args: (
+        np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=float),
+        np.asarray([[0, 1, 2]], dtype=np.int32), mesh_stats,
+    ))
+    request = _local_inlet_request()
+    profile = asyncio.run(api_get_endplanes(case_id, "main_airway"))
+    assert endplanes.LOCAL_INLET_FORMAT in profile["supported_formats"]
+    preview = asyncio.run(api_preview_oblique_endplanes(case_id, request))
+    assert preview["format"] == endplanes.LOCAL_INLET_FORMAT
+    assert preview["can_save"] is False
+    assert preview["can_preview_mesh"] is True
+    assert preview["anterior_seed_lps_mm"] == request.anterior_seed_lps_mm
+    assert preview["anterior_deleted_voxels"] == 40
+    assert preview["anterior_opening_components"] == 1
+    assert preview["unselected_region_changed_voxels"] == 0
+    assert preview["anterior_area_mm2"] == 16.0
+    assert preview["voxel_preflight"]["anterior_opening_components"] == 1
+    assert preview["mesh_preflight"] is False
+    assert not (root / "segment" / "endplanes.json").exists()
+
+    cases.update_stage(case_id, "surface", "ok", artifacts=["surface/airway.stl"])
+    (root / "surface" / "airway.stl").write_bytes(b"old")
+    saved = asyncio.run(api_save_endplanes(case_id, request))
+    assert saved["format"] == endplanes.LOCAL_INLET_FORMAT
+    assert saved["complete"] is True
+    assert saved["anterior_seed_lps_mm"] == request.anterior_seed_lps_mm
+    assert not (root / "surface" / "airway.stl").exists()
+    assert endplanes.current_plan(case_id, "main_airway", record, load_volume(case_id),
+                                  mask)["format"] == endplanes.LOCAL_INLET_FORMAT
+    assert asyncio.run(api_get_endplanes(case_id, "main_airway"))["saved"]["format"] == endplanes.LOCAL_INLET_FORMAT
+
+    with pytest.raises(PipelineError, match="不能覆盖"):
+        endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3)
+    with pytest.raises(PipelineError, match="不能覆盖"):
+        endplanes.save_single_endplane(case_id, "main_airway", "posterior", request.posterior_plane, 3)
+    assert endplanes.load_plan(case_id, "main_airway")["anterior_seed_lps_mm"] == request.anterior_seed_lps_mm
+
+
+def test_local_inlet_model_preview_is_binary_stl_and_has_no_case_side_effects(confirmed_case, monkeypatch):
+    case_id, root, _record, _mask = confirmed_case
+    monkeypatch.setattr(oblique, "validate_local_inlet_pair", _local_inlet_validation)
+
+    def clip_mesh(vertices, faces, *_args, **_kwargs):
+        return vertices, faces, np.asarray([0]), np.asarray([1]), {
+            "closed_caps": True, "inlet_loops": 1, "outlet_loops": 1,
+            "inlet_cap_faces": 1, "outlet_cap_faces": 1,
+        }
+
+    monkeypatch.setattr(surface, "clip_mesh_by_oblique_planes_local", clip_mesh)
+    before = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    stages_before = cases.get_case(case_id)["stages"].copy()
+    response = asyncio.run(api_preview_local_inlet_model(case_id, _local_inlet_request()))
+    count = struct.unpack("<I", response.body[80:84])[0]
+    assert response.media_type == "model/stl"
+    assert count > 0
+    assert len(response.body) == 84 + count * 50
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-mask-version"] == "3"
+    assert response.headers["x-model-scope"] == "main_airway"
+    after = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert after == before
+    assert cases.get_case(case_id)["stages"] == stages_before
+
+
+def test_local_inlet_real_preview_and_saved_surface_share_mesh(confirmed_case):
+    case_id, root, _record, _mask = confirmed_case
+    request = _local_inlet_request()
+    coarse = asyncio.run(api_preview_oblique_endplanes(case_id, request))
+    assert coarse["can_preview_mesh"] is True
+    draft = asyncio.run(api_preview_local_inlet_model(case_id, request))
+    assert len(draft.body) > 84
+    saved = asyncio.run(api_save_endplanes(case_id, request))
+    assert saved["mesh_preflight"]["closed_caps"] is True
+    result = surface.run_surface(case_id, {"model_scope": "main_airway"})
+    formal = (root / "surface" / "airway.stl").read_bytes()
+    assert result["params"]["extend_ap_edges"] is False
+    assert draft.body[80:] == formal[80:]
+
+
+def test_local_inlet_rejects_mesh_settings_that_differ_from_preview_before_writing(confirmed_case):
+    case_id, root, _record, _mask = confirmed_case
+    asyncio.run(api_save_endplanes(case_id, _local_inlet_request()))
+    (root / "surface" / "airway.stl").write_bytes(b"previous STL")
+    before = {path.relative_to(root).as_posix(): path.read_bytes()
+              for path in root.rglob("*") if path.is_file()}
+    for override, key in (({"smooth": True}, "smooth"),
+                          ({"step_size": 2}, "step_size"),
+                          ({"decimate_ratio": 0.5}, "decimate_ratio")):
+        with pytest.raises(PipelineError, match="与已预览的精确网格不一致") as caught:
+            surface.run_surface(case_id, {"model_scope": "main_airway", **override})
+        assert caught.value.to_dict()["detail"]["unsupported_parameters"] == [key]
+        after = {path.relative_to(root).as_posix(): path.read_bytes()
+                 for path in root.rglob("*") if path.is_file()}
+        assert after == before
+
+
+def test_local_inlet_exact_mesh_busy_rejects_preview_and_save_then_recovers(confirmed_case):
+    case_id, root, _record, _mask = confirmed_case
+    request = _local_inlet_request()
+    before = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    with surface.local_geometry_guard():
+        for action in (
+            lambda: asyncio.run(api_preview_local_inlet_model(case_id, request)),
+            lambda: asyncio.run(api_save_endplanes(case_id, request)),
+        ):
+            with pytest.raises(HTTPException) as caught:
+                action()
+            assert caught.value.detail["status"] == "blocked"
+            assert "重试" in "".join(caught.value.detail["remediation"])
+    after = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert after == before
+    assert len(asyncio.run(api_preview_local_inlet_model(case_id, request)).body) > 84
+
+
+def test_local_inlet_exact_mesh_capacity_blocks_before_clip(confirmed_case, monkeypatch):
+    case_id, root, _record, _mask = confirmed_case
+    previous = endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3)
+    (root / "surface" / "airway.stl").write_bytes(b"previous")
+    monkeypatch.setattr(surface, "MAX_LOCAL_INLET_FACES", 1)
+
+    def should_not_clip(*_args, **_kwargs):
+        raise AssertionError("capacity gate must run before precise clipping")
+
+    monkeypatch.setattr(surface, "clip_mesh_by_oblique_planes_local", should_not_clip)
+    request = _local_inlet_request()
+    assert asyncio.run(api_preview_oblique_endplanes(case_id, request))["can_preview_mesh"] is True
+    for action in (
+        lambda: asyncio.run(api_preview_local_inlet_model(case_id, request)),
+        lambda: asyncio.run(api_save_endplanes(case_id, request)),
+    ):
+        with pytest.raises(HTTPException) as caught:
+            action()
+        assert caught.value.detail["status"] == "blocked"
+        assert caught.value.detail["detail"]["source_faces"] > 1
+        assert caught.value.detail["detail"]["local_inlet_face_limit"] == 1
+    assert endplanes.load_plan(case_id, "main_airway") == previous
+    assert (root / "surface" / "airway.stl").read_bytes() == b"previous"
+
+
+def test_local_inlet_mask_capacity_blocks_before_marching_cubes(confirmed_case, monkeypatch):
+    case_id, root, _record, _mask = confirmed_case
+    called = []
+
+    def reject_mask(_mask):
+        called.append("mask_gate")
+        raise PipelineError("blocked", "合成粗容量超限", ["收紧掩膜后重试"])
+
+    def should_not_mesh(*_args, **_kwargs):
+        raise AssertionError("marching cubes must not run after mask capacity rejection")
+
+    monkeypatch.setattr(surface, "ensure_local_mask_capacity", reject_mask)
+    monkeypatch.setattr(surface, "mask_to_stl", should_not_mesh)
+    before = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    for action in (
+        lambda: asyncio.run(api_preview_local_inlet_model(case_id, _local_inlet_request())),
+        lambda: asyncio.run(api_save_endplanes(case_id, _local_inlet_request())),
+    ):
+        with pytest.raises(HTTPException, match="合成粗容量超限"):
+            action()
+    assert called == ["mask_gate", "mask_gate"]
+    after = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert after == before
+
+
+def test_local_inlet_mesh_failure_does_not_replace_plan_or_geometry(confirmed_case, monkeypatch):
+    case_id, root, _record, _mask = confirmed_case
+    previous = endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3)
+    (root / "surface" / "airway.stl").write_bytes(b"previous")
+    monkeypatch.setattr(oblique, "validate_local_inlet_pair", _local_inlet_validation)
+
+    def fail_mesh(*_args):
+        raise PipelineError("blocked", "局部裁切不水密")
+
+    monkeypatch.setattr(local_preview, "build_local_inlet_mesh", fail_mesh)
+    assert asyncio.run(api_preview_oblique_endplanes(case_id, _local_inlet_request()))["can_save"] is False
+    for action in (
+        lambda: asyncio.run(api_preview_local_inlet_model(case_id, _local_inlet_request())),
+        lambda: asyncio.run(api_save_endplanes(case_id, _local_inlet_request())),
+    ):
+        with pytest.raises(HTTPException, match="局部裁切不水密"):
+            action()
+    assert endplanes.load_plan(case_id, "main_airway") == previous
+    assert (root / "surface" / "airway.stl").read_bytes() == b"previous"
+
+
+def test_local_inlet_v2_rejects_missing_seed_mixed_modes_and_single_save(confirmed_case):
+    case_id, root, _record, _mask = confirmed_case
+    invalid = (
+        _local_inlet_request(anterior_seed_lps_mm=None),
+        _local_inlet_request(anterior_index=20),
+        _local_inlet_request(format="oblique_planes_v1"),
+    )
+    for request in invalid:
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(api_preview_oblique_endplanes(case_id, request))
+        assert caught.value.status_code == 400
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(api_save_endplanes(case_id, request))
+        assert caught.value.status_code == 400
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(api_save_single_endplane(case_id, "anterior", SingleEndplaneBody(
+            scope="main_airway", mask_version=3, plane=_local_inlet_request().anterior_plane,
+            format=endplanes.LOCAL_INLET_FORMAT, anterior_seed_lps_mm=[4, -23, 6],
+        )))
+    assert caught.value.status_code == 400
+    assert not (root / "segment" / "endplanes.json").exists()
+
+
+def test_local_inlet_v2_full_candidate_is_not_advertised_or_accepted(confirmed_case):
+    case_id, root, _record, _mask = confirmed_case
+    profile = asyncio.run(api_get_endplanes(case_id, "full_candidate"))
+    assert endplanes.LOCAL_INLET_FORMAT not in profile["supported_formats"]
+    request = _local_inlet_request(scope="full_candidate")
+    for action in (
+        lambda: asyncio.run(api_preview_oblique_endplanes(case_id, request)),
+        lambda: asyncio.run(api_preview_local_inlet_model(case_id, request)),
+        lambda: asyncio.run(api_save_endplanes(case_id, request)),
+    ):
+        with pytest.raises(HTTPException, match="暂仅支持主鼻腔"):
+            action()
+    assert not (root / "segment" / "endplanes.json").exists()
+
+
+def test_local_inlet_v2_failed_preflight_preserves_existing_plan_and_geometry(confirmed_case, monkeypatch):
+    case_id, root, _record, _mask = confirmed_case
+    previous = endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3)
+    (root / "surface" / "airway.stl").write_bytes(b"previous")
+
+    def fail_preflight(*_args, **_kwargs):
+        raise PipelineError("blocked", "局部入口碰到未选分支")
+
+    monkeypatch.setattr(oblique, "validate_local_inlet_pair", fail_preflight, raising=False)
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(api_save_endplanes(case_id, _local_inlet_request()))
+    assert caught.value.status_code == 400
+    assert endplanes.load_plan(case_id, "main_airway") == previous
+    assert (root / "surface" / "airway.stl").read_bytes() == b"previous"
+
+
 def test_new_segmentation_removes_previous_endplane_choices(confirmed_case, monkeypatch):
     case_id, root, _record, mask = confirmed_case
     endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3)
@@ -265,3 +572,130 @@ def test_new_segmentation_removes_previous_endplane_choices(confirmed_case, monk
     assert result["mask_version"] == 4
     assert not (root / "segment" / "endplanes.json").exists()
     assert endplanes.get_endplanes(case_id)["saved"] is None
+
+
+def test_saved_endplanes_keep_versioned_corrections_after_mask_refresh(
+    confirmed_case, tmp_path, monkeypatch,
+):
+    from pipeline import endplane_history
+
+    monkeypatch.setenv("WINDCATCHER_LEARNING_DIR", str(tmp_path / "learning"))
+    case_id, root, _record, _mask = confirmed_case
+    first = endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3)
+    second = endplanes.save_endplanes(case_id, "main_airway", 19, 8, 3)
+    endplanes.save_endplanes(case_id, "main_airway", 19, 8, 3)
+
+    revisions = endplane_history.list_revisions(case_id, "main_airway")
+    assert len(revisions) == 2
+    assert revisions[0]["previous_plan"] is None
+    assert revisions[0]["confirmed_plan"] == first
+    assert revisions[1]["previous_plan"] == first
+    assert revisions[1]["confirmed_plan"] == second
+    assert revisions[1]["mask_version"] == 3
+    assert revisions[1]["actor_id"] is None
+
+    (root / "segment" / "endplanes.json").unlink()
+    assert endplane_history.list_revisions(case_id, "main_airway") == revisions
+
+
+def test_failed_endplane_save_never_becomes_confirmed_history(
+    confirmed_case, tmp_path, monkeypatch,
+):
+    from pipeline import endplane_history
+
+    monkeypatch.setenv("WINDCATCHER_LEARNING_DIR", str(tmp_path / "learning"))
+    case_id, root, _record, _mask = confirmed_case
+    first = endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3)
+
+    def fail_invalidation(*_args, **_kwargs):
+        raise OSError("synthetic locked artifact")
+
+    monkeypatch.setattr(endplanes, "invalidate_downstream", fail_invalidation)
+    with pytest.raises(PipelineError, match="旧 STL/CFD"):
+        endplanes.save_endplanes(case_id, "main_airway", 19, 8, 3)
+    assert endplanes.load_plan(case_id, "main_airway") == first
+    revisions = endplane_history.list_revisions(case_id, "main_airway")
+    assert len(revisions) == 1
+    assert revisions[0]["confirmed_plan"] == first
+
+
+def test_endplane_history_recovers_a_saved_plan_after_commit_interruption(
+    confirmed_case, tmp_path, monkeypatch,
+):
+    from pipeline import endplane_history
+
+    monkeypatch.setenv("WINDCATCHER_LEARNING_DIR", str(tmp_path / "learning"))
+    case_id, _root, _record, _mask = confirmed_case
+    original_commit = endplane_history.commit_revision
+
+    def interrupted_commit(_revision_id):
+        monkeypatch.setattr(endplane_history, "commit_revision", original_commit)
+        raise OSError("synthetic learning database outage")
+
+    monkeypatch.setattr(endplane_history, "commit_revision", interrupted_commit)
+    with pytest.raises(PipelineError, match="修正记录未完成"):
+        endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3)
+    assert endplane_history.list_revisions(case_id, "main_airway") == []
+    saved = endplanes.load_plan(case_id, "main_airway")
+
+    assert endplanes.save_endplanes(case_id, "main_airway", 20, 8, 3) == saved
+    revisions = endplane_history.list_revisions(case_id, "main_airway")
+    assert len(revisions) == 1
+    assert revisions[0]["confirmed_plan"] == saved
+
+
+def test_direct_saves_in_separate_processes_serialize_the_entire_commit(
+    confirmed_case, tmp_path, monkeypatch,
+):
+    """A second process must not abort a live pending revision or overwrite it."""
+    from pipeline import endplane_history
+
+    monkeypatch.setenv("WINDCATCHER_LEARNING_DIR", str(tmp_path / "learning"))
+    case_id, _root, _record, _mask = confirmed_case
+    entered_invalidation = threading.Event()
+    release_first_save = threading.Event()
+    original_invalidate = endplanes.invalidate_downstream
+
+    def pause_first_save(*args, **kwargs):
+        entered_invalidation.set()
+        if not release_first_save.wait(timeout=15):
+            raise TimeoutError("first save was not released")
+        return original_invalidate(*args, **kwargs)
+
+    monkeypatch.setattr(endplanes, "invalidate_downstream", pause_first_save)
+    child_marker = tmp_path / "child-started"
+    child_code = """
+import sys
+from pathlib import Path
+from pipeline import cases, endplanes
+cases.CASES_DIR = Path(sys.argv[1])
+Path(sys.argv[3]).write_text("ready", encoding="utf-8")
+endplanes.save_endplanes(sys.argv[2], "main_airway", 19, 8, 3)
+"""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(endplanes.save_endplanes, case_id, "main_airway", 20, 8, 3)
+        assert entered_invalidation.wait(timeout=15)
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(tmp_path), case_id, str(child_marker)],
+            cwd=Path(__file__).resolve().parents[1], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not child_marker.exists() and time.monotonic() < deadline:
+                assert child.poll() is None, child.communicate()[1]
+                time.sleep(0.05)
+            assert child_marker.exists(), "second process did not reach its save call"
+            time.sleep(0.8)
+            assert child.poll() is None, "second process saved while first commit was pending"
+        finally:
+            release_first_save.set()
+            stdout, stderr = child.communicate(timeout=30)
+        assert child.returncode == 0, (stdout, stderr)
+        initial = first.result(timeout=15)
+
+    revisions = endplane_history.list_revisions(case_id, "main_airway", include_pending=True)
+    assert [revision["status"] for revision in revisions] == ["committed", "committed"]
+    assert revisions[0]["confirmed_plan"] == initial
+    assert revisions[1]["previous_plan"] == initial
+    assert endplanes.load_plan(case_id, "main_airway") == revisions[1]["confirmed_plan"]

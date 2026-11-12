@@ -1,0 +1,3 @@
+# Isolated candidate worker only; install CUDA torch from the official wheel index.
+nnunetv2==2.6.2
+torch==2.6.0

@@ -62,3 +62,42 @@ test("failed public upload keeps selected files for retry", async () => {
   assert.deepEqual(h.state.uploadFiles.map((file) => file.name), ["001.dcm", "002.dcm"]);
   assert.equal(h.nodes["btn-newcase"].disabled, false);
 });
+
+for (const cloud of [true, false]) {
+  test(`case deletion uses ${cloud ? "ModelScope POST transport" : "the local DELETE method"}`, async () => {
+    const start = source.indexOf("async function api(path, options = {}) {");
+    const end = source.indexOf("\nasync function apiUploadCase", start);
+    let request;
+    const context = vm.createContext({
+      window: { WindcatcherCloudAccess: cloud },
+      fetch: async (url, options) => {
+        request = { url, options };
+        return { ok: true, json: async () => ({ status: "deleted" }) };
+      },
+    });
+    vm.runInContext(source.slice(start, end), context);
+    await context.api("/api/cases/case-20261027-120000-abcd", { method: "DELETE" });
+    assert.equal(request.url, "/api/cases/case-20261027-120000-abcd");
+    assert.equal(request.options.method, cloud ? "POST" : "DELETE");
+    assert.equal(request.options.headers["X-Windcatcher-Method"], cloud ? "DELETE" : undefined);
+  });
+}
+
+test("API errors preserve top-level PipelineError reason and remediation", async () => {
+  const start = source.indexOf("async function api(path, options = {}) {");
+  const end = source.indexOf("\nasync function apiUploadCase", start);
+  const context = vm.createContext({
+    window: {},
+    fetch: async () => ({
+      ok: false, status: 400,
+      headers: { get: () => null },
+      json: async () => ({ status: "blocked", reason: "病例的上游步骤正在运行", remediation: ["等待当前步骤结束后重试"] }),
+    }),
+  });
+  vm.runInContext(source.slice(start, end), context);
+  await assert.rejects(context.api("/api/cases/test/cfd-postprocess"), (error) => {
+    assert.equal(error.detail.reason, "病例的上游步骤正在运行");
+    assert.match(error.message, /等待当前步骤结束后重试/);
+    return true;
+  });
+});

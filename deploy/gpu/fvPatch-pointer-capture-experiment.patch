@@ -1,0 +1,14 @@
+--- a/src/finiteVolume/fvMesh/fvPatches/fvPatch/fvPatchTemplates.C
++++ b/src/finiteVolume/fvMesh/fvPatches/fvPatch/fvPatchTemplates.C
+@@ -60,1 +60,4 @@
+     labelRange faceRange(0, len);
++    const label* const addressingPtr = addressing.cdata();
++    const Type* const internalDataPtr = internalData.cdata();
++    Type* const patchDataPtr = pfld.data();
+@@ -69,4 +72,4 @@
+-            [&](const label i)
++            [addressingPtr, internalDataPtr, patchDataPtr](const label i)
+             {
+-                pfld[i] = internalData[addressing[i]];
++                patchDataPtr[i] = internalDataPtr[addressingPtr[i]];
+             }

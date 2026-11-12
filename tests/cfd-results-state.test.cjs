@@ -29,6 +29,16 @@ function fixture() {
   return { context, state, elements };
 }
 
+test("a failed viewer can regenerate only after current field availability was verified", () => {
+  const { context, elements } = fixture();
+  vm.runInContext(productionFunction("renderCfdResultsError"), context);
+  context.renderCfdResultsError("inlet 坐标不完整", undefined, true);
+  assert.equal(elements.get("btn-cfd-postprocess").disabled, false);
+  assert.match(elements.get("cfd-results-state").innerHTML, /重新生成可视化/);
+  context.renderCfdResultsError("当前请求未能核对求解场");
+  assert.equal(elements.get("btn-cfd-postprocess").disabled, true);
+});
+
 test("actual summary contract enables generation from real-field availability, independent of another CT viewer", () => {
   const { context, elements } = fixture();
   const record = context.cfdResultsCaseRecord();
@@ -88,4 +98,44 @@ test("failed browser postprocessing can be retried while its original fields rem
   }, context.cfdResultsCaseRecord());
   assert.equal(elements.get("btn-cfd-postprocess").disabled, false);
   assert.match(elements.get("cfd-results-state").innerHTML, /后处理曾超时/);
+});
+
+test("result review displays measured initial residuals against configured thresholds", () => {
+  const box = { innerHTML: "" };
+  const context = vm.createContext({
+    $: () => box,
+    escapeHtml: value => String(value),
+    reportNumber: value => Number.isFinite(value) ? value : null,
+  });
+  vm.runInContext(productionFunction("renderCfdValidation"), context);
+  context.renderCfdValidation({
+    eligible: false,
+    convergence: {
+      iterations: 1000,
+      reason: "已达到 endTime，尚未确认稳态收敛",
+      initial_residual: { Ux: 0.00082539008, p: 0.0040558345 },
+      residual_control: { U: 0.00001, p: 0.0001 },
+    },
+    checks: [{ name: "残差收敛", status: "pending" }],
+  });
+  assert.match(box.innerHTML, /1000/);
+  assert.match(box.innerHTML, /Ux.*8\.25e-4.*1\.00e-5/);
+  assert.match(box.innerHTML, /p.*4\.06e-3.*1\.00e-4/);
+  assert.match(box.innerHTML, /已达到 endTime/);
+});
+
+test("result review distinguishes numeric checks from final publishing eligibility", () => {
+  const box = { innerHTML: "" };
+  const context = vm.createContext({
+    $: () => box,
+    escapeHtml: value => String(value),
+    reportNumber: value => Number.isFinite(value) ? value : null,
+  });
+  vm.runInContext(productionFunction("renderCfdValidation"), context);
+  context.renderCfdValidation({ numeric_ok: true, eligible: false, checks: [] });
+  assert.match(box.innerHTML, /数值检查.*已通过/);
+  assert.match(box.innerHTML, /患者分享.*未满足发布条件/);
+  context.renderCfdValidation({ numeric_ok: true, eligible: true, checks: [] });
+  assert.match(box.innerHTML, /患者分享.*已满足发布条件/);
+  assert.doesNotMatch(box.innerHTML, /可进入工程复核/);
 });

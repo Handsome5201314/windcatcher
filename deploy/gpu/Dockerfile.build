@@ -1,0 +1,8 @@
+FROM nvcr.io/nvidia/nvhpc:24.9-devel-cuda_multi-ubuntu22.04
+
+# The NVHPC SDK has the compiler and CUDA toolkit, but lacks OpenFOAM's
+# lexer/parser build tools. Keep the base image unchanged for CPU cases.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        flex libfl-dev bison zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*

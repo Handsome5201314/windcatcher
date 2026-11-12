@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>风见 · 统一入口流程 UI 设计稿</title>
+  <style>
+    :root { --ink:#151b1d; --muted:#526165; --line:#dfe8e7; --teal:#0f766e; --soft:#e9f6f3; --dark:#0d1519; }
+    * {box-sizing:border-box} body {margin:0; color:var(--ink); background:#edf3f2; font:14px/1.5 "Segoe UI","Microsoft YaHei UI",sans-serif}
+    .sheet {width:1560px; height:1110px; margin:auto; padding:26px; background:#f5f8f7}
+    .banner {height:38px; display:flex; align-items:center; justify-content:space-between; color:#593e07; background:#fff2d8; border:1px solid #eac876; border-radius:8px; padding:0 14px; font-weight:650}
+    .banner small {font-weight:500}
+    .frame {height:1020px; margin-top:14px; display:grid; grid-template-columns:212px 1fr; border:1px solid #dce7e5; border-radius:13px; background:#fff; box-shadow:0 15px 42px #1f51451b; overflow:hidden}
+    aside {border-right:1px solid var(--line); padding:25px 14px; display:flex; flex-direction:column}
+    .brand {display:flex; align-items:center; gap:11px; padding:2px 10px 26px; font-size:20px; font-weight:750}
+    .logo {width:31px; height:31px; border:3px solid var(--teal); border-radius:8px; transform:rotate(-12deg); display:grid; place-items:center; color:var(--teal); font-size:17px}
+    .nav {padding:13px 14px; margin:2px 0; color:#526165; border-radius:8px}
+    .nav.on {color:#095c56; background:var(--soft); font-weight:700}
+    .foot {margin-top:auto; padding:16px 10px 0; border-top:1px solid var(--line); color:#6c7f81; font-size:12px}
+    main {padding:26px 30px; min-width:0}
+    .crumb {font-size:12px; color:#7a888b; margin-bottom:12px}
+    .head {display:flex; justify-content:space-between; align-items:start; gap:20px}
+    h1 {margin:0; font-size:27px; line-height:1.25; letter-spacing:-.02em}
+    .sub {margin:7px 0 0; color:var(--muted); font-size:13px}
+    .pill {display:inline-flex; align-items:center; gap:7px; border:1px solid #a9d7ce; border-radius:99px; background:#eef9f6; color:#0c635b; padding:7px 11px; font-weight:650; font-size:12px; white-space:nowrap}
+    .dot {width:8px; height:8px; border-radius:50%; background:#0f766e}
+    .hero {margin-top:22px; border:1px solid #b8dad2; border-radius:12px; background:linear-gradient(110deg,#ecf8f5,#f9fcfb); padding:18px 20px; display:flex; align-items:center; justify-content:space-between; gap:20px}
+    .hero h2 {margin:0; font-size:17px}
+    .hero p {margin:5px 0 0; color:#496261; font-size:12.5px}
+    .btn {min-width:152px; border:0; border-radius:8px; padding:11px 18px; background:#0f766e; color:#fff; text-align:center; font-weight:700; font-size:13px}
+    .progress {margin-top:17px; display:grid; grid-template-columns:repeat(5,1fr); gap:8px}
+    .step {position:relative; border:1px solid #dfe9e7; border-radius:9px; padding:12px 12px 11px; background:#fff; min-height:84px}
+    .step.done {border-color:#badbd3; background:#f5fbf9}
+    .step.current {border-color:#78beb1; box-shadow:inset 0 3px #0f766e; background:#f2faf8}
+    .num {display:inline-grid; place-items:center; width:23px; height:23px; border-radius:99px; color:#fff; background:#0f766e; font-size:12px; font-weight:750}
+    .step.wait .num {background:#bcc9c8}
+    .step strong {margin-left:7px; font-size:12.5px}
+    .step p {margin:7px 0 0; color:#69797a; font-size:11px}
+    .section-head {display:flex; align-items:center; justify-content:space-between; margin:22px 0 10px}
+    .section-head h2 {font-size:17px; margin:0}
+    .section-head small {color:#6c7c7d}
+    .card {border:1px solid var(--line); border-radius:11px; background:#fff}
+    .ports {display:grid; grid-template-columns:repeat(3,1fr); gap:10px}
+    .port {padding:11px 14px; display:flex; align-items:center; justify-content:space-between; min-height:62px}
+    .port.active {border-color:#76bcb1; background:#eff9f6; box-shadow:inset 0 0 0 1px #b4dbd2}
+    .port strong {display:block; font-size:13px}
+    .port small {display:block; margin-top:3px; font-size:11px; color:#6a7b7d}
+    .status {font-size:11px; font-weight:700; color:#0f766e}
+    .visuals {margin-top:10px; display:grid; grid-template-columns:1.06fr .94fr; gap:12px}
+    .viz {height:356px; overflow:hidden; position:relative; border-radius:10px; background:#0d1519; border:1px solid #2b4548}
+    .viz-head {height:46px; padding:0 17px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #26383d; color:#e8f5f3; font-size:12px}
+    .viz-head span {color:#9dbab7; font-size:11px}
+    .viz svg {display:block; width:100%; height:265px}
+    .viz-foot {position:absolute; bottom:0; height:45px; left:0; right:0; padding:0 17px; display:flex; align-items:center; justify-content:space-between; border-top:1px solid #26383d; color:#b9d1cc; font-size:11px}
+    .mini {border:1px solid #395a58; border-radius:5px; padding:4px 7px; color:#a8dcd2}
+    .match {margin:10px 0 0; display:flex; align-items:center; justify-content:center; color:#0d625a; font-weight:700; font-size:12px}
+    .match code {font-family:Consolas,monospace; color:#0f766e; margin:0 4px}
+    .qc {margin-top:15px; padding:15px 17px; display:flex; align-items:center; justify-content:space-between}
+    .qc strong {font-size:13px}
+    .qc p {margin:4px 0 0; color:#5a6b6d; font-size:11px}
+    .warn {border-radius:6px; background:#fff4dc; color:#8d560b; padding:8px 10px; font-size:11px; font-weight:650}
+    .advanced {margin-top:11px; border:1px solid var(--line); border-radius:8px; padding:12px 16px; color:#506164; font-size:12px}
+    .advanced b {color:#28373a}
+    .advanced small {float:right; color:#758689}
+    .footer {margin-top:14px; color:#718184; font-size:11px}
+  </style>
+</head>
+<body>
+  <div class="sheet">
+    <div class="banner"><span>目标界面设计稿 · 当前软件尚未实现统一 port 流程</span><small>示意图仅说明操作逻辑；形状和状态不代表真实病例结果</small></div>
+    <div class="frame">
+      <aside>
+        <div class="brand"><span class="logo">∿</span> 风见</div>
+        <div class="nav">工作台</div>
+        <div class="nav on">病例处理</div>
+        <div class="nav">Agent 自动跑</div>
+        <div class="nav">患者分享</div>
+        <div class="nav">参考病例库</div>
+        <div class="foot">研究预览 · 非临床诊断</div>
+      </aside>
+      <main>
+        <div class="crumb">工作台 / 病例处理 / 病例示意</div>
+        <div class="head"><div><h1>从 CT 到鼻腔气流</h1><p class="sub">系统自动建模、找三个开口、质检并求解；遇到无法确定的位置才请专家处理。</p></div><div class="pill"><span class="dot"></span> 流程示意</div></div>
+        <div class="hero"><div><h2>① 导入 CT，后续自动运行</h2><p>用户只选 CT 文件夹。系统保留鼻孔外侧有限空气上下文，生成主鼻腔模型与三个开口。</p></div><div class="btn">导入 CT 并开始</div></div>
+        <div class="progress">
+          <div class="step done"><span class="num">1</span><strong>导入 CT</strong><p>读取影像与方向信息</p></div>
+          <div class="step done"><span class="num">2</span><strong>生成主鼻腔</strong><p>保留入口周围空气</p></div>
+          <div class="step current"><span class="num">3</span><strong>生成三个开口</strong><p>左鼻孔 · 右鼻孔 · 鼻咽端</p></div>
+          <div class="step wait"><span class="num">4</span><strong>几何与质量检查</strong><p>检查局部裁切和封盖</p></div>
+          <div class="step wait"><span class="num">5</span><strong>CFD 气流模拟</strong><p>通过后自动运行</p></div>
+        </div>
+        <div class="section-head"><h2>② 看三个真实开口</h2><small>按名称切换；模型与 CT 显示同一个 port</small></div>
+        <div class="ports">
+          <div class="port card active"><div><strong>左鼻孔入口</strong><small>选中 · 蓝绿色封盖</small></div><span class="status">同一 port</span></div>
+          <div class="port card"><div><strong>右鼻孔入口</strong><small>切换查看</small></div><span class="status">待核对</span></div>
+          <div class="port card"><div><strong>鼻咽端出口</strong><small>切换查看</small></div><span class="status">待核对</span></div>
+        </div>
+        <div class="visuals">
+          <div class="viz"><div class="viz-head"><strong>三维模型 · 实际局部裁切和 cap</strong><span>可旋转 / 放大</span></div>
+            <svg viewBox="0 0 600 265" aria-label="鼻腔模型示意，不是实际患者网格">
+              <defs><linearGradient id="g" x2="0" y2="1"><stop stop-color="#80d5d0"/><stop offset="1" stop-color="#277e84"/></linearGradient><filter id="glow"><feGaussianBlur stdDeviation="7"/></filter></defs>
+              <path d="M159 34 C154 91 177 142 235 166 C272 184 267 202 282 238 M414 34 C419 87 398 140 345 164 C309 183 325 210 310 238" fill="none" stroke="#2b7b81" stroke-width="66" opacity=".36"/>
+              <path d="M159 34 C154 91 177 142 235 166 C272 184 267 202 282 238 M414 34 C419 87 398 140 345 164 C309 183 325 210 310 238" fill="none" stroke="url(#g)" stroke-width="33" opacity=".85" stroke-linecap="round"/>
+              <path d="M158 39 C170 80 155 127 212 152 M414 40 C405 89 423 121 367 155" fill="none" stroke="#b7f7ed" stroke-width="5" opacity=".5"/>
+              <ellipse cx="159" cy="34" rx="27" ry="11" transform="rotate(-24 159 34)" fill="#a6f5e4" stroke="#52e4cb" stroke-width="3"/>
+              <ellipse cx="414" cy="34" rx="26" ry="11" transform="rotate(22 414 34)" fill="#7dc7c3" stroke="#a2ded6" stroke-width="2" opacity=".6"/>
+              <circle cx="159" cy="34" r="38" fill="#6df1d4" opacity=".18" filter="url(#glow)"/>
+              <path d="M187 28 L249 28 L266 45" fill="none" stroke="#8de9d8" stroke-width="1.5"/><text x="273" y="49" fill="#c4f6ed" font-size="13">左鼻孔真实 cap</text>
+              <text x="35" y="243" fill="#8daaa8" font-size="11">蓝绿高亮 = 真实网格/封盖；灰色只作原始范围对照</text>
+            </svg><div class="viz-foot"><span>只切当前入口的局部支段；其余鼻腔保留</span><span class="mini">查看未裁切叠影</span></div></div>
+          <div class="viz"><div class="viz-head"><strong>CT 对照 · 同一个 port 的投影</strong><span>不能独立再选一遍</span></div>
+            <svg viewBox="0 0 530 265" aria-label="CT 投影示意，不是实际患者 CT">
+              <defs><radialGradient id="ct"><stop stop-color="#59676c"/><stop offset=".65" stop-color="#283339"/><stop offset="1" stop-color="#56646a"/></radialGradient></defs>
+              <ellipse cx="265" cy="128" rx="133" ry="106" fill="url(#ct)" stroke="#728185" stroke-width="7" opacity=".75"/>
+              <path d="M199 80 C179 114 193 152 215 159 C235 161 242 140 244 114 C241 86 220 72 199 80 M312 80 C293 106 289 137 303 158 C326 161 340 140 339 110 C337 88 324 79 312 80" fill="#111b20" stroke="#87969b" stroke-width="4"/>
+              <path d="M196 77 C177 113 190 157 217 162 C243 163 247 137 248 110" fill="none" stroke="#66e0cd" stroke-width="5" stroke-linecap="round"/>
+              <circle cx="218" cy="119" r="6" fill="#74efd5"/><path d="M230 117 L390 75" fill="none" stroke="#72e6d0" stroke-width="1.5"/><text x="394" y="78" fill="#b9efe3" font-size="12">同一边界投影</text>
+              <text x="28" y="241" fill="#9badab" font-size="11">示意 CT 轮廓，用于理解位置关系</text>
+            </svg><div class="viz-foot"><span>左鼻孔 · 模型端面和 CT 同步</span><span class="mini">示例 ID: PORT-L-001</span></div></div>
+        </div>
+        <div class="match">同一个 <code>port_id</code> → 三维边界环 + cap → CT 投影 → CFD 边界条件；位置不再分别保存</div>
+        <div class="qc card"><div><strong>③ 质检通过后，自动生成气流模拟</strong><p>若鼻孔残缺、误切其他部位或 cap 不闭合，流程暂停并说明原因；不自动把错误结果当作通过。</p></div><span class="warn">异常时：转专家处理</span></div>
+        <div class="advanced"><b>⌄ 高级处理（默认收起）</b><small>三维 seed / 画圈 · 调整位置 · 原始切片 · 质检详情</small></div>
+        <div class="footer">设计原则：只有一套入口数据。现有的“切面选择”和“三维画圈实验区”合并为同一个正式流程前，本图只用于讨论，不代表功能已上线。</div>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

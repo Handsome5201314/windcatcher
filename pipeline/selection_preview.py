@@ -1,7 +1,8 @@
 """按当前已确认掩膜的原始体素分辨率重建端面选择用 3D 模型。
 
-所有轴均保留原始采样，不做降采样、网格简化或几何平滑。仅裁去外围
-空白以节省内存；选端模型不修改掩膜或正式 STL、几何质检和 CFD 阶段。
+所有轴均保留原始采样，不做降采样、网格简化或几何平滑。主气道与正式
+建模一致地选取 6 连通最大组件，完整候选保留全量；选端模型不修改掩膜
+或正式 STL、几何质检和 CFD 阶段。
 """
 
 from __future__ import annotations
@@ -19,11 +20,11 @@ from . import endplanes
 from .cases import case_dir
 from .errors import PipelineError
 from .mask_review import has_current_external_air_validation
-from .surface import voxel_to_mm, write_binary_stl
+from .surface import select_largest_component, voxel_to_mm, write_binary_stl
 from .volume import load_volume
 
 _GENERATE_LOCK = threading.Lock()
-_MODEL_RESOLUTION = "native_voxel_v1"
+_MODEL_RESOLUTION = "native_voxel_main6conn_v2"
 
 
 def _bbox(mask: np.ndarray) -> tuple[slice, slice, slice]:
@@ -98,6 +99,8 @@ def selection_model(case_id: str, scope: str = "main_airway", mask_version: int 
         path = root / "preview" / f"selection-model-{scope}-{version}-{fingerprint}.stl"
         if path.exists() and path.stat().st_size >= 84:
             return path, version
+        if scope == "main_airway":
+            mask, _ = select_largest_component(mask)
         vertices, faces = _preview_mesh(mask, volume, ap_axis)
         # 掩膜编辑可能在网格计算期间并发完成。旧结果不能落盘或被当作新版本返回。
         _, _, _, _, final_version, final_stamp = _state(case_id, scope, version)

@@ -50,6 +50,8 @@ function harness(nativeFetch, options = {}) {
     clearTimeout: (id) => timers.delete(id),
     queueMicrotask: (fn) => fn(),
     addEventListener(name, handler) { listeners.set(`window:${name}`, handler); },
+    ...(options.window || {}),
+    ...(options.window || {}),
   };
   const context = vm.createContext({ window, document, URL, Headers, Request, Uint8Array, Array, Date: FakeDate, Promise, JSON, Math, Number, String, Boolean, Error, Set, Map, Object, RegExp, console });
   vm.runInContext(source, context, { filename: "activity-monitor.js" });
@@ -68,6 +70,84 @@ function harness(nativeFetch, options = {}) {
   }
   return { window, document, listeners, timers, nodes, advance, settle, monitor: window.WindcatcherMonitor };
 }
+
+test("authenticated public operators record versioned events with stable retry identifiers", async () => {
+  const batches = [];
+  const h = harness(async (_input, options) => {
+    batches.push(JSON.parse(options.body));
+    return response(batches.length === 1 ? 503 : 200);
+  }, { window: { WindcatcherSharedAccess: true, WindcatcherActivityAccess: true } });
+  assert.ok(h.monitor);
+  h.monitor.record("navigation", "page_opened", {}, "activity");
+  await h.monitor.flush();
+  await h.advance(5000);
+  assert.equal(batches.length, 2);
+  assert.match(batches[0].events[0].event_id, /^[0-9a-f-]{36}$/);
+  assert.equal(batches[0].events[0].event_id, batches[1].events[0].event_id);
+});
+
+test("untrusted shared pages and patient pages never install capture listeners", () => {
+  const shared = harness(async () => response(), { window: { WindcatcherSharedAccess: true } });
+  assert.equal(shared.monitor, undefined);
+  assert.equal(shared.listeners.size, 0);
+  const patient = harness(async () => response(), { window: {
+    WindcatcherActivityAccess: true, location: { pathname: "/share/example" },
+  } });
+  assert.equal(patient.monitor, undefined);
+  assert.equal(patient.listeners.size, 0);
+});
+
+test("durable history panel is discoverable and never reports zero-day retention", async () => {
+  const nodes = new Map(["monitor-events", "monitor-status", "monitor-summary", "monitor-error", "monitor-refresh"].map((id) => [id, element("DIV", { id })]));
+  const h = harness(async (input) => response(200, input === "/api/monitor/status"
+    ? { status: "recording", total_events: 42, retention_days: null, max_events: null }
+    : { events: [] }), { nodes, hash: "#activity" });
+  await h.monitor.refreshPanel();
+  assert.match(nodes.get("monitor-summary").textContent, /长期保留/);
+  assert.doesNotMatch(nodes.get("monitor-summary").textContent, /0 天/);
+  const html = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
+  assert.match(html, /data-route="activity"/);
+  assert.match(html, /id="page-activity"/);
+});
+
+test("authenticated public operators record versioned events with stable retry identifiers", async () => {
+  const batches = [];
+  const h = harness(async (_input, options) => {
+    batches.push(JSON.parse(options.body));
+    return response(batches.length === 1 ? 503 : 200);
+  }, { window: { WindcatcherSharedAccess: true, WindcatcherActivityAccess: true } });
+  assert.ok(h.monitor);
+  h.monitor.record("navigation", "page_opened", {}, "activity");
+  await h.monitor.flush();
+  await h.advance(5000);
+  assert.equal(batches.length, 2);
+  assert.match(batches[0].events[0].event_id, /^[0-9a-f-]{36}$/);
+  assert.equal(batches[0].events[0].event_id, batches[1].events[0].event_id);
+});
+
+test("untrusted shared pages and patient pages never install capture listeners", () => {
+  const shared = harness(async () => response(), { window: { WindcatcherSharedAccess: true } });
+  assert.equal(shared.monitor, undefined);
+  assert.equal(shared.listeners.size, 0);
+  const patient = harness(async () => response(), { window: {
+    WindcatcherActivityAccess: true, location: { pathname: "/share/example" },
+  } });
+  assert.equal(patient.monitor, undefined);
+  assert.equal(patient.listeners.size, 0);
+});
+
+test("durable history panel is discoverable and never reports zero-day retention", async () => {
+  const nodes = new Map(["monitor-events", "monitor-status", "monitor-summary", "monitor-error", "monitor-refresh"].map((id) => [id, element("DIV", { id })]));
+  const h = harness(async (input) => response(200, input === "/api/monitor/status"
+    ? { status: "recording", total_events: 42, retention_days: null, max_events: null }
+    : { events: [] }), { nodes, hash: "#activity" });
+  await h.monitor.refreshPanel();
+  assert.match(nodes.get("monitor-summary").textContent, /长期保留/);
+  assert.doesNotMatch(nodes.get("monitor-summary").textContent, /0 天/);
+  const html = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
+  assert.match(html, /data-route="activity"/);
+  assert.match(html, /id="page-activity"/);
+});
 
 test("record strips raw values and sends only a bounded event batch", async () => {
   const calls = [];

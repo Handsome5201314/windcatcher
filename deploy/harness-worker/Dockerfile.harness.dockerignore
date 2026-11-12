@@ -1,0 +1,17 @@
+# Dockerfile-specific allowlist. This takes precedence over root .dockerignore.
+**
+!deploy/
+!deploy/harness-readonly.patch.yml
+!deploy/harness-worker/
+!deploy/harness-worker/Dockerfile.harness
+!deploy/harness-worker/Dockerfile.harness.dockerignore
+!deploy/harness-worker/package.json
+!deploy/harness-worker/package-lock.json
+!deploy/harness-worker/requirements.txt
+!scripts/
+!scripts/check_harness_profile.py
+!scripts/harness_container_worker.py
+!scripts/harness_action_selector.py
+!scripts/harness_endplane_worker.py
+!scripts/harness_readonly_sidecar.py
+!scripts/harness_sdk_worker.py

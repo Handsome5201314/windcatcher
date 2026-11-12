@@ -1,0 +1,9 @@
+{
+  "name": "windcatcher-harness-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned, tool-free DeepSeek Harness runtime for the Windcatcher advisory worker",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.2-alpha.2"
+  }
+}

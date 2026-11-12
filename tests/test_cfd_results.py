@@ -73,8 +73,13 @@ def tiny_reader(monkeypatch, vtk_pipe):
     class Reader:
         def __init__(self):
             self.selected_time = None
+            self.enabled_patches = []
             self.output = vtk.vtkMultiBlockDataSet()
             self.output.SetBlock(0, mesh)
+
+        def SetPatchArrayStatus(self, name, enabled):
+            if enabled:
+                self.enabled_patches.append(name)
 
         def GetTimeValues(self):
             values = vtk.vtkDoubleArray()
@@ -96,6 +101,47 @@ def tiny_reader(monkeypatch, vtk_pipe):
     reader = Reader()
     monkeypatch.setattr(vtk, "vtkOpenFOAMReader", lambda: reader)
     return reader
+
+
+def test_bilateral_postprocess_traces_from_both_recorded_inlets(result_case, tiny_reader, vtk_pipe):
+    from vtk.util.numpy_support import numpy_to_vtk
+    case_id, root = result_case
+    vtk = cfd_results.vtk
+    _, inlet = vtk_pipe
+    pressure = numpy_to_vtk(np.zeros(inlet.GetNumberOfCells()), deep=True)
+    pressure.SetName("p")
+    inlet.GetCellData().AddArray(pressure)
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(0, 0.002, 0)
+    plane.SetNormal(0, 1, 0)
+    clip = vtk.vtkClipPolyData()
+    clip.SetInputData(inlet)
+    clip.SetClipFunction(plane)
+    clip.GenerateClippedOutputOn()
+    clip.Update()
+    boundary = vtk.vtkMultiBlockDataSet()
+    for index, block in enumerate((clip.GetOutput(), clip.GetClippedOutput())):
+        boundary.SetBlock(index, block)
+        boundary.GetMetaData(index).Set(vtk.vtkCompositeDataSet.NAME(), ("inlet_left", "inlet_right")[index])
+    tiny_reader.output.SetBlock(1, boundary)
+    (root / "cfd" / "case_meta.json").write_text(json.dumps({
+        "inlet_patches": ["inlet_left", "inlet_right"],
+        "boundary_layout": "bilateral_local_v3",
+    }), encoding="utf-8")
+    manifest = cfd_results.run_postprocess(case_id)
+    payload = json.loads((root / manifest["payload"]).read_text(encoding="utf-8"))
+    assert "patch/inlet_left" in tiny_reader.enabled_patches
+    assert "patch/inlet_right" in tiny_reader.enabled_patches
+    assert payload["patches"]["inlet_left"]["indices"]
+    assert payload["patches"]["inlet_right"]["indices"]
+    assert manifest["counts"]["streamlines"] > 0
+    seeds = np.asarray(payload["metadata"]["streamlines"]["seed_positions_m"]).reshape(-1, 3)
+    assert seeds[:, 1].min() < 0.002 < seeds[:, 1].max()
+    prior = (root / "cfd/results/manifest.json").read_bytes()
+    boundary.SetBlock(1, None)
+    with pytest.raises(PipelineError, match="缺少左侧或右侧入口"):
+        cfd_results.run_postprocess(case_id)
+    assert (root / "cfd/results/manifest.json").read_bytes() == prior
 
 
 def test_get_results_reports_missing_without_creating_source_files(tmp_path, monkeypatch):

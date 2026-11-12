@@ -1,0 +1,30 @@
+{
+  "fixture_id": "synthetic-bilateral-local-inlet-v1",
+  "fixture_version": 1,
+  "algorithm_version": "oblique_local_inlet_v2",
+  "shape_ijk": [28, 38, 16],
+  "airway_boxes_ijk": [
+    [[4, 11], [3, 17], [5, 12]],
+    [[17, 24], [3, 17], [5, 12]],
+    [[4, 24], [17, 22], [5, 12]],
+    [[9, 19], [22, 35], [5, 12]]
+  ],
+  "spacing_mm": [1.0, 1.0, 1.0],
+  "origin_lps_mm": [0.0, 0.0, 0.0],
+  "axis_dirs": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+  "anterior_plane": {
+    "point_lps_mm": [7.0, 9.0, 8.0],
+    "normal_lps": [0.45, -0.893, 0.0]
+  },
+  "posterior_plane": {
+    "point_lps_mm": [14.0, 29.0, 8.0],
+    "normal_lps": [0.0, 1.0, 0.0]
+  },
+  "selected_seed_lps_mm": [7.0, 5.0, 8.0],
+  "probes_ijk": {
+    "selected_anterior": [7, 5, 8],
+    "unselected_anterior": [20, 5, 8],
+    "retained_posterior": [14, 25, 8],
+    "removed_posterior": [14, 30, 8]
+  }
+}

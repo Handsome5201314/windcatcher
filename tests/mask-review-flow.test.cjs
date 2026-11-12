@@ -10,7 +10,7 @@ const start = source.match(/^async function refreshAfterMaskReview\(/m).index;
 const functionSource = source.slice(start, source.indexOf("\n}", start) + 2);
 
 function harness({ synthetic = false, path = "/segment/confirm", fail = false, switchCase = false } = {}) {
-  const state = { caseId: "case-a", case: { case_id: "case-a", synthetic }, endplanes: { open: false } };
+  const state = { caseId: "case-a", case: { case_id: "case-a", synthetic }, endplanes: { open: false }, maskEditor: { externalAirFeedback: null }, focused: null };
   const messages = [];
   const requests = [];
   const button = { textContent: "确认气道范围", disabled: false };
@@ -18,6 +18,7 @@ function harness({ synthetic = false, path = "/segment/confirm", fail = false, s
     state,
     guardEndplaneDraft: () => true,
     externalAirCleanupState: () => ({ pending: false }),
+    updateCtViewerGuide: () => {},
     busy: (node, value) => { node.disabled = value; },
     api: async (url) => {
       requests.push(url);
@@ -26,10 +27,12 @@ function harness({ synthetic = false, path = "/segment/confirm", fail = false, s
       return { message: "气道范围已确认" };
     },
     selectCase: async (id) => { state.caseId = id; return true; },
-    endplaneContext: () => state.case.synthetic ? null : { caseId: state.caseId },
+    endplaneContext: () => ({ caseId: state.caseId }),
+    focusStageTarget: (_target, focus) => { state.focused = focus.id; },
     $: (id) => {
-      assert.equal(id, "btn-endplanes");
-      return { click: () => { state.endplanes.open = !state.endplanes.open; } };
+      if (id === "btn-endplanes") return { click: () => { state.endplanes.open = !state.endplanes.open; } };
+      assert.ok(["quick-preview-panel", "quick-preview-primary"].includes(id));
+      return { id };
     },
     toast: (message, failed) => messages.push({ message, failed }),
   });
@@ -37,19 +40,20 @@ function harness({ synthetic = false, path = "/segment/confirm", fail = false, s
   return { state, messages, requests, button, run: () => context.refreshAfterMaskReview(button, path, "已确认") };
 }
 
-test("confirming a real CT opens manual endplane selection before STL generation", async () => {
+test("confirming a real CT returns to the visible automatic primary action", async () => {
   const h = harness();
   await h.run();
-  assert.equal(h.state.endplanes.open, true);
+  assert.equal(h.state.endplanes.open, false);
+  assert.equal(h.state.focused, "quick-preview-primary");
   assert.deepEqual(h.requests, ["/api/cases/case-a/segment/confirm"]);
   assert.equal(h.button.disabled, false);
   assert.equal(h.button.textContent, "确认气道范围");
 });
 
-test("synthetic confirmation does not open anatomical selection", async () => {
+test("synthetic acceptance can open the same endplane selection flow", async () => {
   const h = harness({ synthetic: true });
   await h.run();
-  assert.equal(h.state.endplanes.open, false);
+  assert.equal(h.state.endplanes.open, true);
   assert.equal(h.messages[0].failed, undefined);
 });
 
@@ -65,6 +69,8 @@ test("failed confirmation leaves manual endplanes closed and reports the failure
   await h.run();
   assert.equal(h.state.endplanes.open, false);
   assert.deepEqual(h.messages, [{ message: "确认失败", failed: true }]);
+  assert.equal(h.state.maskEditor.externalAirFeedback.kind, "error");
+  assert.equal(h.state.maskEditor.externalAirFeedback.message, "确认失败");
   assert.equal(h.button.disabled, false);
 });
 

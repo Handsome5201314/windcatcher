@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import mesh_cache, preview
+from . import gpu_solver, mesh_cache, preview
 from .cfd_validation import (
     inspect_latest_fields, parse_mesh_checks, parse_residuals, pressure_metadata, read_json,
 )
@@ -40,9 +40,46 @@ def configured_image() -> str:
     return ""
 
 
+def configured_image_flavour(image: str | None = None) -> str:
+    image = (configured_image() if image is None else image).strip().lower()
+    return "esi" if image.startswith("microfluidica/openfoam") else "org"
+
+
 def remember_image(image: str) -> None:
     marker = Path(__file__).resolve().parent.parent / ".openfoam_image"
     marker.write_text(image.strip(), encoding="utf-8")
+
+
+def _docker_shell_config(image: str) -> tuple[str, str]:
+    """返回镜像对应的 shell 入口和环境加载片段。
+
+    项目默认镜像是 OpenFOAM.org 11，使用标准 bash 加载
+    ``/opt/openfoam11/etc/bashrc``。microfluidica 镜像自带
+    ``/openfoam/bash`` 包装器，它会加载 OpenFOAM 2606 的 profile；
+    若仍使用默认路径，后端探测虽然能看到镜像，实际求解会找不到
+    ``simpleFoam``。
+    """
+    normalized = str(image or "").strip().lower()
+    if normalized.startswith("microfluidica/openfoam"):
+        return "/openfoam/bash", ""
+    return "bash", ". /opt/openfoam11/etc/bashrc >/dev/null 2>&1; "
+
+
+def _docker_command_config(image_ref: str, pinned_image: str) -> tuple[str, str, str]:
+    """Keep the configured image reference for shell adaptation after pinning."""
+    entrypoint, env_source = _docker_shell_config(image_ref)
+    return pinned_image, entrypoint, env_source
+
+
+def _docker_no_fields_option(image_ref: str) -> str:
+    """Return the decompose/reconstruct flag used by the configured flavour."""
+    return "-no-fields" if str(image_ref or "").strip().lower().startswith("microfluidica/openfoam") else "-noFields"
+
+
+def _reconstruct_mesh_command(image_ref: str) -> str:
+    if configured_image_flavour(image_ref) == "esi":
+        return "reconstructParMesh -constant -time 0"
+    return f"reconstructPar -constant {_docker_no_fields_option(image_ref)} -time 0"
 
 
 def _run(cmd: list[str], timeout: int) -> tuple[int, str, str]:
@@ -309,8 +346,15 @@ def _error_diagnosis(name: str, result: dict, output: str, timeout: int) -> tupl
         )
     fatal = re.search(r"FOAM FATAL (?:ERROR|IO ERROR)\s*:\s*(.*?)(?:\n|$)", output, flags=re.I)
     if fatal:
+        detail = fatal.group(1).strip()
+        if re.fullmatch(r"\(openfoam[-\w.]+\)", detail, flags=re.I):
+            for line in output[fatal.end():].splitlines():
+                candidate = re.sub(r"^\s*\[\d+\]\s*", "", line).strip()
+                if candidate:
+                    detail = candidate
+                    break
         return (
-            f"{name} 返回 OpenFOAM 致命错误：{fatal.group(1).strip()}",
+            f"{name} 返回 OpenFOAM 致命错误：{detail}",
             ["打开对应步骤日志查看完整上下文", "检查边界名称、字段边界条件与网格 patch 是否一致"],
         )
     return (
@@ -372,6 +416,12 @@ def _execution_summary(backend: str, parallel_active: bool, requested_procs: int
         "gpu_used": False,
         "note": "OpenFOAM simpleFoam 默认使用 CPU；GPU 不会自动参与" if not parallel_active else "MPI 并行使用 CPU；GPU 不会自动参与",
     }
+
+
+def validate_compute_target(value: str) -> str:
+    if value not in {"cpu", "gpu"}:
+        raise ValueError("compute_target 必须是 cpu 或 gpu")
+    return value
 
 
 def _docker_mpi_command(count: int, program: str) -> str:
@@ -652,6 +702,10 @@ def _read_postprocessing(case_dir: Path, fields: dict | None = None) -> dict:
             errors.append(f"{path.relative_to(base)}: 数据包含非有限值")
             continue
         sample_name = next((name for token, name in (
+            ("inletleftflowrate", "inlet_left_flow_m3s"),
+            ("inletrightflowrate", "inlet_right_flow_m3s"),
+            ("inletleftpressure", "inlet_left_pressure_field"),
+            ("inletrightpressure", "inlet_right_pressure_field"),
             ("inletflowrate", "inlet_flow_m3s"), ("outletflowrate", "outlet_flow_m3s"),
             ("wallflowrate", "wall_flow_m3s"), ("inletpressure", "inlet_pressure_field"),
             ("outletpressure", "outlet_pressure_field"),
@@ -668,9 +722,42 @@ def _read_postprocessing(case_dir: Path, fields: dict | None = None) -> dict:
     if phi.get("complete") and "wall" in patch_fluxes and "wall_flow_m3s" not in values:
         values["wall_flow_m3s"] = patch_fluxes["wall"]
         selected["wall_flow_m3s"] = f"{fields['latest_time']}/phi:wall"
+    case_meta = read_json(case_dir / "case_meta.json")
+    bilateral = case_meta.get("boundary_layout") == "bilateral_local_v3"
+    if bilateral:
+        left = values.get("inlet_left_flow_m3s")
+        right = values.get("inlet_right_flow_m3s")
+        left_time = times.get("inlet_left_flow_m3s")
+        right_time = times.get("inlet_right_flow_m3s")
+        if left is not None and right is not None and left_time == right_time:
+            values["inlet_flow_m3s"] = left + right
+            times["inlet_flow_m3s"] = left_time
+            selected["inlet_flow_m3s"] = "sum(inlet_left_flow_m3s,inlet_right_flow_m3s)"
+        left_pressure = values.get("inlet_left_pressure_field")
+        right_pressure = values.get("inlet_right_pressure_field")
+        areas = case_meta.get("inlet_areas_mm2") or {}
+        left_area, right_area = areas.get("inlet_left"), areas.get("inlet_right")
+        if (
+            left_pressure is not None and right_pressure is not None
+            and times.get("inlet_left_pressure_field") == times.get("inlet_right_pressure_field")
+            and isinstance(left_area, (int, float)) and isinstance(right_area, (int, float))
+            and left_area > 0 and right_area > 0
+        ):
+            values["inlet_pressure_field"] = (
+                left_pressure * left_area + right_pressure * right_area
+            ) / (left_area + right_area)
+            times["inlet_pressure_field"] = times["inlet_left_pressure_field"]
+            selected["inlet_pressure_field"] = "area_weighted(inlet_left_pressure_field,inlet_right_pressure_field)"
     p_dimensions = fields.get("fields", {}).get("p", {}).get("dimensions")
-    pressure = pressure_metadata(p_dimensions, read_json(case_dir / "case_meta.json"))
+    pressure = pressure_metadata(p_dimensions, case_meta)
     result = {"status": "parsed", **values, "sample_times": times, "sources": selected, "errors": errors, "pressure": pressure}
+    if bilateral:
+        result["bilateral_inlet_samples_complete"] = all(
+            values.get(key) is not None for key in (
+                "inlet_left_flow_m3s", "inlet_right_flow_m3s",
+                "inlet_left_pressure_field", "inlet_right_pressure_field",
+            )
+        )
     expected_time = fields.get("latest_time")
     result["samples_current"] = expected_time is not None and all(time == float(expected_time) for time in times.values())
     for end in ("inlet", "outlet"):
@@ -683,7 +770,12 @@ def _read_postprocessing(case_dir: Path, fields: dict | None = None) -> dict:
     inlet = values.get("inlet_flow_m3s")
     outlet = values.get("outlet_flow_m3s")
     if inlet is not None and outlet is not None:
-        result["flow_direction_ok"] = inlet < 0 and outlet > 0
+        result["flow_direction_ok"] = inlet < 0 and outlet > 0 and (
+            not bilateral or (
+                values.get("inlet_left_flow_m3s", 0) < 0
+                and values.get("inlet_right_flow_m3s", 0) < 0
+            )
+        )
         wall = values.get("wall_flow_m3s")
         result["wall_flow_checked"] = wall is not None
         all_patches_checked = bool(phi.get("complete")) and set(patch_fluxes) == set(fields.get("mesh", {}).get("patch_faces", {}))
@@ -711,9 +803,11 @@ def run_case(
     timeout_s: int = 7200,
     *,
     cfd_dir_override: Path | None = None,
+    compute_target: str = "cpu",
 ) -> dict:
     """尝试运行求解；没有后端就返回 missing，不写任何结果文件。"""
     from .cases import case_dir, update_stage
+    validate_compute_target(compute_target)
 
     root = case_dir(case_id)
     cfd_dir = Path(cfd_dir_override) if cfd_dir_override is not None else root / "cfd"
@@ -755,6 +849,13 @@ def run_case(
         raise PipelineError(
             "blocked", "还没有算例文件", ["先执行 cfd-prep 生成算例"], {"stage": "cfd_prep"}
         )
+    gpu_capability = None
+    if compute_target == "gpu":
+        if backend not in (None, "docker"):
+            raise PipelineError("blocked", "GPU 求解仅支持 Docker 后端", ["改用 Docker 或选择 CPU 求解"])
+        gpu_capability = gpu_solver.probe_gpu_solver()
+        if not gpu_capability["available"]:
+            raise PipelineError("blocked", gpu_capability["reason"], ["先完成 GPU 求解镜像和合成算例验证，再重新选择 GPU"])
 
     detection = detect_backends()
     if not detection["available"]:
@@ -777,7 +878,7 @@ def run_case(
         )
         return payload
 
-    chosen = backend or detection["available"][0]
+    chosen = backend or ("docker" if compute_target == "gpu" else detection["available"][0])
     if chosen not in detection["available"]:
         raise PipelineError("blocked", f"所选 {chosen} 求解后端不可用", ["在环境页面检查所选后端"])
     (cfd_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -786,13 +887,24 @@ def run_case(
         meta = read_json(cfd_dir / "case_meta.json")
     except (OSError, ValueError) as exc:
         raise PipelineError("blocked", f"算例配置无法读取：{exc}", ["检查 cfd/case_meta.json 后重试"]) from exc
+    if chosen == "docker" and meta.get("openfoam_flavour", "org") != configured_image_flavour():
+        raise PipelineError(
+            "blocked", "算例 OpenFOAM 分支与当前 Docker 镜像不匹配",
+            ["重新生成该病例 CFD 算例后再运行求解；已确认的端面无需重新选择"],
+        )
+    if compute_target == "gpu" and meta.get("openfoam_flavour") != "esi":
+        raise PipelineError(
+            "blocked", "GPU 求解镜像与当前算例 OpenFOAM 分支不匹配",
+            ["用 OpenFOAM v2606 重新生成 CFD 算例，再选择 GPU 求解"],
+        )
     parallel_meta = meta.get("parallel", {}) if isinstance(meta.get("parallel", {}), dict) else {}
     try:
         requested_procs = openfoam_mpi_processes(parallel_meta)
     except ValueError as exc:
         raise PipelineError("blocked", str(exc), ["修正并行核数配置后重试"]) from exc
     parallel_requested = requested_procs > 1
-    if parallel_requested:
+    solver_parallel = parallel_requested and compute_target == "cpu"
+    if parallel_requested and compute_target == "cpu":
         if chosen == "native" and any(not shutil.which(tool) for tool in ("decomposePar", "mpirun", "reconstructPar")):
             raise PipelineError("blocked", "当前本机后端缺少 MPI 工具，不能按指定核数并行", ["安装 MPI 和 OpenFOAM 并行工具，或设置 OPENFOAM_MPI_PROCS=1 使用单进程"])
         _prepare_decomposition(cfd_dir, requested_procs)
@@ -804,18 +916,37 @@ def run_case(
     reuse = mesh_cache.inspect_reuse(cfd_dir, signature)
     reuse_mesh = reuse["reusable"]
     parallel_mesh = chosen == "docker" and parallel_requested
+    if compute_target == "gpu" and parallel_mesh and not reuse_mesh:
+        # GPU solves serially, but a rebuilt mesh still uses CPU MPI. Update
+        # the dictionary before archiving the previous run or decomposing.
+        _prepare_decomposition(cfd_dir, requested_procs)
     generation = (reuse.get("manifest", {}).get("generation", {}) if reuse_mesh else
                   {"mode": "parallel" if parallel_mesh else "serial", "requested_subdomains": requested_procs if parallel_mesh else 1, "run_id": run_id})
 
+    gpu_solution = gpu_solver.prepare_gpu_fv_solution(cfd_dir) if compute_target == "gpu" else None
     if chosen == "docker":
         # Pin the actual local image, so changing a tag cannot change this run.
-        image = identity.get("image_id") or configured_image()
+        image_ref = configured_image()
+        image = identity.get("image_id") or image_ref
         volume_arg = f"{cfd_dir.resolve()}:/case"
-        env_source = ". /opt/openfoam11/etc/bashrc >/dev/null 2>&1; "
+        # Keep the human-readable image reference for runtime adaptation. The
+        # pinned digest is used as the container image, but it no longer carries
+        # the vendor/path information needed to select its profile wrapper.
+        image, shell_entrypoint, env_source = _docker_command_config(image_ref, image)
+        no_fields_option = _docker_no_fields_option(image_ref)
 
         def command(inner: str, step: str) -> list[str]:
             name = f"windcatcher-{run_id}-{step}"
-            return ["docker", "run", "--rm", "--name", name, "--entrypoint", "bash", "-v", volume_arg, "-w", "/case", image, "-c", env_source + inner]
+            if step == "simpleFoam" and gpu_capability is not None:
+                return [
+                    "docker", "run", "--rm", "--name", name, "--gpus", "device=0",
+                    "--env", "FOAM_MEMORY_POOL=managed; size=1024, incr=1024",
+                    "--env", "CUDA_INJECTION64_PATH=/openfoam/libwindcatcher_gpu_kernel_count.so",
+                    "--entrypoint", "/openfoam/bash", "-v", volume_arg,
+                    "-v", f"{gpu_solution.resolve()}:/case/system/fvSolution:ro",
+                    "-w", "/case", gpu_capability["image_id"], "-c", "simpleFoam",
+                ]
+            return ["docker", "run", "--rm", "--name", name, "--entrypoint", shell_entrypoint, "-v", volume_arg, "-w", "/case", image, "-c", env_source + inner]
         def mpi(program: str) -> str:
             return _docker_mpi_command(requested_procs, program)
     elif chosen == "wsl":
@@ -831,21 +962,21 @@ def run_case(
             return f"mpirun -np {requested_procs} {program}"
 
     plan = []
-    if chosen == "docker" and parallel_requested:
+    if chosen == "docker" and parallel_requested and (compute_target == "cpu" or not reuse_mesh):
         plan.append(("mpiPreflight", _docker_mpi_preflight(requested_procs)))
     plan.append(("prepareRun", ""))
     if not reuse_mesh:
         plan.append(("blockMesh", "blockMesh"))
         if parallel_mesh:
             plan.extend([
-                ("decomposeMesh", "decomposePar -force -noFields"),
+                ("decomposeMesh", f"decomposePar -force {no_fields_option}"),
                 ("snappyHexMesh", mpi("snappyHexMesh -parallel -overwrite")),
-                ("reconstructMesh", "reconstructPar -constant -noFields -time 0"),
+                ("reconstructMesh", _reconstruct_mesh_command(image_ref)),
             ])
         else:
             plan.append(("snappyHexMesh", "snappyHexMesh -overwrite"))
     plan.append(("checkMesh", "checkMesh"))
-    if parallel_requested:
+    if solver_parallel:
         plan.extend([
             ("decomposePar", "decomposePar -force -time 0"),
             ("simpleFoam", mpi("simpleFoam -parallel")),
@@ -859,11 +990,26 @@ def run_case(
         # millions of cell values as text on Windows bind mounts.
         plan.append(("foamToVTK", "foamToVTK -latestTime -fields '(U p)' -noFunctionObjects"))
     commands = [(command(inner, name) if inner else [], name) for name, inner in plan]
-    parallel_active = parallel_requested
+    parallel_active = solver_parallel
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     run_started = time.monotonic()
     mesh_summary = {"check_status": "pending", "reason": "等待本次 checkMesh 检查"}
     execution = _execution_summary(chosen, parallel_active, requested_procs)
+    execution["compute_target"] = compute_target
+    if gpu_capability is not None:
+        execution.update({
+            "mode": "gpu-single",
+            "requested_subdomains": 1,
+            "gpu_requested": True,
+            "gpu": {
+                "device_name": gpu_capability["device_name"],
+                "image_id": gpu_capability["image_id"],
+                "architecture": gpu_capability["architecture"],
+                "verification": "synthetic-cfd-smoke-and-runtime-preflight",
+                "probe": "CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL",
+            },
+            "note": "CPU 负责网格；已验证的单 GPU 镜像仅负责 simpleFoam",
+        })
     execution["mesh"] = {
         "action": "reused" if reuse_mesh else "rebuilt", **generation,
         "status": "pending",
@@ -873,12 +1019,15 @@ def run_case(
         execution["mesh"]["source_run_id"] = generation.get("run_id") or reuse["manifest"]["check_mesh"]["run_id"]
     parallel_record = {**parallel_meta, "enabled": parallel_active,
                        "requested_subdomains": requested_procs if parallel_active else 1}
+    if gpu_capability is not None:
+        parallel_record["mesh_requested_subdomains"] = requested_procs if parallel_mesh else 1
 
     def live_status(current_step: str | None, progress: dict, solver: dict, message: str | None = None) -> dict:
         payload = {
             "status": "running",
             "run_id": run_id,
             "backend": chosen,
+            "compute_target": compute_target,
             "execution": execution,
             "parallel": parallel_record,
             "mesh": mesh_summary,
@@ -897,7 +1046,8 @@ def run_case(
 
     stage_update(
         "running",
-        message=f"已选择 {chosen} 后端，准备执行 CFD 求解" + (f"（{requested_procs} 核并行）" if parallel_active else "（单进程）"),
+        message=("已选择单 GPU 求解，准备执行 CFD" if gpu_capability is not None else
+                 f"已选择 {chosen} 后端，准备执行 CFD 求解" + (f"（{requested_procs} 核并行）" if parallel_active else "（单进程）")),
         data={"solved": False, "backend": chosen, "current_step": None, "run_id": run_id},
     )
     steps = []
@@ -982,10 +1132,48 @@ def run_case(
             execution["runtime"] = _docker_runtime_summary(out, requested_procs)
         if name == "checkMesh":
             mesh_summary = _mesh_summary(cfd_dir)
+        if name == "simpleFoam" and gpu_capability is not None:
+            # The CUPTI injection library prints a success marker only after
+            # flushing actual CONCURRENT_KERNEL device activity records.
+            # A CUDA launch API call, device visibility, or a failed solve is
+            # not sufficient to claim that the GPU solver succeeded.
+            lines = [line.strip() for line in out.splitlines()]
+            markers = [line for line in lines if line.startswith("WINDCATCHER_GPU_DEVICE_KERNELS")]
+            probe_errors = [line for line in lines if line.startswith("WINDCATCHER_GPU_PROBE_")]
+            marker = re.fullmatch(r"WINDCATCHER_GPU_DEVICE_KERNELS=([1-9][0-9]*)", markers[0]) if len(markers) == 1 else None
+            device_kernels = int(marker.group(1)) if marker is not None else None
+            result["solver_exit_code"] = code
+            execution["gpu"]["solver_exit_code"] = code
+            execution["gpu_used"] = code == 0 and device_kernels is not None and not probe_errors
+            execution["gpu"]["kernel_evidence"] = {
+                "status": "observed" if device_kernels is not None and not probe_errors else "not_observed",
+                "source": "CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL",
+                "device_kernel_count": device_kernels,
+                "marker_count": len(markers),
+                "probe_errors": probe_errors,
+                "log": "cfd/logs/simpleFoam.log",
+            }
+            if code != 0:
+                execution["note"] = f"GPU simpleFoam 求解失败，实际退出码 {code}"
+                result["validation_failure"] = "gpu_solver_failed"
+            elif probe_errors:
+                execution["note"] = "CUPTI 设备内核记录未通过完整性检查；本次 GPU 算例不能验收"
+                result["validation_failure"] = "gpu_probe_unverified"
+            elif device_kernels is None:
+                execution["note"] = "缺少唯一且有效的 CUPTI 设备内核记录；本次 GPU 算例不能验收"
+                result["validation_failure"] = "gpu_device_kernel_evidence_missing"
+            else:
+                execution["note"] = f"CUPTI 记录了 {device_kernels} 次设备内核执行"
+            if result.get("validation_failure"):
+                out += f"\n{execution['note']}\n"
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"\n{execution['note']}\n")
         step_elapsed = result.get("elapsed_seconds")
         steps.append({
             "name": name,
             "returncode": code,
+            "solver_exit_code": result.get("solver_exit_code") if name == "simpleFoam" and gpu_capability is not None else None,
+            "validation_failure": result.get("validation_failure"),
             "log": f"cfd/logs/{name}.log",
             "elapsed_seconds": step_elapsed,
             "step_elapsed_seconds": step_elapsed,
@@ -1013,8 +1201,15 @@ def run_case(
                     out += f"\n复用网格复核失败：{cache_result['reason']}\n"
                     result.update(returncode=code, output=out, error=cache_result["reason"])
                     steps[-1]["returncode"] = code
-        if code != 0 and name != "foamToVTK":  # 可视化转换失败不阻断求解状态
-            reason, remediation = _error_diagnosis(name, result, out, step_timeout)
+        if (code != 0 or result.get("validation_failure")) and name != "foamToVTK":  # 可视化转换失败不阻断求解状态
+            if result.get("validation_failure"):
+                reason = execution["note"]
+                remediation = [
+                    "打开 simpleFoam 日志和 Nsight CUDA API CSV 核对实际求解与内核启动记录",
+                    "在合成算例中复核 GPU 镜像和 Nsight 报告后重试",
+                ]
+            else:
+                reason, remediation = _error_diagnosis(name, result, out, step_timeout)
             if name in mesh_cache.MESH_STEPS:
                 execution["mesh"]["status"] = "failed"
                 execution["mesh"]["cache"] = {"status": "unavailable", "reason": reason}
@@ -1025,12 +1220,14 @@ def run_case(
                 "status": "failed",
                 "run_id": run_id,
                 "backend": chosen,
+                "compute_target": compute_target,
                 "execution": execution,
                 "parallel": parallel_record,
                 "mesh": mesh_summary,
                 "failed_step": name,
                 "current_step": name,
                 "returncode": code,
+                "validation_failure": result.get("validation_failure"),
                 "timed_out": bool(result.get("timed_out") or code == 124),
                 "cleanup": result.get("cleanup"),
                 "steps": steps,
@@ -1062,6 +1259,7 @@ def run_case(
         "status": "ran",
         "run_id": run_id,
         "backend": chosen,
+        "compute_target": compute_target,
         "execution": execution,
         "parallel": parallel_record,
         "mesh": mesh_summary,
@@ -1135,6 +1333,8 @@ def check_result_gate(case_id: str, *, cfd_dir_override: Path | None = None) -> 
     fields = inspect_latest_fields(cfd_dir)
     post = _read_postprocessing(cfd_dir, fields)
     mesh = parse_mesh_checks(cfd_dir)
+    case_meta = read_json(cfd_dir / "case_meta.json")
+    bilateral = case_meta.get("boundary_layout") == "bilateral_local_v3"
     residual_ok = residuals.get("status") == "parsed" and residuals.get("converged")
     checks.append(
         {
@@ -1150,12 +1350,13 @@ def check_result_gate(case_id: str, *, cfd_dir_override: Path | None = None) -> 
         and post.get("samples_current") and post.get("all_boundary_fluxes_checked")
         and post.get("net_mass_conservation_error_percent", math.inf) < 2.0
         and post.get("wall_leakage_percent", math.inf) < 0.1 and not post.get("errors")
+        and (not bilateral or post.get("bilateral_inlet_samples_complete"))
     )
     checks.append(
         {
             "name": "质量守恒",
             "status": "ok" if mass_ok else "pending",
-            "detail": {"inlet_outlet_error_percent": mass_error, "flow_direction_ok": post.get("flow_direction_ok"), "net_boundary_flow_m3s": post.get("net_boundary_flow_m3s"), "wall_leakage_percent": post.get("wall_leakage_percent"), "samples_current": post.get("samples_current"), "errors": post.get("errors")},
+            "detail": {"inlet_outlet_error_percent": mass_error, "flow_direction_ok": post.get("flow_direction_ok"), "net_boundary_flow_m3s": post.get("net_boundary_flow_m3s"), "wall_leakage_percent": post.get("wall_leakage_percent"), "samples_current": post.get("samples_current"), "bilateral_inlet_samples_complete": post.get("bilateral_inlet_samples_complete") if bilateral else None, "errors": post.get("errors")},
         }
     )
 
@@ -1197,6 +1398,7 @@ def check_result_gate(case_id: str, *, cfd_dir_override: Path | None = None) -> 
     eligible = numeric_ok and sensitivity_ok and review_ok
     metrics = {key: post.get(key) for key in (
         "inlet_flow_m3s", "outlet_flow_m3s", "wall_flow_m3s", "net_boundary_flow_m3s",
+        "inlet_left_flow_m3s", "inlet_right_flow_m3s",
         "mass_conservation_error_percent", "net_mass_conservation_error_percent", "wall_leakage_percent",
         "inlet_pressure_pa", "outlet_pressure_pa", "inlet_pressure_m2s2", "outlet_pressure_m2s2",
     )}

@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from pipeline import cases, mesh_cache, openfoam_runner
+from pipeline import cases, config, mesh_cache, openfoam_runner
 
 
 BACKEND = {"name": "docker", "image_id": "sha256:" + "a" * 64, "openfoam_flavour": "org"}
@@ -16,6 +16,9 @@ CHECK_OUTPUT = "points: 8\nfaces: 6\ninternal faces: 0\ncells: 1\nMesh OK.\nEnd\
 def reusable_case(tmp_path, monkeypatch):
     monkeypatch.setattr(cases, "CASES_DIR", tmp_path)
     monkeypatch.delenv("OPENFOAM_MPI_PROCS", raising=False)
+    monkeypatch.setattr(config, "detect_compute_capabilities", lambda: {
+        "parallel": {"strongest": 16, "balanced": 12, "custom_max": 24},
+    })
     monkeypatch.setattr(openfoam_runner.preview, "viewer_metadata", lambda _: {})
     monkeypatch.setattr(openfoam_runner, "detect_backends", lambda: {"available": ["docker"]})
     monkeypatch.setattr(openfoam_runner, "configured_image", lambda: "synthetic-openfoam-image")

@@ -4,13 +4,16 @@ import json
 
 import pytest
 
-from pipeline import cases, openfoam_runner
+from pipeline import cases, config, openfoam_runner
 
 
 @pytest.fixture
 def parallel_case(tmp_path, monkeypatch):
     monkeypatch.setattr(cases, "CASES_DIR", tmp_path)
     monkeypatch.delenv("OPENFOAM_MPI_PROCS", raising=False)
+    monkeypatch.setattr(config, "detect_compute_capabilities", lambda: {
+        "parallel": {"strongest": 16, "balanced": 12, "custom_max": 24},
+    })
     monkeypatch.setattr(openfoam_runner.preview, "viewer_metadata", lambda _: {})
     monkeypatch.setattr(openfoam_runner, "detect_backends", lambda: {"available": ["docker"]})
     monkeypatch.setattr(openfoam_runner, "configured_image", lambda: "test-openfoam-image")

@@ -17,6 +17,9 @@ from .errors import PipelineError
 from .volume import Volume, anterior_sign, load_volume, resolve_ap_axis
 
 
+SEGMENTATION_ALGORITHM_VERSION = "sop-threshold-connected-component-v1"
+
+
 def _structure(connectivity: int) -> np.ndarray:
     return ndimage.generate_binary_structure(3, connectivity)
 
@@ -330,6 +333,7 @@ def segment_airway(volume: Volume, params: dict | None = None) -> dict:
     ap_length_mm = round(float((posterior_plane - anterior_plane + 1) * ap_spacing), 2)
 
     result = {
+        "algorithm_version": SEGMENTATION_ALGORITHM_VERSION,
         "params": {
             "hu_low": float(p["hu_low"]),
             "hu_high": float(p["hu_high"]),
@@ -462,6 +466,7 @@ def run_segment(case_id: str, params: dict | None = None) -> dict:
             "segment/segmentation.json",
         ],
         data={
+            "algorithm_version": SEGMENTATION_ALGORITHM_VERSION,
             "volume_ml": result["metrics"]["volume_ml"],
             "ap_length_mm": result["metrics"]["ap_length_mm"],
             "hu_range": [result["params"]["hu_low"], result["params"]["hu_high"]],

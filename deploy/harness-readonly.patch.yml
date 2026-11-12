@@ -1,0 +1,42 @@
+# Overlay for the official DeepSeek Harness sdk-minimal profile.
+# Keep this list synchronized with the pinned upstream profile and verify
+# the *composed* tree before enabling any model request.
+- id: tool-fs
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: mcp-resources
+  disabled: true
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: terminal-bash
+  disabled: true
+- id: terminal-pwsh
+  disabled: true
+- id: subprocess
+  disabled: true
+- id: pty
+  disabled: true
+- id: sandbox-policy
+  config:
+    mode: read-only
+- id: llm-deepseek
+  disabled: true
+- insert:
+    - id: llm-pi-ai
+      name: '@deepseek-ai/dsh-llm-pi-ai'
+      config:
+        providers:
+          windcatcher-relay:
+            apiKeyEnv: DEEPSEEK_API_KEY
+            api: openai-completions
+            baseURL: https://tongyimohe.aitoken.credit/v1
+            defaultContextWindow: 32768
+            defaultMaxTokens: 800
+            compat:
+              maxTokensField: max_completion_tokens
+            models:
+              - id: gpt-6.1-sol
+                name: gpt-6.1-sol

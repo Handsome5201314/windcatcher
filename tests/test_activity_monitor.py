@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib
 import json
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Event
 
 import pytest
 
@@ -16,6 +18,7 @@ from pipeline import activity_monitor as monitor
 @pytest.fixture(autouse=True)
 def isolated_monitor(tmp_path, monkeypatch):
     monkeypatch.setenv(monitor.DIRECTORY_ENV, str(tmp_path / "monitor"))
+    monkeypatch.setenv("WINDCATCHER_MULTIUSER", "0")
     return tmp_path / "monitor"
 
 
@@ -32,11 +35,14 @@ def test_persistence_server_timestamp_and_status(isolated_monitor):
     assert entry["id"] == event_id == 1
     assert entry["timestamp"].endswith("Z")
     assert entry["timestamp"] != "forged"
-    assert reloaded.get_status() == {
+    status = reloaded.get_status()
+    assert {key: status[key] for key in ("status", "total_events", "last_event_at", "last_event_id",
+        "retention_days", "max_events", "database_path")} == {
         "status": "recording", "total_events": 1, "last_event_at": entry["timestamp"],
         "last_event_id": event_id,
-        "retention_days": 14, "max_events": 50_000, "database_path": ".local-monitor/activity.sqlite3",
+        "retention_days": None, "max_events": None, "database_path": ".local-monitor/activity.sqlite3",
     }
+    assert status["schema_version"] == 1 and status["app_version"]
     assert (isolated_monitor / "activity.sqlite3").is_file()
 
 
@@ -108,15 +114,84 @@ def test_context_values_are_sanitized():
     assert event["session_id"] is event["request_id"] is None
 
 
-def test_retention_prunes_on_read_and_keeps_boundary(monkeypatch):
+def test_events_remain_available_without_automatic_retention(monkeypatch):
     now = datetime(2026, 10, 9, tzinfo=timezone.utc)
     monkeypatch.setattr(monitor, "_now", lambda: now - timedelta(days=14, seconds=1))
     expired = monitor.record_event(_event())
     monkeypatch.setattr(monitor, "_now", lambda: now - timedelta(days=14))
     boundary = monitor.record_event(_event())
     monkeypatch.setattr(monitor, "_now", lambda: now)
-    assert monitor.get_status()["total_events"] == 1
-    assert [entry["id"] for entry in monitor.query_events(after=expired)["events"]] == [boundary]
+    assert monitor.get_status()["total_events"] == 2
+    assert [entry["id"] for entry in monitor.query_events(after=0)["events"]] == [expired, boundary]
+
+
+def test_multiuser_prunes_only_older_than_180_days_on_status_and_query(monkeypatch):
+    monkeypatch.setenv("WINDCATCHER_MULTIUSER", "1")
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    monkeypatch.setattr(monitor, "_now", lambda: now - timedelta(days=180, seconds=1))
+    expired = monitor.record_event(_event())
+    monkeypatch.setattr(monitor, "_now", lambda: now - timedelta(days=180))
+    boundary = monitor.record_event(_event())
+    monkeypatch.setattr(monitor, "_now", lambda: now - timedelta(days=179))
+    recent = monitor.record_event(_event())
+    monkeypatch.setattr(monitor, "_now", lambda: now)
+
+    status = monitor.get_status()
+    assert status["retention_days"] == 180
+    assert status["total_events"] == 2
+    assert [entry["id"] for entry in monitor.query_events()["events"]] == [boundary, recent]
+    assert expired < boundary < recent
+
+
+def test_multiuser_query_prunes_even_without_status_poll(monkeypatch):
+    monkeypatch.setenv("WINDCATCHER_MULTIUSER", "1")
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    monkeypatch.setattr(monitor, "_now", lambda: now - timedelta(days=181))
+    monitor.record_event(_event())
+    monkeypatch.setattr(monitor, "_now", lambda: now)
+    assert monitor.query_events()["events"] == []
+    assert monitor.get_status()["total_events"] == 0
+
+
+def test_idle_cleanup_prunes_expired_personal_events_and_checkpoints_wal(monkeypatch, isolated_monitor):
+    monkeypatch.setenv("WINDCATCHER_MULTIUSER", "1")
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    monkeypatch.setattr(monitor, "_now", lambda: now - timedelta(days=181))
+    monitor.record_event(_event(target="expired_sentinel"))
+    monkeypatch.setattr(monitor, "_now", lambda: now - timedelta(days=180))
+    boundary = monitor.record_event(_event(target="boundary_sentinel"))
+    monkeypatch.setattr(monitor, "_now", lambda: now)
+
+    assert monitor.prune_expired_events() == 1
+    database = isolated_monitor / "activity.sqlite3"
+    for path in (database, database.with_name(database.name + "-wal")):
+        if path.exists():
+            assert b"expired_sentinel" not in path.read_bytes()
+    assert [event["id"] for event in monitor.query_events()["events"]] == [boundary]
+    assert monitor.get_status()["retention_days"] == 180
+    assert monitor.get_status()["status"] == "recording"
+
+
+def test_idle_cleanup_is_disabled_for_shared_mode(isolated_monitor):
+    assert monitor.prune_expired_events() == 0
+    assert not (isolated_monitor / "activity.sqlite3").exists()
+
+
+def test_retention_checkpoint_failure_is_visible_until_retry(monkeypatch):
+    monkeypatch.setenv("WINDCATCHER_MULTIUSER", "1")
+    original = monitor._prune
+
+    def fail(*_args):
+        raise sqlite3.OperationalError("test failure")
+
+    monkeypatch.setattr(monitor, "_prune", fail)
+    with pytest.raises(sqlite3.OperationalError):
+        monitor.prune_expired_events()
+    monkeypatch.setattr(monitor, "_prune", original)
+    assert monitor.get_status()["retention_error_type"] == "OperationalError"
+    assert monitor.get_status()["status"] == "unavailable"
+    assert monitor.prune_expired_events() == 0
+    assert "retention_error_type" not in monitor.get_status()
 
 
 def test_maximum_events_retains_latest_and_ids_remain_monotonic(monkeypatch):
@@ -188,7 +263,7 @@ def test_client_operation_time_does_not_control_retention(monkeypatch):
     assert events[2]["details"] == {}
     assert monitor.get_status()["total_events"] == 3
     monkeypatch.setattr(monitor, "_now", lambda: now + timedelta(days=14, seconds=1))
-    assert monitor.get_status()["total_events"] == 0
+    assert monitor.get_status()["total_events"] == 3
 
 
 @pytest.mark.parametrize("filters", [{"after": -1}, {"limit": 0}, {"limit": 501}, {"kind": "private"}, {"case_id": "patient-name"}, {"session_id": "../../private"}, {"errors_only": "true"}, {"latest": "true"}])
@@ -214,6 +289,32 @@ def test_concurrent_writes_and_reads_have_no_missing_or_duplicate_events():
     assert len(written) == len(set(written)) == len(entries) == 120
     assert [entry["id"] for entry in entries] == sorted(written)
     assert monitor.get_status()["total_events"] == 120
+
+
+def test_first_open_waits_for_another_connections_initialization_lock(isolated_monitor):
+    """A short startup lock must not drop the first activity event."""
+    isolated_monitor.mkdir()
+    path = isolated_monitor / "activity.sqlite3"
+    blocker = sqlite3.connect(path)
+    blocker.execute("CREATE TABLE startup_guard (id INTEGER)")
+    blocker.commit()
+    blocker.execute("BEGIN EXCLUSIVE")
+    started = Event()
+
+    def write():
+        started.set()
+        return monitor.record_event(_event())
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(write)
+            assert started.wait(timeout=2)
+            time.sleep(0.8)  # Longer than the former 500 ms busy timeout.
+            blocker.rollback()
+            assert future.result(timeout=5) == 1
+    finally:
+        blocker.close()
+    assert monitor.get_status()["total_events"] == 1
 
 
 def test_database_io_failure_propagates(isolated_monitor):

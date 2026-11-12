@@ -49,10 +49,23 @@ def case_dir(case_id: str) -> Path:
 def create_case(source_type: str, source_path: str, synthetic: bool = False) -> str:
     """新建病例，返回 case_id，并建立产物子目录。"""
     ensure_dirs()
-    case_id = _new_case_id()
-    root = case_dir(case_id)
-    for sub in ("import", "anonymized", "volume", "segment", "surface", "cfd", "report", "preview"):
-        (root / sub).mkdir(parents=True, exist_ok=True)
+    # The ID has only four random hex digits. Reserve the directory atomically:
+    # reusing an existing directory would overwrite another operator's case.
+    for _ in range(32):
+        case_id = _new_case_id()
+        root = case_dir(case_id)
+        # A partially deleted case has no directory but still owns its ID.
+        # Never reuse that ID while its deletion marker is awaiting cleanup.
+        marker = _deletion_marker(case_id)
+        if marker.exists() or marker.is_symlink():
+            continue
+        try:
+            root.mkdir(exist_ok=False)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise PipelineError("failed", "无法分配唯一病例编号", ["请稍后重试创建病例"])
 
     data = {
         "case_id": case_id,
@@ -74,7 +87,13 @@ def create_case(source_type: str, source_path: str, synthetic: bool = False) -> 
     data["stages"]["import"]["status"] = "ok"
     data["stages"]["import"]["message"] = f"已登记输入来源：{source_type}"
     data["stages"]["import"]["updated_at"] = _now()
-    _write_case(case_id, data)
+    try:
+        for sub in ("import", "anonymized", "volume", "segment", "surface", "cfd", "report", "preview"):
+            (root / sub).mkdir()
+        _write_case(case_id, data)
+    except Exception:
+        shutil.rmtree(root)
+        raise
     _record_activity("lifecycle", "case_created", case_id)
     return case_id
 
@@ -236,6 +255,9 @@ def list_cases() -> list[dict]:
     ensure_dirs()
     out = []
     for path in sorted(CASES_DIR.glob("*/case.json")):
+        marker = CASES_DIR / f".windcatcher-deleting-{path.parent.name}.json"
+        if path.parent.name.startswith(".") or marker.exists() or marker.is_symlink():
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -261,10 +283,10 @@ def list_cases() -> list[dict]:
     return out
 
 
-def delete_case(case_id: str) -> None:
-    """删除一个已经停止处理的本地病例及其全部产物。
+def check_case_deletable(case_id: str) -> Path:
+    """预检本地病例是否已停止处理且位于允许删除的目录。
 
-    删除边界固定在 ``cases/<case_id>``，并拒绝删除仍有后台阶段运行的病例。
+    只返回经核验的 ``cases/<case_id>`` 路径，不执行删除。
     """
     root = case_dir(case_id)
     try:
@@ -272,6 +294,9 @@ def delete_case(case_id: str) -> None:
     except PipelineError:
         raise
 
+    from .segmentation_model_jobs import case_busy
+    if case_busy(case_id):
+        raise PipelineError('blocked', 'AI 分割候选正在处理，请先取消任务', ['等待候选完成或取消后再删除病例'])
     job = case.get("job") or {}
     running = job.get("status") == "running" or any(
         entry.get("status") == "running" for entry in case.get("stages", {}).values()
@@ -294,10 +319,78 @@ def delete_case(case_id: str) -> None:
     if not (resolved / CASE_FILE).is_file():
         raise PipelineError("failed", f"病例不存在：{case_id}", ["刷新病例列表后重试"])
 
+    return resolved
+
+
+def _deletion_marker(case_id: str) -> Path:
+    return CASES_DIR / f".windcatcher-deleting-{case_dir(case_id).name}.json"
+
+
+def _read_deletion_marker(case_id: str) -> dict | None:
+    marker = _deletion_marker(case_id)
+    if marker.is_symlink():
+        raise PipelineError("failed", "病例删除标记无效", ["联系管理员检查病例存储"])
+    if not marker.exists():
+        return None
     try:
-        shutil.rmtree(resolved)
-    except OSError as exc:
-        raise PipelineError("failed", f"删除病例失败：{exc}", ["确认风见没有正在读取该病例，再重试"]) from exc
+        data = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else None
+    except (OSError, UnicodeError, ValueError):
+        data = None
+    if (not isinstance(data, dict) or data.get("case_id") != case_id
+            or not (data.get("owner_id") is None or isinstance(data.get("owner_id"), str))):
+        raise PipelineError("failed", "病例删除标记损坏", ["联系管理员检查病例存储"])
+    return data
+
+
+def deletion_pending(case_id: str) -> bool:
+    """A marker permits retry after a partial file delete or identity failure."""
+    return _read_deletion_marker(case_id) is not None
+
+
+def deletion_owner(case_id: str) -> str | None:
+    marker = _read_deletion_marker(case_id)
+    return marker["owner_id"] if marker is not None else None
+
+
+def begin_case_deletion(case_id: str, owner_id: str | None = None) -> None:
+    """Atomically mark an authorized, idle case before revoking public views."""
+    marker_data = _read_deletion_marker(case_id)
+    if marker_data is not None:
+        if marker_data["owner_id"] != owner_id:
+            raise PipelineError("failed", "病例删除由另一位所有者启动", ["由原所有者继续删除"])
+        return
+    check_case_deletable(case_id)
+    marker = _deletion_marker(case_id)
+    temporary = marker.with_name(marker.name + f".{secrets.token_hex(4)}.tmp")
+    try:
+        temporary.write_text(json.dumps({"case_id": case_id, "owner_id": owner_id}), encoding="utf-8")
+        temporary.replace(marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def finish_case_deletion(case_id: str) -> None:
+    marker = _deletion_marker(case_id)
+    if deletion_pending(case_id):
+        marker.unlink()
+
+
+def delete_case(case_id: str, *, keep_marker: bool = False, owner_id: str | None = None) -> None:
+    """Delete a case after its durable marker; retain it until ACL retirement."""
+    begin_case_deletion(case_id, owner_id)
+    root = case_dir(case_id)
+    if root.is_symlink():
+        raise PipelineError("failed", "病例目录不在本地病例存储范围内", ["联系管理员检查病例存储"])
+    if root.exists():
+        resolved = root.resolve(strict=True)
+        if resolved.parent != CASES_DIR.resolve() or not resolved.is_dir():
+            raise PipelineError("failed", "病例目录不在本地病例存储范围内", ["联系管理员检查病例存储"])
+        try:
+            shutil.rmtree(resolved)
+        except OSError as exc:
+            raise PipelineError("failed", f"删除病例失败：{exc}", ["确认风见没有正在读取该病例，再重试"]) from exc
+    if not keep_marker:
+        finish_case_deletion(case_id)
 
 
 def artifact_path(case_id: str, rel: str) -> Path:
@@ -305,7 +398,9 @@ def artifact_path(case_id: str, rel: str) -> Path:
     root = case_dir(case_id).resolve()
     target = (root / rel).resolve()
     try:
-        target.relative_to(root)
+        relative = target.relative_to(root)
     except ValueError:
         raise PipelineError("failed", "请求的文件不在该病例目录内", ["检查相对路径是否正确"])
+    if relative.parts and relative.parts[0].lower() == 'learning':
+        raise PipelineError('blocked', '学习快照不通过通用产物接口下载', ['使用学习摘要接口'])
     return target

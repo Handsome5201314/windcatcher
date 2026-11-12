@@ -17,6 +17,7 @@ from scipy import ndimage
 from .cases import case_dir, get_case, invalidate_downstream, update_stage
 from .errors import PipelineError
 from .volume import anterior_sign, load_volume
+from .segmentation_learning import case_operation, mask_transaction
 
 CORRECTED_MASK_REL = "review/airway_corrected_mask.nrrd"
 EDIT_VIEW_AXES = {"axial": 0, "coronal": 1, "sagittal": 2}
@@ -31,6 +32,14 @@ MAX_EDIT_RADIUS = 64
 EXTERNAL_AIR_BODY_HU = -300.0
 EXTERNAL_AIR_CLOSURE_MM = 3.0
 EXTERNAL_AIR_MIN_RETAINED_VOXELS = 5_000
+# Technical stop limits for existing candidate voxels near the anterior
+# opening. These are not anatomical acceptance criteria.
+NOSTRIL_CANDIDATE_MAX_AP_MM = 25.0
+NOSTRIL_CANDIDATE_MAX_OTHER_MM = 20.0
+NOSTRIL_CANDIDATE_MAX_VOLUME_MM3 = 1000.0
+NOSTRIL_CANDIDATE_MIN_VOXELS = 50
+NOSTRIL_CANDIDATE_MAX_FRONT_OVERHANG_MM = 5.0
+NOSTRIL_CANDIDATE_MAX_POSTERIOR_FRACTION = 0.30
 
 # ``mask.npy`` 是主鼻腔范围，``candidate_mask.npy`` 是完整候选范围。
 # 浏览器复核同时作用于两者，避免用户在 CT 里看到的是一个范围、
@@ -39,6 +48,7 @@ MAIN_MASK_BACKUP_NAME = "mask_candidate.npy"
 FULL_MASK_BACKUP_NAME = "candidate_mask_original.npy"
 PRE_CLEAN_MAIN_MASK_NAME = "mask_before_external_air.npy"
 PRE_CLEAN_FULL_MASK_NAME = "candidate_before_external_air.npy"
+AI_DRAFT_DIR = "ai_candidate_drafts"
 
 
 def external_air_cleanup_pending(segmentation: dict) -> bool:
@@ -268,6 +278,14 @@ def _disk_structure(radius: int) -> np.ndarray:
     return (xx * xx + yy * yy) <= radius * radius
 
 
+def _body_envelope_slice(body: np.ndarray, structure: np.ndarray) -> np.ndarray:
+    closed = ndimage.binary_closing(body, structure=structure)
+    # Zero padding can erode observed tissue at a cropped image edge and
+    # open an enclosed lumen. Preserve that tissue for both cleanup and
+    # confirmation so the two operations use the same body envelope.
+    return ndimage.binary_fill_holes(closed | body)
+
+
 def _body_envelope(
     hu: np.ndarray,
     spacing: tuple[float, float, float],
@@ -292,9 +310,84 @@ def _body_envelope(
     body = np.asarray(hu > float(body_hu), dtype=bool)
     envelope = np.empty(body.shape, dtype=bool)
     for index in range(body.shape[0]):
-        closed = ndimage.binary_closing(body[index], structure=structure)
-        envelope[index] = ndimage.binary_fill_holes(closed)
+        envelope[index] = _body_envelope_slice(body[index], structure)
     return envelope, radius
+
+
+def _anterior_opening_candidates(
+    mask: np.ndarray,
+    envelope: np.ndarray,
+    spacing: tuple[float, float, float],
+    ap_axis: int,
+    anterior_axis_sign: float,
+) -> tuple[np.ndarray, dict]:
+    """Retain bounded existing air candidates next to the anterior opening.
+
+    A 2D body envelope may end inside an open nostril. This only preserves
+    input voxels; it does not establish anatomy or authorize a CFD boundary.
+    Detached, posterior, large, and image-edge exterior regions are excluded.
+    """
+    source = np.asarray(mask, dtype=bool)
+    inside = source & envelope
+    outside = source & ~envelope
+    protected = np.zeros_like(source)
+    if not inside.any() or not outside.any():
+        return protected, {"candidate_components": 0, "preserved_components": 0, "preserved_voxels": 0}
+    outside_voxels = int(outside.sum())
+    inside_voxels = int(inside.sum())
+    # Raw threshold masks can contain millions of exterior voxels. They are
+    # not local opening candidates; do not label that entire outside volume.
+    if outside_voxels > max(20_000, int(0.20 * inside_voxels)):
+        return protected, {
+            "candidate_components": None, "preserved_components": 0,
+            "preserved_voxels": 0, "status": "exterior_dominated_not_preserved",
+        }
+
+    ap_occupied = np.flatnonzero(np.any(inside, axis=tuple(axis for axis in range(3) if axis != ap_axis)))
+    front = int(ap_occupied[-1] if anterior_axis_sign > 0 else ap_occupied[0])
+    span_mm = float((ap_occupied[-1] - ap_occupied[0] + 1) * spacing[ap_axis])
+    labels, count = ndimage.label(outside, structure=ndimage.generate_binary_structure(3, 1))
+    contact = ndimage.binary_dilation(inside, structure=ndimage.generate_binary_structure(3, 1)) & outside
+    qualifying = []
+    for label, bounds in enumerate(ndimage.find_objects(labels), start=1):
+        if bounds is None or any(part.start == 0 or part.stop == source.shape[axis] for axis, part in enumerate(bounds)):
+            continue
+        component = labels[bounds] == label
+        voxels = int(component.sum())
+        if not (NOSTRIL_CANDIDATE_MIN_VOXELS <= voxels
+                and voxels * float(np.prod(spacing)) <= NOSTRIL_CANDIDATE_MAX_VOLUME_MM3):
+            continue
+        if not np.any(component & contact[bounds]):
+            continue
+        extents_mm = [(part.stop - part.start) * float(spacing[axis]) for axis, part in enumerate(bounds)]
+        if extents_mm[ap_axis] > NOSTRIL_CANDIDATE_MAX_AP_MM or any(
+            extent > NOSTRIL_CANDIDATE_MAX_OTHER_MM
+            for axis, extent in enumerate(extents_mm) if axis != ap_axis
+        ):
+            continue
+        front_of_component = bounds[ap_axis].stop - 1 if anterior_axis_sign > 0 else bounds[ap_axis].start
+        rear_of_component = bounds[ap_axis].start if anterior_axis_sign > 0 else bounds[ap_axis].stop - 1
+        overhang_mm = max(0.0, (front_of_component - front) * anterior_axis_sign * spacing[ap_axis])
+        posterior_mm = max(0.0, (front - rear_of_component) * anterior_axis_sign * spacing[ap_axis])
+        if (overhang_mm > NOSTRIL_CANDIDATE_MAX_FRONT_OVERHANG_MM
+                or posterior_mm > NOSTRIL_CANDIDATE_MAX_POSTERIOR_FRACTION * span_mm):
+            continue
+        qualifying.append((bounds, component))
+
+    if len(qualifying) > 2:
+        raise PipelineError(
+            "blocked", "鼻孔附近有超过两个包络外候选支段，无法自动判定保留范围",
+            ["进入专家流程检查原始 CT 与候选掩膜；本次不修改病例"],
+            {"anterior_candidate_components": len(qualifying)},
+        )
+    for bounds, component in qualifying:
+        protected[bounds] |= component
+    return protected, {
+        "candidate_components": int(count),
+        "preserved_components": len(qualifying),
+        "preserved_voxels": int(protected.sum()),
+        "status": "near_nostril_review_required" if qualifying else "none",
+    }
 
 
 def _remove_external_air_array(
@@ -305,12 +398,14 @@ def _remove_external_air_array(
     *,
     body_hu: float = EXTERNAL_AIR_BODY_HU,
     closure_mm: float = EXTERNAL_AIR_CLOSURE_MM,
+    anterior_axis_sign: float = -1.0,
 ) -> tuple[np.ndarray, dict]:
     """从候选掩膜中移除体外空气，并返回可审计统计信息。
 
     体外空气不能只靠边界连通域删除，因为鼻腔本身通过鼻孔/鼻咽与
-    体数据边界相连。这里先限制到 CT 身体包络，再裁掉非前后轴最外层
-    的边界体素；包络内的连通组件全部保留，交给后续人工复核和精修。
+    体数据边界相连。先取 CT 身体包络；仅对有界、与内部相接的前端
+    原候选支段作待核对保留，再裁掉非前后轴最外层边界体素。
+    保留候选不等于鼻孔解剖确认，仍须后续复核和精确端面验证。
     身体包络 HU 阈值应等于当前气道候选的上限，避免皮肤部分容积伪影
     被双方同时选中。
     若没有足够的内部体素可保留，函数会抛出 ``blocked``，调用方不会
@@ -332,10 +427,14 @@ def _remove_external_air_array(
         raise PipelineError("blocked", "当前候选掩膜为空，无法自动去除体外空气", ["先完成气道分割"])
 
     envelope, radius = _body_envelope(hu, spacing, body_hu, closure_mm)
-    inside = mask & envelope
+    opening_candidate, opening_detail = _anterior_opening_candidates(
+        mask, envelope, spacing, ap_axis, anterior_axis_sign
+    )
+    inside_envelope = mask & envelope
+    inside = inside_envelope | opening_candidate
     outside_voxels = int((mask & ~envelope).sum())
 
-    # 统计包络内连通域，但不要按边界删除整个组件：鼻腔主腔与开口相连，
+    # 统计清理后候选连通域，但不要按边界删除整个组件：鼻腔主腔与开口相连，
     # 这样做会把真正需要保留的主气道一起删掉。
     labels, components = ndimage.label(inside, structure=np.ones((3, 3, 3), dtype=bool))
     touching_non_ap = np.zeros(int(components) + 1, dtype=bool)
@@ -365,15 +464,16 @@ def _remove_external_air_array(
     retained_voxels = int(retained.sum())
 
     detail = {
-        "method": "ct_body_envelope_then_non_ap_boundary_components",
+        "method": "ct_body_envelope_with_anterior_candidate_collar_then_non_ap_boundary_components",
         "body_hu_threshold": float(body_hu),
         "closure_radius_mm": float(closure_mm),
         "closure_radius_pixels": int(radius),
         "candidate_voxels": original_voxels,
         "body_envelope_voxels": int(envelope.sum()),
-        "inside_envelope_voxels": int(inside.sum()),
+        "inside_envelope_voxels": int(inside_envelope.sum()),
         "outside_envelope_voxels": outside_voxels,
-        "components_inside_envelope": int(components),
+        "anterior_opening_candidate": opening_detail,
+        "components_after_candidate_preservation": int(components),
         "components_touching_non_ap_boundary": int(np.count_nonzero(touching_non_ap)),
         "components_removed_at_non_ap_boundary": 0,
         "boundary_voxels_trimmed": int(boundary_trimmed.sum()),
@@ -411,18 +511,24 @@ def _outside_body_envelope_counts(
     hu: np.ndarray,
     spacing: tuple[float, float, float],
     body_hu: float,
+    *,
+    allowed_outside: np.ndarray | None = None,
 ) -> tuple[int, int]:
-    """确认前逐层检查两个掩膜是否仍落在目标体内包络之外。"""
+    """Count exterior voxels other than the backed-up anterior candidates."""
     if mask.shape != candidate.shape or mask.shape != hu.shape:
         raise PipelineError("failed", "掩膜与 CT 尺寸不一致，无法检查体外空气", ["重新导入或重新分割该病例"])
+    if allowed_outside is not None and allowed_outside.shape != mask.shape:
+        raise PipelineError("failed", "鼻孔候选保护范围与掩膜尺寸不一致", ["重新执行体外空气清理"])
     radius = max(1, int(np.ceil(EXTERNAL_AIR_CLOSURE_MM / min(float(spacing[1]), float(spacing[2])))))
     structure = _disk_structure(radius)
     main_outside = 0
     candidate_outside = 0
     for index in range(mask.shape[0]):
         body = hu[index] > body_hu
-        envelope = ndimage.binary_fill_holes(ndimage.binary_closing(body, structure=structure))
+        envelope = _body_envelope_slice(body, structure)
         outside = ~envelope
+        if allowed_outside is not None:
+            outside &= ~allowed_outside[index]
         main_outside += int(np.count_nonzero(mask[index] & outside))
         candidate_outside += int(np.count_nonzero(candidate[index] & outside))
     return main_outside, candidate_outside
@@ -547,6 +653,7 @@ def _replace_mask_and_record(
         segmentation_backup.unlink(missing_ok=True)
 
 
+@mask_transaction
 def _replace_masks_and_record(
     mask_path: Path,
     mask_temp: Path,
@@ -557,11 +664,13 @@ def _replace_masks_and_record(
 ) -> None:
     """原子替换主气道、完整候选和登记文件。"""
     token = secrets.token_hex(6)
+    from .segmentation_learning import prepare_change
+    learning_pair = prepare_change(mask_path, mask_temp, segmentation_path, segmentation_temp)
     paths = (
         (mask_path, mask_temp),
         (candidate_path, candidate_temp),
         (segmentation_path, segmentation_temp),
-    )
+    ) + ((learning_pair,) if learning_pair is not None else ())
     backups: list[tuple[Path, Path, bool]] = []
     installed: list[Path] = []
     try:
@@ -726,6 +835,148 @@ def _commit_mask_change(
         raise
 
 
+def _write_ai_draft_snapshot(
+    root: Path,
+    snapshot_dir: Path,
+    mask: np.ndarray,
+    candidate: np.ndarray,
+    segmentation: dict,
+) -> None:
+    """保存采用 AI 候选前的状态，确保草稿可追溯且不丢失旧结果。"""
+    if snapshot_dir.is_symlink() or not snapshot_dir.resolve().is_relative_to((root / "review").resolve()):
+        raise PipelineError("failed", "AI 草稿快照目录无效", ["刷新病例后重试"])
+    snapshot_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        _atomic_save_npy(snapshot_dir / "previous_mask.npy", mask)
+        _atomic_save_npy(snapshot_dir / "previous_candidate.npy", candidate)
+        temp = snapshot_dir / "previous_segmentation.json.tmp"
+        temp.write_text(json.dumps(segmentation, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(snapshot_dir / "previous_segmentation.json")
+    except Exception:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        raise
+
+
+@case_operation
+def adopt_ai_candidate_draft(
+    case_id: str,
+    candidate: np.ndarray,
+    *,
+    run_id: str,
+    model_id: str,
+    source_mask_version: int,
+) -> dict:
+    """把已完成的模型候选放入待人工复核草稿，不确认也不放行下游。"""
+    root = case_dir(case_id)
+    geometry = _read_volume_geometry(case_id)
+    expected_shape = tuple(int(value) for value in geometry["shape"])
+    candidate = np.asarray(candidate)
+    if candidate.ndim != 3 or tuple(candidate.shape) != expected_shape:
+        raise PipelineError("failed", "AI 候选尺寸与当前 CT 不一致", ["重新生成当前病例的 AI 候选"])
+    if not np.isfinite(candidate).all() or np.any(candidate < 0):
+        raise PipelineError("failed", "AI 候选包含无效体素", ["重新生成当前病例的 AI 候选"])
+    candidate = (candidate > 0).astype(np.uint8)
+    if not candidate.any():
+        raise PipelineError("blocked", "AI 候选为空，不能作为待复核草稿", ["保留当前结果并重新生成候选"])
+
+    seg_path, segmentation = _load_segmentation(case_id)
+    current_version = segmentation.get("mask_version")
+    if type(current_version) is not int or current_version != source_mask_version:
+        raise PipelineError("blocked", "当前正式掩膜已变化，不能采用过期 AI 候选", ["刷新病例并重新生成候选"])
+    existing = segmentation.get("ai_candidate_draft")
+    if isinstance(existing, dict) and existing.get("status") == "pending_review":
+        if existing.get("run_id") == run_id:
+            return {
+                "status": "drafted",
+                "already_applied": True,
+                "message": "该 AI 候选已经是当前待复核草稿",
+                "mask_version": current_version,
+                "draft_run_id": run_id,
+                "need_human_confirm": True,
+            }
+        raise PipelineError("blocked", "已有 AI 候选草稿等待复核", ["先完成当前草稿的 CT 复核后再切换候选"])
+
+    mask, current_candidate = _current_masks(root, expected_shape)
+    _ensure_edit_backups(root, mask, current_candidate)
+    snapshot_dir = root / "review" / AI_DRAFT_DIR / run_id
+    if snapshot_dir.exists() or snapshot_dir.is_symlink():
+        raise PipelineError("blocked", "该 AI 候选的草稿快照已存在，请刷新病例", ["不要重复提交同一候选"])
+    _write_ai_draft_snapshot(root, snapshot_dir, mask, current_candidate, segmentation)
+
+    ap_axis = int(segmentation.get("params", {}).get("ap_axis", 1))
+    flags = _review_flags(candidate, ap_axis)
+    spacing = tuple(float(value) for value in geometry["spacing_mm"])
+    metrics = _mask_metrics(candidate, spacing, ap_axis)
+    coords = np.where(candidate)
+    params = dict(segmentation.get("params") or {})
+    params["anterior_plane"] = int(coords[ap_axis].min())
+    params["posterior_plane"] = int(coords[ap_axis].max())
+    next_version = current_version + 1
+    segmentation["params"] = params
+    segmentation["mask_version"] = next_version
+    segmentation["mask_source"] = "ai_model_candidate_draft"
+    segmentation["candidate_source"] = "ai_model_candidate_draft"
+    segmentation["candidate_mask_available"] = True
+    segmentation["need_human_confirm"] = True
+    segmentation["metrics"] = metrics
+    segmentation["candidate_metrics"] = metrics
+    segmentation["review_flags"] = flags
+    segmentation["candidate_review_flags"] = flags
+    segmentation["candidate_cleaning"] = {
+        "status": "manual_review_required",
+        "source": "ai_model_candidate_draft",
+        "run_id": run_id,
+    }
+    segmentation["candidate_external_air_cleanup"] = None
+    segmentation.pop("external_air_validation", None)
+    segmentation.pop("external_air_undo", None)
+    segmentation["ai_candidate_draft"] = {
+        "status": "pending_review",
+        "run_id": run_id,
+        "model_id": model_id,
+        "source_mask_version": source_mask_version,
+        "draft_mask_version": next_version,
+        "snapshot_dir": str(snapshot_dir.relative_to(root)).replace("\\", "/"),
+        "created_at": _now(),
+    }
+    segmentation["human_review"] = {
+        **segmentation.get("human_review", {}),
+        "status": "AI 候选已转为待复核草稿",
+        "method": "AI 分割候选 + 风见三平面 CT 复核",
+        "source": run_id,
+        "drafted_at": _now(),
+    }
+    _commit_mask_change(case_id, candidate, segmentation, candidate)
+    invalidate_downstream(case_id, "AI 候选已转为待复核草稿，需人工确认后重新生成下游产物")
+    update_stage(
+        case_id,
+        "segment",
+        "warn",
+        message="AI 候选已转为待复核草稿；请逐层检查鼻孔、鼻咽和体外空气",
+        artifacts=["segment/mask.npy", "segment/candidate_mask.npy", "segment/segmentation.json", str(snapshot_dir.relative_to(root)).replace("\\", "/")],
+        data={
+            "volume_ml": metrics["volume_ml"],
+            "ap_length_mm": metrics["ap_length_mm"],
+            "need_human_confirm": True,
+            "external_air_suspected": flags["external_air_suspected"],
+            "candidate_external_air_suspected": flags["external_air_suspected"],
+            "mask_source": "ai_model_candidate_draft",
+            "mask_version": next_version,
+            "candidate_mask_available": True,
+            "ai_candidate_draft": segmentation["ai_candidate_draft"],
+        },
+    )
+    return {
+        "status": "drafted",
+        "message": "AI 候选已转为待复核草稿；正式气道仍未确认，不能生成 STL 或 CFD",
+        "mask_version": next_version,
+        "draft_run_id": run_id,
+        "need_human_confirm": True,
+        "review_flags": flags,
+        "metrics": metrics,
+    }
+
+
 def _mask_change_result(case_id: str, segmentation: dict, message: str, action: str) -> dict:
     root = case_dir(case_id)
     ap_axis = int(segmentation.get("params", {}).get("ap_axis", 1))
@@ -850,6 +1101,7 @@ def auto_remove_external_air(case_id: str) -> dict:
         spacing,
         ap_axis,
         body_hu=body_hu,
+        anterior_axis_sign=anterior_sign(volume.meta, ap_axis),
     )
     cleaned_candidate_bool = cleaned_candidate.astype(bool)
     if candidate_cleanup["removed_voxels"] == 0 and not external_air_cleanup_pending(segmentation):
@@ -934,7 +1186,7 @@ def auto_remove_external_air(case_id: str) -> dict:
     segmentation["human_review"] = {
         **segmentation.get("human_review", {}),
         "status": "已自动去除可识别体外空气，待人工复核",
-        "method": "CT 体内包络 + 非前后轴边界残留清理",
+        "method": "CT 体内包络 + 鼻孔附近候选保留 + 非前后轴边界残留清理",
         "last_action": "remove_external_air",
         "edited_at": _now(),
     }
@@ -951,8 +1203,10 @@ def auto_remove_external_air(case_id: str) -> dict:
     _commit_mask_change(case_id, cleaned_bool, segmentation, cleaned_candidate_bool)
 
     message = "已更新体外空气清理候选；请重新核对鼻孔、鼻咽端面及鼻窦，再确认气道范围"
+    if candidate_cleanup["anterior_opening_candidate"]["preserved_voxels"]:
+        message = "已保留鼻孔附近的原始空气候选；这不证明入口完整，请在 CT 与实际裁切中核对"
     if flags["external_air_suspected"] or candidate_flags["external_air_suspected"]:
-        message = "已移除包络外体外空气，但掩膜仍触及非前后边界，请继续人工精修"
+        message = "掩膜仍触及非前后边界；请核对鼻孔候选及体外空气，再进入专家流程精修"
     result = _mask_change_result(case_id, segmentation, message, "remove_external_air")
     result["cleanup"] = cleanup
     result["candidate_cleanup"] = candidate_cleanup
@@ -1216,8 +1470,26 @@ def confirm_mask(case_id: str) -> dict:
         )
     volume = load_volume(case_id)
     body_hu = float(segmentation.get("params", {}).get("hu_high", EXTERNAL_AIR_BODY_HU))
+    opening_cleanup = (segmentation.get("candidate_external_air_cleanup") or {}).get(
+        "anterior_opening_candidate", {}
+    )
+    expected_opening_voxels = opening_cleanup.get("preserved_voxels", 0)
+    allowed_outside = None
+    if expected_opening_voxels:
+        before_path = root / "segment" / PRE_CLEAN_FULL_MASK_NAME
+        if not before_path.is_file():
+            raise PipelineError("blocked", "缺少鼻孔候选清理前副本，不能核验保留范围", ["重新执行体外空气清理"])
+        before = _load_mask_array(before_path, tuple(int(v) for v in volume.shape), "鼻孔候选清理前掩膜")
+        envelope, _ = _body_envelope(volume.array, volume.spacing, body_hu)
+        allowed_outside, opening_check = _anterior_opening_candidates(
+            before, envelope, volume.spacing, ap_axis, anterior_sign(volume.meta, ap_axis)
+        )
+        if (type(expected_opening_voxels) is not int
+                or opening_check["preserved_voxels"] != expected_opening_voxels):
+            raise PipelineError("blocked", "鼻孔候选保护范围与清理记录不一致", ["重新执行体外空气清理后复核"])
     main_outside, candidate_outside = _outside_body_envelope_counts(
-        mask, candidate, volume.array, volume.spacing, body_hu
+        mask, candidate, volume.array, volume.spacing, body_hu,
+        allowed_outside=allowed_outside,
     )
     if main_outside or candidate_outside:
         raise PipelineError(
@@ -1237,6 +1509,8 @@ def confirm_mask(case_id: str) -> dict:
         "body_hu_threshold": body_hu,
         "outside_voxels": main_outside,
         "candidate_outside_voxels": candidate_outside,
+        "main_anterior_opening_candidate_voxels": int(np.count_nonzero(mask & allowed_outside)) if allowed_outside is not None else 0,
+        "candidate_anterior_opening_candidate_voxels": int(np.count_nonzero(candidate & allowed_outside)) if allowed_outside is not None else 0,
     }
     invalidate_downstream(case_id, "气道掩膜已人工确认，需重新生成下游产物")
     tmp_json = seg_path.with_name(f"{seg_path.name}.{secrets.token_hex(4)}.tmp")

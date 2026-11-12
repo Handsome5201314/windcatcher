@@ -11,6 +11,33 @@ from pipeline.errors import PipelineError
 from pipeline.volume import Volume, save_volume
 
 
+def test_body_envelope_does_not_erode_image_edge_tissue_and_open_an_internal_lumen():
+    hu = np.full((12, 64, 64), 40.0, dtype=np.float32)
+    hu[:, :6, :] = -1000.0  # Known exterior air.
+    hu[3:9, 20:62, 22:42] = -800.0  # Enclosed lumen near the image edge.
+    envelope, _ = mask_review._body_envelope(hu, (0.5, 0.5, 0.5))
+    assert envelope[5, 63, 32], "closing must preserve observed tissue at the image edge"
+    assert envelope[5, 45, 32], "edge erosion must not flood exterior air into the lumen"
+    assert not envelope[5, 0, 32], "actual exterior air must remain excluded"
+
+
+def test_confirmation_uses_same_envelope_as_cleanup_at_image_edge():
+    hu = np.full((12, 64, 64), 40.0, dtype=np.float32)
+    hu[:, :6, :] = -1000.0
+    hu[3:9, 20:62, 22:42] = -800.0
+    spacing = (0.5, 0.5, 0.5)
+    candidate = hu < -300
+    cleaned, _ = mask_review._remove_external_air_array(candidate, hu, spacing, 1)
+    assert cleaned[5, 45, 32]
+    assert mask_review._outside_body_envelope_counts(
+        cleaned, cleaned, hu, spacing, -300
+    ) == (0, 0)
+    # The same validation must still reject known external air.
+    assert mask_review._outside_body_envelope_counts(
+        cleaned, candidate, hu, spacing, -300
+    ) == (0, int(candidate[:, :6, :].sum()))
+
+
 @pytest.fixture
 def edit_case(tmp_path, monkeypatch):
     # 只使用临时合成体数据，不接触患者病例目录。

@@ -293,6 +293,11 @@ def run_postprocess(case_id: str, progress_callback: Callable[[dict], None] | No
     root = case_dir(case_id)
     foam, signature, time_name = _source(root)
     pressure_unit = _pressure_unit(root / "cfd" / time_name / "p")
+    meta_path = root / "cfd" / "case_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    inlet_names = meta.get("inlet_patches", ["inlet"])
+    if inlet_names not in (["inlet"], ["inlet_left", "inlet_right"]):
+        raise PipelineError("failed", "算例入口边界名称不受支持，不能生成流线")
     if vtk is None:
         raise PipelineError("failed", "当前 Python 环境没有 VTK", ["在工作台虚拟环境安装 VTK"])
 
@@ -318,7 +323,8 @@ def run_postprocess(case_id: str, progress_callback: Callable[[dict], None] | No
     reader.DisableAllPatchArrays()
     reader.SetPatchArrayStatus("internalMesh", 1)
     reader.SetPatchArrayStatus("patch/wall", 1)
-    reader.SetPatchArrayStatus("patch/inlet", 1)
+    for name in inlet_names:
+        reader.SetPatchArrayStatus(f"patch/{name}", 1)
     reader.SetPatchArrayStatus("patch/outlet", 1)
     reader.DisableAllCellArrays()
     reader.SetCellArrayStatus("U", 1)
@@ -341,9 +347,19 @@ def run_postprocess(case_id: str, progress_callback: Callable[[dict], None] | No
     if not all(np.isfinite(array).all() for array in (ua, pa, xyz)):
         raise PipelineError("failed", "最终求解场或网格含 NaN 或 Infinity，结果未发布")
     boundary = data.GetBlock(1) if data.IsA("vtkMultiBlockDataSet") and data.GetNumberOfBlocks() > 1 else None
-    step("wall", "提取 wall、inlet、outlet 边界")
+    step("wall", "提取壁面、算例入口与出口边界")
     wall = _sample_patch(_patch_block(boundary, "wall"), limit=120_000)
-    inlet = _patch_block(boundary, "inlet")
+    inlet_blocks = {name: _patch_block(boundary, name) for name in inlet_names}
+    if len(inlet_names) == 2:
+        if any(block is None or block.GetNumberOfCells() == 0 for block in inlet_blocks.values()):
+            raise PipelineError("failed", "双侧算例缺少左侧或右侧入口边界，结果未发布")
+        combined = vtk.vtkAppendPolyData()
+        for block in inlet_blocks.values():
+            combined.AddInputData(block)
+        combined.Update()
+        inlet = combined.GetOutput()
+    else:
+        inlet = inlet_blocks["inlet"]
     outlet = _patch_block(boundary, "outlet")
     step("streamlines", "从入口种子积分流线")
     streamlines, streamline_metadata = _streamlines(mesh, inlet)
@@ -355,7 +371,8 @@ def run_postprocess(case_id: str, progress_callback: Callable[[dict], None] | No
         "units": {"coordinates": "m", "velocity": "m/s", "pressure": pressure_unit},
         "bounds_m": [float(v) for v in mesh.GetBounds()],
         "wall": wall,
-        "patches": {"inlet": _sample_patch(inlet), "outlet": _sample_patch(outlet)},
+        "patches": {"inlet": _sample_patch(inlet), "outlet": _sample_patch(outlet),
+                    **({name: _sample_patch(block) for name, block in inlet_blocks.items()} if len(inlet_names) == 2 else {})},
         "streamlines": streamlines,
         "slices": slices,
         "ranges": {"velocity": [float(np.linalg.norm(ua, axis=1).min()), float(np.linalg.norm(ua, axis=1).max())], "pressure": [float(pa.min()), float(pa.max())]},

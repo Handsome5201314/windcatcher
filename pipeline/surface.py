@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import struct
+import threading
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,70 @@ from . import endplanes, oblique
 from .errors import PipelineError
 from .mask_review import has_current_external_air_validation
 from .volume import load_volume
+
+
+MAX_LOCAL_INLET_FACES = 750_000
+MAX_LOCAL_MASK_BOUNDARY_TRANSITIONS = 450_000
+GEOMETRY_ALGORITHM_VERSION = "mask-to-stl-oblique-clip-v3"
+_LOCAL_GEOMETRY_LOCK = threading.Lock()
+
+
+@contextmanager
+def local_geometry_guard():
+    """Admit at most one memory-intensive local-inlet mesh build per worker."""
+    if not _LOCAL_GEOMETRY_LOCK.acquire(blocking=False):
+        raise PipelineError(
+            "blocked", "已有局部端面网格任务正在运行",
+            ["等待当前精确预览或 STL 生成完成后重试"],
+        )
+    try:
+        yield
+    finally:
+        _LOCAL_GEOMETRY_LOCK.release()
+
+
+def ensure_local_mesh_face_capacity(faces_before_decimation: int) -> None:
+    """Reject meshes whose local Python clipping would overrun the worker."""
+    count = int(faces_before_decimation)
+    if count < 0:
+        raise PipelineError("failed", "网格面数无效", ["重新生成气道表面"])
+    if count > MAX_LOCAL_INLET_FACES:
+        raise PipelineError(
+            "blocked", "当前网格过大，暂不能做精确局部斜切",
+            ["改用主气道范围或收紧掩膜范围，再重新预览局部端面"],
+            {"source_faces": count, "local_inlet_face_limit": MAX_LOCAL_INLET_FACES},
+        )
+
+
+def ensure_local_mask_capacity(mask: np.ndarray) -> int:
+    """Bound the marching-cubes input before allocating its full mesh.
+
+    This counts voxel-label transitions, not triangles; the authoritative
+    post-generation face gate remains necessary because their ratio varies.
+    """
+    source = np.asarray(mask, dtype=bool)
+    if source.ndim != 3:
+        raise PipelineError("failed", "局部端面掩膜维度无效", ["重新复核气道掩膜"])
+    transitions = 0
+    for axis in range(3):
+        lower = [slice(None)] * 3
+        upper = [slice(None)] * 3
+        lower[axis] = slice(None, -1)
+        upper[axis] = slice(1, None)
+        transitions += int(np.count_nonzero(source[tuple(lower)] != source[tuple(upper)]))
+        edge = [slice(None)] * 3
+        edge[axis] = 0
+        transitions += int(np.count_nonzero(source[tuple(edge)]))
+        edge[axis] = -1
+        transitions += int(np.count_nonzero(source[tuple(edge)]))
+    if transitions > MAX_LOCAL_MASK_BOUNDARY_TRANSITIONS:
+        raise PipelineError(
+            "blocked", "局部端面掩膜表面过大，暂不能生成精确预览",
+            ["改用主气道范围或收紧掩膜范围后重试"],
+            {"mask_boundary_transitions": transitions,
+             "local_inlet_boundary_limit": MAX_LOCAL_MASK_BOUNDARY_TRANSITIONS},
+        )
+    return transitions
 
 
 def voxel_to_mm(verts: np.ndarray, spacing, origin, axis_dirs) -> np.ndarray:
@@ -209,6 +275,34 @@ def write_binary_stl(path: Path, vertices: np.ndarray, faces: np.ndarray) -> Non
         records.tofile(handle)
 
 
+def remove_opposite_coincident_faces(faces: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Cancel exact opposite face pairs; keep coordinates and all distinct walls.
+
+    Marching cubes can emit a doubled, zero-thickness interior sheet at
+    ambiguous voxel configurations. Only pairs with identical vertex IDs
+    and opposite winding cancel; same-winding duplicates and more complex
+    nonmanifold topology remain subject to the normal quality gates.
+    """
+    faces = np.asarray(faces, dtype=np.int32)
+    if not len(faces):
+        return faces, {"removed_faces": 0, "opposite_pairs": 0}
+    _, inverse, counts = np.unique(np.sort(faces, axis=1), axis=0, return_inverse=True, return_counts=True)
+    pairs = np.flatnonzero(counts == 2)
+    keep = np.ones(len(faces), dtype=bool)
+    if len(pairs):
+        order = np.argsort(inverse, kind="stable")
+        starts = np.concatenate(([0], np.cumsum(counts[:-1])))
+        first, second = order[starts[pairs]], order[starts[pairs] + 1]
+        parity = ((faces[:,0] > faces[:,1]).astype(np.int8)
+                  + (faces[:,0] > faces[:,2]).astype(np.int8)
+                  + (faces[:,1] > faces[:,2]).astype(np.int8)) % 2
+        opposite = parity[first] != parity[second]
+        keep[first[opposite]] = False
+        keep[second[opposite]] = False
+    removed = int((~keep).sum())
+    return faces[keep], {"removed_faces": removed, "opposite_pairs": removed // 2}
+
+
 def mask_to_stl(
     mask: np.ndarray,
     spacing,
@@ -257,8 +351,11 @@ def mask_to_stl(
 
     vertices_mm = voxel_to_mm(verts, spacing, origin_eff, axis_dirs)
     faces_before = len(faces)
+    faces, coincident_cleanup = remove_opposite_coincident_faces(faces)
 
     notes = []
+    if coincident_cleanup["removed_faces"]:
+        notes.append(f"已移除 {coincident_cleanup['removed_faces']} 个方向相反且完全重合的零厚度三角面；顶点坐标和原掩膜未改变")
     cleanup = {
         "components": int(manifold_stats.get("components", 1)),
         "removed_components": 0,
@@ -307,6 +404,7 @@ def mask_to_stl(
             "model_scope": str(p.get("model_scope", "main_airway")),
         },
         "loose_cleanup": cleanup,
+        "coincident_face_cleanup": coincident_cleanup,
         "manifold_prep": manifold_stats,
         "notes": notes,
         "_vertices": vertices_mm,
@@ -610,6 +708,259 @@ def clip_mesh_by_oblique_planes(
     }
 
 
+def _is_selected_local_mesh_group(
+    votes: dict[int, int], selected_label: int, *, group_index: int,
+    group_size: int, sampled_fragments: int, voxel_component_count: int,
+) -> bool:
+    """Only an ambiguous group touching the selected voxel branch blocks.
+
+    Unmatched and unrelated positive-side mesh fragments stay intact.  A
+    target branch still needs one confident match; the caller checks that
+    exactly one group was selected.
+    """
+    if selected_label not in votes:
+        return False
+    winner, count = max(votes.items(), key=lambda item: item[1])
+    if winner != selected_label or count < 0.8 * sum(votes.values()):
+        raise PipelineError(
+            "blocked", "网格局部支段跨越多个气道区域",
+            ["把切面移到单一鼻孔管段；薄壁或分叉处需显式局部轮廓"],
+            {
+                "mesh_component_index": group_index,
+                "mesh_component_fragments": group_size,
+                "sampled_fragments": sampled_fragments,
+                "voxel_component_votes": {str(label): int(votes[label]) for label in sorted(votes)},
+                "voxel_positive_components": voxel_component_count,
+            },
+        )
+    return True
+
+
+def clip_mesh_by_oblique_planes_local(
+    vertices: np.ndarray, faces: np.ndarray, anterior_plane: dict, posterior_plane: dict,
+    mask: np.ndarray, volume, *, anterior_seed_lps_mm,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Open one selected anterior branch while preserving other plane crossings.
+
+    The seed first selects a 6-connected *voxel* component on the deletion side.
+    Split surface fragments are then matched to that component by their nearby
+    source-mask voxels; nearest surface-to-seed matching is unsafe for a thin
+    septum. Ambiguous matches and multiple inlet rings block the export.
+    """
+    selected, positive_mask, local_stats = oblique._local_delete_component(
+        mask, volume, anterior_plane, anterior_seed_lps_mm
+    )
+    voxel_labels, crop, _ = oblique._label_positive_components(positive_mask)
+    selected_label = int(np.unique(voxel_labels[selected[crop]])[0])
+    anterior_kept: list[np.ndarray] = []
+    anterior_positive: list[np.ndarray] = []
+    reverse_anterior = {
+        "point_lps_mm": anterior_plane["point_lps_mm"],
+        "normal_lps": (-np.asarray(anterior_plane["normal_lps"], dtype=float)).tolist(),
+    }
+    for face in np.asarray(faces, dtype=np.int32):
+        polygon = _clip_polygon_to_plane(np.asarray(vertices[face], dtype=float), posterior_plane)
+        if len(polygon) < 3:
+            continue
+        inside = _clip_polygon_to_plane(np.asarray(polygon, dtype=float), anterior_plane)
+        outside = _clip_polygon_to_plane(np.asarray(polygon, dtype=float), reverse_anterior)
+        if len(inside) >= 3:
+            anterior_kept.append(np.asarray(inside, dtype=float))
+        if len(outside) >= 3:
+            anterior_positive.append(np.asarray(outside, dtype=float))
+    if not anterior_kept or not anterior_positive:
+        raise PipelineError("blocked", "局部鼻孔切面没有形成可裁切的网格", ["把切面移入目标鼻孔管段"])
+
+    # Connected components of the mesh on the positive side.  Edge adjacency
+    # avoids connecting two wall sheets that merely meet at one vertex.
+    _, positive_indices = _weld_points(
+        [point for polygon in anterior_positive for point in polygon]
+    )
+    polygon_ids = [
+        [positive_indices[tuple(np.rint(point / 1e-6).astype(np.int64).tolist())] for point in polygon]
+        for polygon in anterior_positive
+    ]
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    edge_owner: dict[tuple[int, int], int] = {}
+    for index, ids in enumerate(polygon_ids):
+        for first, second in zip(ids, ids[1:] + ids[:1]):
+            if first == second:
+                continue
+            edge = (min(first, second), max(first, second))
+            previous = edge_owner.setdefault(edge, index)
+            if previous != index:
+                adjacency[index].add(previous)
+                adjacency[previous].add(index)
+    groups: list[list[int]] = []
+    seen: set[int] = set()
+    for start in range(len(anterior_positive)):
+        if start in seen:
+            continue
+        queue = [start]
+        seen.add(start)
+        group: list[int] = []
+        while queue:
+            current = queue.pop()
+            group.append(current)
+            for neighbor in adjacency[current] - seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+        groups.append(group)
+
+    axes_mm = np.asarray(volume.axis_dirs, dtype=float) * np.asarray(volume.spacing, dtype=float)[:, None]
+    inverse_axes = np.linalg.inv(axes_mm)
+    origin = np.asarray(volume.origin, dtype=float)
+    normal = np.asarray(anterior_plane["normal_lps"], dtype=float)
+    plane_point = np.asarray(anterior_plane["point_lps_mm"], dtype=float)
+
+    def label_near(point: np.ndarray) -> int:
+        ijk = (point - origin) @ inverse_axes
+        center = np.rint(ijk).astype(int)
+        near = [
+            range(max(0, int(c) - 2), min(int(n), int(c) + 3))
+            for c, n in zip(center, positive_mask.shape)
+        ]
+        ranked: dict[int, float] = {}
+        for i in near[0]:
+            for j in near[1]:
+                for k in near[2]:
+                    if not (crop[0].start <= i < crop[0].stop
+                            and crop[1].start <= j < crop[1].stop
+                            and crop[2].start <= k < crop[2].stop):
+                        continue
+                    label = int(voxel_labels[
+                        i - crop[0].start, j - crop[1].start, k - crop[2].start
+                    ])
+                    if label:
+                        voxel_point = origin + np.asarray([i, j, k]) @ axes_mm
+                        distance = float(np.linalg.norm(voxel_point - point))
+                        ranked[label] = min(ranked.get(label, float("inf")), distance)
+        if not ranked:
+            return 0
+        nearest = sorted((distance, label) for label, distance in ranked.items())
+        if nearest[0][0] > 2.5 * float(max(volume.spacing)):
+            return 0
+        if len(nearest) > 1 and nearest[1][0] - nearest[0][0] < 0.25 * float(min(volume.spacing)):
+            return 0
+        return nearest[0][1]
+
+    selected_groups: list[int] = []
+    for group_index, group in enumerate(groups):
+        centroids = [anterior_positive[index].mean(axis=0) for index in group]
+        order = sorted(
+            range(len(group)), key=lambda item: float(np.dot(centroids[item] - plane_point, normal)),
+            reverse=True,
+        )
+        samples = [order[int(index)] for index in np.linspace(0, len(order) - 1, min(32, len(order)))]
+        votes: dict[int, int] = defaultdict(int)
+        for sample in samples:
+            label = label_near(centroids[sample])
+            if label:
+                votes[label] += 1
+        if _is_selected_local_mesh_group(
+            votes, selected_label, group_index=group_index, group_size=len(group),
+            sampled_fragments=len(samples),
+            voxel_component_count=local_stats["anterior_candidate_components"],
+        ):
+            selected_groups.append(group_index)
+    if len(selected_groups) != 1:
+        raise PipelineError(
+            "blocked", "所选鼻孔与网格删除支段无法唯一对应",
+            ["重新选取鼻孔外侧锚点；跨支段时需明确局部轮廓"],
+            {"selected_mesh_components": len(selected_groups)},
+        )
+    removed_polygon_indices = set(groups[selected_groups[0]])
+    wall_polygons = anterior_kept + [
+        polygon for index, polygon in enumerate(anterior_positive) if index not in removed_polygon_indices
+    ]
+    wall_vertices, wall_indices = _weld_points([point for polygon in wall_polygons for point in polygon])
+    wall_faces: list[list[int]] = []
+    for polygon in wall_polygons:
+        ids = [wall_indices[tuple(np.rint(point / 1e-6).astype(np.int64).tolist())] for point in polygon]
+        for index in range(1, len(ids) - 1):
+            triangle = [ids[0], ids[index], ids[index + 1]]
+            if len(set(triangle)) == 3:
+                wall_faces.append(triangle)
+    if not wall_faces:
+        raise PipelineError("blocked", "局部裁切后网格为空", ["调整切面位置"])
+
+    edge_counts: dict[tuple[int, int], int] = defaultdict(int)
+    for face in wall_faces:
+        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+            edge_counts[(min(a, b), max(a, b))] += 1
+    cap_segments: list[list[tuple[np.ndarray, np.ndarray]]] = [[], []]
+    for (a, b), count in edge_counts.items():
+        if count != 1:
+            continue
+        first, second = wall_vertices[[a, b]]
+        matches = []
+        for plane in (anterior_plane, posterior_plane):
+            plane_point = np.asarray(plane["point_lps_mm"], dtype=float)
+            plane_normal = np.asarray(plane["normal_lps"], dtype=float)
+            matches.append(
+                max(abs(float(np.dot(first - plane_point, plane_normal))),
+                    abs(float(np.dot(second - plane_point, plane_normal)))) <= 1e-5
+            )
+        if sum(matches) != 1:
+            raise PipelineError("blocked", "局部裁切出现非端面网格缺口", ["核查原始掩膜连通性和切面位置"])
+        cap_segments[matches.index(True)].append((first, second))
+    cap_faces: list[list[int]] = []
+    cap_groups: list[list[int]] = [[], []]
+    loop_counts: list[int] = []
+    for plane_index, (plane, segments) in enumerate(zip((anterior_plane, posterior_plane), cap_segments)):
+        loops = _plane_loops(segments)
+        loop_counts.append(len(loops))
+        if (plane_index == 0 and len(loops) != 1) or not loops:
+            raise PipelineError(
+                "blocked", "局部鼻孔裁切形成多个入口或无有效出口",
+                ["把切面移到单一、连续的鼻孔管段；多环需显式局部轮廓"],
+                {"inlet_loops": len(loops) if plane_index == 0 else loop_counts[0],
+                 "outlet_loops": len(loops) if plane_index == 1 else None},
+            )
+        for loop in loops:
+            ids = [wall_indices[tuple(np.rint(point / 1e-6).astype(np.int64).tolist())] for point in loop]
+            triangles = _triangulate_plane_loop(wall_vertices[ids], np.asarray(plane["normal_lps"], dtype=float))
+            if not len(triangles):
+                raise PipelineError("blocked", "端面轮廓不能封盖", ["调整切面，避开复杂交汇处"])
+            for face in np.asarray(ids, dtype=np.int32)[triangles]:
+                triangle = [int(index) for index in face]
+                points = wall_vertices[triangle]
+                direction = np.cross(points[1] - points[0], points[2] - points[0])
+                if float(np.dot(direction, plane["normal_lps"])) < 0:
+                    triangle[1], triangle[2] = triangle[2], triangle[1]
+                cap_groups[plane_index].append(len(wall_faces) + len(cap_faces))
+                cap_faces.append(triangle)
+    output_faces = np.asarray(wall_faces + cap_faces, dtype=np.int32)
+    final_counts: dict[tuple[int, int], int] = defaultdict(int)
+    for face in output_faces:
+        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+            final_counts[(min(int(a), int(b)), max(int(a), int(b)))] += 1
+    if any(count != 2 for count in final_counts.values()):
+        raise PipelineError("blocked", "局部切面封盖后网格不水密", ["调整切面，避开分叉或薄壁区域"])
+    inlet = np.asarray(cap_groups[0], dtype=np.int32)
+    outlet = np.asarray(cap_groups[1], dtype=np.int32)
+
+    def cap_area(indices: np.ndarray) -> float:
+        triangles = wall_vertices[output_faces[indices]]
+        return float(0.5 * np.linalg.norm(
+            np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1
+        ).sum())
+
+    return wall_vertices, output_faces, inlet, outlet, {
+        "format": "oblique_mesh_clip_local_v2",
+        "retained_surface_faces": len(wall_faces),
+        "selected_delete_surface_fragments": len(removed_polygon_indices),
+        "anterior_deleted_voxels": local_stats["anterior_deleted_voxels"],
+        "inlet_loops": loop_counts[0],
+        "outlet_loops": loop_counts[1],
+        "inlet_cap_faces": len(inlet),
+        "outlet_cap_faces": len(outlet),
+        "inlet_area_mm2": round(cap_area(inlet), 3),
+        "outlet_area_mm2": round(cap_area(outlet), 3),
+        "closed_caps": True,
+    }
+
+
 def run_surface(case_id: str, params: dict | None = None) -> dict:
     """对病例生成气道 STL。"""
     from .cases import case_dir, get_case, update_stage
@@ -706,11 +1057,61 @@ def run_surface(case_id: str, params: dict | None = None) -> dict:
             ["返回 CT 三平面视窗选择并保存两端，再重新生成 STL"],
             {"stage": "segment", "model_scope": model_scope, "mask_version": seg.get("mask_version")},
         )
-    oblique_plan = bool(plan is not None and plan.get("format") == "oblique_planes_v1")
+    oblique_format = plan.get("format") if plan is not None else None
+    local_oblique_plan = oblique_format == "oblique_local_inlet_v2"
+    bilateral_local_plan = oblique_format == endplanes.BILATERAL_LOCAL_FORMAT
+    precise_local_plan = local_oblique_plan or bilateral_local_plan
+    oblique_plan = oblique_format in {
+        "oblique_planes_v1", "oblique_local_inlet_v2", endplanes.BILATERAL_LOCAL_FORMAT,
+    }
+    if precise_local_plan:
+        # The read-only actual-mesh preview and the save preflight both use
+        # the unmodified full-resolution surface. Reject other mesh settings
+        # before writing any artifact so the STL matches the inspected mesh.
+        unsupported = (
+            ("smooth", requested.get("smooth") not in (None, False)),
+            ("step_size", requested.get("step_size") is not None
+             and (type(requested["step_size"]) is not int or requested["step_size"] != 1)),
+            ("decimate_ratio", requested.get("decimate_ratio") is not None),
+        )
+        invalid = [name for name, rejected in unsupported if rejected]
+        if invalid:
+            raise PipelineError(
+                "blocked", "局部入口 STL 参数与已预览的精确网格不一致",
+                ["使用默认网格参数（smooth=false、step_size=1、decimate_ratio=null）重新生成 STL"],
+                {"unsupported_parameters": invalid},
+            )
     # Only the saved free planes may open an oblique model. Extending the
     # original A-P extrema can leave extra wall holes outside those planes.
     requested["extend_ap_edges"] = not oblique_plan
-    if oblique_plan:
+    if bilateral_local_plan:
+        source_mask = select_largest_component(mask)[0]
+        validation = oblique.validate_bilateral_local_planes(
+            source_mask, vol, plan["left_inlet_plane"], plan["right_inlet_plane"],
+            plan["posterior_plane"], plan["left_inlet_seed_lps_mm"],
+            plan["right_inlet_seed_lps_mm"], plan["posterior_seed_lps_mm"],
+            main_airway=True,
+        )
+        effective_mask = oblique.clip_mask_oblique_bilateral_local(
+            source_mask, vol, validation["left_inlet_plane"],
+            validation["right_inlet_plane"], validation["posterior_plane"],
+            left_inlet_seed_lps_mm=validation["left_inlet_seed_lps_mm"],
+            right_inlet_seed_lps_mm=validation["right_inlet_seed_lps_mm"],
+            posterior_seed_lps_mm=validation["posterior_seed_lps_mm"],
+        )
+    elif local_oblique_plan:
+        source_mask = (
+            select_largest_component(mask)[0] if model_scope == "main_airway" else mask
+        )
+        oblique.validate_local_inlet_pair(
+            source_mask, vol, plan["anterior_plane"], plan["posterior_plane"],
+            plan["anterior_seed_lps_mm"], main_airway=model_scope == "main_airway",
+        )
+        effective_mask = oblique.clip_mask_oblique_local(
+            source_mask, vol, plan["anterior_plane"], plan["posterior_plane"],
+            anterior_seed_lps_mm=plan["anterior_seed_lps_mm"],
+        )
+    elif oblique_plan:
         # The voxel clip is retained only as a coarse mask for volume and
         # locationInMesh checks.  The authoritative geometry is clipped below
         # in patient millimetres, so a rotated plane cannot be reduced to a CT
@@ -728,33 +1129,68 @@ def run_surface(case_id: str, params: dict | None = None) -> dict:
             endplanes.clip_mask(mask, ap_axis, plan["anterior_index"], plan["posterior_index"])
             if plan is not None else mask
         )
-    result = mask_to_stl(
-        mask, vol.spacing, vol.origin, vol.axis_dirs, ap_axis=ap_axis, params=requested,
-    )
-    result["mask_version"] = seg.get("mask_version")
-    vertices = result.pop("_vertices")
-    faces = result.pop("_faces")
-    inlet_triangles = np.zeros((0,), dtype=np.int32)
-    outlet_triangles = np.zeros((0,), dtype=np.int32)
-    if oblique_plan:
-        vertices, faces, inlet_triangles, outlet_triangles, clip_stats = clip_mesh_by_oblique_planes(
-            vertices,
-            faces,
-            plan["anterior_plane"],
-            plan["posterior_plane"],
+    with local_geometry_guard() if precise_local_plan else nullcontext():
+        if precise_local_plan:
+            ensure_local_mask_capacity(source_mask)
+        result = mask_to_stl(
+            mask, vol.spacing, vol.origin, vol.axis_dirs, ap_axis=ap_axis, params=requested,
         )
-        result["oblique_clip"] = clip_stats
-        result["faces_before_decimation"] = int(len(faces))
-        result["faces"] = int(len(faces))
-        result["vertices"] = int(len(vertices))
-        result["bbox_lps_mm"] = [
-            [round(float(vertices[:, index].min()), 2), round(float(vertices[:, index].max()), 2)]
-            for index in range(3)
-        ]
+        result["geometry_algorithm_version"] = GEOMETRY_ALGORITHM_VERSION
+        result["mask_version"] = seg.get("mask_version")
+        vertices = result.pop("_vertices")
+        faces = result.pop("_faces")
+        inlet_triangles = np.zeros((0,), dtype=np.int32)
+        inlet_left_triangles = np.zeros((0,), dtype=np.int32)
+        inlet_right_triangles = np.zeros((0,), dtype=np.int32)
+        outlet_triangles = np.zeros((0,), dtype=np.int32)
+        if oblique_plan:
+            if bilateral_local_plan:
+                from .bilateral_local import clip_mesh_bilateral_local
+
+                source_faces = int(result["faces_before_decimation"])
+                ensure_local_mesh_face_capacity(source_faces)
+                (vertices, faces, inlet_left_triangles, inlet_right_triangles,
+                 outlet_triangles, clip_stats) = clip_mesh_bilateral_local(
+                    vertices, faces, source_mask, vol,
+                    left_inlet_plane=plan["left_inlet_plane"],
+                    right_inlet_plane=plan["right_inlet_plane"],
+                    posterior_plane=plan["posterior_plane"],
+                    left_inlet_seed_lps_mm=plan["left_inlet_seed_lps_mm"],
+                    right_inlet_seed_lps_mm=plan["right_inlet_seed_lps_mm"],
+                    posterior_seed_lps_mm=plan["posterior_seed_lps_mm"],
+                )
+                clip_stats["source_surface_faces"] = source_faces
+            elif local_oblique_plan:
+                source_faces = int(result["faces_before_decimation"])
+                ensure_local_mesh_face_capacity(source_faces)
+                vertices, faces, inlet_triangles, outlet_triangles, clip_stats = clip_mesh_by_oblique_planes_local(
+                    vertices, faces, plan["anterior_plane"], plan["posterior_plane"],
+                    source_mask, vol, anterior_seed_lps_mm=plan["anterior_seed_lps_mm"],
+                )
+                clip_stats["source_surface_faces"] = source_faces
+            else:
+                vertices, faces, inlet_triangles, outlet_triangles, clip_stats = clip_mesh_by_oblique_planes(
+                    vertices, faces, plan["anterior_plane"], plan["posterior_plane"],
+                )
+            result["oblique_clip"] = clip_stats
+            result["faces_before_decimation"] = int(len(faces))
+            result["faces"] = int(len(faces))
+            result["vertices"] = int(len(vertices))
+            result["bbox_lps_mm"] = [
+                [round(float(vertices[:, index].min()), 2), round(float(vertices[:, index].max()), 2)]
+                for index in range(3)
+            ]
     result["endplanes"] = (
         {
             **plan,
-            "source": "user_confirmed_oblique_planes" if oblique_plan else "user_confirmed_ct_planes",
+            "source": (
+                ("automated_bilateral_local_oblique_planes"
+                 if plan.get("confirmation_source") == "automated_technical_gate"
+                 and plan.get("human_confirmed") is False
+                 else "user_confirmed_bilateral_local_oblique_planes") if bilateral_local_plan else
+                "user_confirmed_local_oblique_planes" if local_oblique_plan else
+                "user_confirmed_oblique_planes" if oblique_plan else "user_confirmed_ct_planes"
+            ),
         }
         if plan is not None
         else None
@@ -765,12 +1201,23 @@ def run_surface(case_id: str, params: dict | None = None) -> dict:
     np.save(root / "surface" / "vertices.npy", vertices)
     np.save(root / "surface" / "faces.npy", faces)
     inlet_path = root / "surface" / "inlet_triangles.npy"
+    inlet_left_path = root / "surface" / "inlet_left_triangles.npy"
+    inlet_right_path = root / "surface" / "inlet_right_triangles.npy"
     outlet_path = root / "surface" / "outlet_triangles.npy"
-    if oblique_plan:
+    if bilateral_local_plan:
+        inlet_path.unlink(missing_ok=True)
+        np.save(inlet_left_path, inlet_left_triangles)
+        np.save(inlet_right_path, inlet_right_triangles)
+        np.save(outlet_path, outlet_triangles)
+    elif oblique_plan:
+        inlet_left_path.unlink(missing_ok=True)
+        inlet_right_path.unlink(missing_ok=True)
         np.save(inlet_path, inlet_triangles)
         np.save(outlet_path, outlet_triangles)
     else:
         inlet_path.unlink(missing_ok=True)
+        inlet_left_path.unlink(missing_ok=True)
+        inlet_right_path.unlink(missing_ok=True)
         outlet_path.unlink(missing_ok=True)
     # 几何质检必须对照与本次 STL 相同的掩膜范围；重跑时总是刷新，
     # 避免切换主气道/完整候选后读取上次裁切的残留文件。
@@ -798,11 +1245,15 @@ def run_surface(case_id: str, params: dict | None = None) -> dict:
         stage_status,
         message=message,
         artifacts=(
+            ["surface/airway.stl", "surface/surface.json", "surface/inlet_left_triangles.npy",
+             "surface/inlet_right_triangles.npy", "surface/outlet_triangles.npy"]
+            if bilateral_local_plan else
             ["surface/airway.stl", "surface/surface.json", "surface/inlet_triangles.npy", "surface/outlet_triangles.npy"]
             if oblique_plan
             else ["surface/airway.stl", "surface/surface.json"]
         ),
         data={
+            "geometry_algorithm_version": GEOMETRY_ALGORITHM_VERSION,
             "faces": result["faces"],
             "vertices": result["vertices"],
             "model_scope": model_scope,
@@ -814,7 +1265,15 @@ def run_surface(case_id: str, params: dict | None = None) -> dict:
             "mask_version": seg.get("mask_version"),
             "opening_caps": {
                 "inlet_triangles": int(len(inlet_triangles)),
+                "inlet_left_triangles": int(len(inlet_left_triangles)),
+                "inlet_right_triangles": int(len(inlet_right_triangles)),
                 "outlet_triangles": int(len(outlet_triangles)),
+                "inlet_left_area_mm2": (
+                    result.get("oblique_clip", {}).get("left_inlet_area_mm2") if bilateral_local_plan else None
+                ),
+                "inlet_right_area_mm2": (
+                    result.get("oblique_clip", {}).get("right_inlet_area_mm2") if bilateral_local_plan else None
+                ),
                 "inlet_area_mm2": (
                     result.get("oblique_clip", {}).get("inlet_area_mm2") if oblique_plan else None
                 ),

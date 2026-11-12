@@ -2,10 +2,11 @@
 "use strict";
 
 (function () {
-  if (window.WindcatcherSharedAccess) return;
+  if (window.location.pathname?.startsWith("/share/") || window.WindcatcherActivityEnabled === false
+      || window.WindcatcherSharedAccess && window.WindcatcherActivityAccess !== true) return;
   if (window.WindcatcherMonitor || typeof window.fetch !== "function") return;
   const nativeFetch = window.fetch.bind(window);
-  const routes = new Set(["work", "cases", "results", "env", "method", "sample"]);
+  const routes = new Set(["work", "cases", "results", "env", "method", "sample", "activity"]);
   const numericKeys = new Set(["status_code", "duration_ms", "index", "radius", "level", "width", "anterior_index", "posterior_index", "operation_count", "point_count", "delta_x", "delta_y", "delta", "button", "value", "line", "column", "count", "controls", "client_time_ms", "sequence"]);
   const booleanKeys = new Set(["overlay", "dirty", "checked", "value"]);
   const tokenValues = {
@@ -105,7 +106,7 @@
   }
 
   function eventOf(kind, action, details, target, requestId, current = context()) {
-    return { kind: kinds.has(kind) ? kind : "lifecycle", action: token(action, 48) || "unknown", ...current, session_id: sessionId, request_id: token(requestId, 64) || uuid(), target: token(target) || null, details: { ...detailsOf(details), client_time_ms: Date.now(), sequence: ++sequence } };
+    return { event_id: uuid(), kind: kinds.has(kind) ? kind : "lifecycle", action: token(action, 48) || "unknown", ...current, session_id: sessionId, request_id: token(requestId, 64) || uuid(), target: token(target) || null, details: { ...detailsOf(details), client_time_ms: Date.now(), sequence: ++sequence } };
   }
 
   function queueDropSummary() {
@@ -135,7 +136,7 @@
   function renderLocalState() {
     const summary = document.getElementById("monitor-summary");
     if (summary) {
-      const base = summary.dataset.monitorBase || "操作记录仅保存在本机。";
+      const base = summary.dataset.monitorBase || "操作记录保存在风见服务器的本地数据库中。";
       summary.textContent = `${base} 浏览器待发送 ${queue.length} 条；本次会话丢弃 ${dropped} 条。`;
     }
     const error = document.getElementById("monitor-error");
@@ -307,7 +308,7 @@
     drainInputs();
     drainWheels();
     enqueue(eventOf("navigation", "route", {}, route(), null, { ...context(), route: route() }));
-    if (route() === "env") void refreshPanel();
+    if (route() === "activity") void refreshPanel();
   });
   window.addEventListener("pagehide", () => { void flush({ keepalive: true }); });
 
@@ -368,7 +369,12 @@
       panelQueryFailed = false;
       status.textContent = "正在记录";
       const summary = document.getElementById("monitor-summary");
-      if (summary) summary.dataset.monitorBase = `本机共 ${Number(health.total_events) || 0} 条，保留 ${Number(health.retention_days) || 0} 天。`;
+      if (summary) {
+        const count = Number(health.total_events) || 0;
+        summary.dataset.monitorBase = health.retention_days == null
+          ? `服务器共保存 ${count} 条操作记录，长期保留。`
+          : `服务器共保存 ${count} 条操作记录，保留 ${Number(health.retention_days) || 0} 天。`;
+      }
       list.replaceChildren();
       const events = data.events.slice(0, 50);
       if (!events.length) {
@@ -440,7 +446,7 @@
       if (filter) filter.addEventListener("change", () => { void refreshPanel(); });
       panelBound = Boolean(refresh);
     }
-    if (route() === "env") void refreshPanel();
+    if (route() === "activity") void refreshPanel();
   }
 
   window.WindcatcherMonitor = Object.freeze({ setContextProvider: (provider) => { contextProvider = typeof provider === "function" ? provider : null; }, record, flush, refreshPanel });

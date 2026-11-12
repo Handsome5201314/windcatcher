@@ -12,7 +12,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from skimage import measure
 
-from pipeline import cases, endplanes, selection_preview
+from pipeline import cases, endplanes, selection_preview, surface
 from pipeline.errors import PipelineError
 from pipeline.surface import write_binary_stl
 from pipeline.volume import Volume, load_volume, save_volume
@@ -120,6 +120,63 @@ def test_selection_mesh_does_not_bridge_one_voxel_gap(confirmed_case):
     adjacency = coo_matrix((np.ones(len(edges)), (edges[:, 0], edges[:, 1])), shape=(len(vertices), len(vertices)))
 
     assert connected_components(adjacency, directed=False, return_labels=False) == 2
+
+
+def test_main_preview_uses_formal_six_connected_component_and_full_candidate_keeps_all(confirmed_case, monkeypatch):
+    case_id, root, _seg = confirmed_case
+    mask_path = root / "segment" / "mask.npy"
+    candidate_path = root / "segment" / "candidate_mask.npy"
+    mask = np.load(mask_path)
+    mask[2:4, 5:8, 0:2] = 1  # A detached island in the confirmed mask.
+    np.save(mask_path, mask)
+    np.save(candidate_path, mask)
+    seen = {}
+    original_preview_mesh = selection_preview._preview_mesh
+
+    def capture_mask(values, volume, ap_axis):
+        seen[len(seen)] = np.asarray(values).copy()
+        return original_preview_mesh(values, volume, ap_axis)
+
+    monkeypatch.setattr(selection_preview, "_preview_mesh", capture_mask)
+    main_path, _ = selection_preview.selection_model(case_id, "main_airway", 3)
+    candidate_path_stl, _ = selection_preview.selection_model(case_id, "full_candidate", 3)
+
+    formal_component, statistics = surface.select_largest_component(mask)
+    assert statistics["voxels_dropped"] == 12
+    np.testing.assert_array_equal(seen[0], formal_component)
+    np.testing.assert_array_equal(seen[1], mask)
+    assert _stl_faces(candidate_path_stl) > _stl_faces(main_path)
+    np.testing.assert_array_equal(np.load(mask_path), mask)
+    np.testing.assert_array_equal(np.load(candidate_path), mask)
+
+
+def test_selection_model_invalidates_prior_native_voxel_cache(confirmed_case):
+    case_id, root, _seg = confirmed_case
+    mask_path = root / "segment" / "mask.npy"
+    mask = np.load(mask_path)
+    mask[2:4, 5:8, 0:2] = 1
+    np.save(mask_path, mask)
+    stamp = tuple((path.stat().st_size, path.stat().st_mtime_ns) for path in (
+        mask_path, root / "segment" / "segmentation.json", root / "volume" / "meta.json",
+    ))
+    old_fingerprint = hashlib.sha256(json.dumps(
+        ("native_voxel_v1", "main_airway", 3, stamp), separators=(",", ":"),
+    ).encode()).hexdigest()[:16]
+    old_path = root / "preview" / f"selection-model-main_airway-3-{old_fingerprint}.stl"
+    old_path.parent.mkdir(parents=True, exist_ok=True)
+    volume = load_volume(case_id)
+    write_binary_stl(old_path, *selection_preview._preview_mesh(mask, volume, 1))
+    old_bytes = old_path.read_bytes()
+
+    new_path, version = selection_preview.selection_model(case_id, "main_airway", 3)
+
+    expected_mask, _ = surface.select_largest_component(mask)
+    _, expected_faces = selection_preview._preview_mesh(expected_mask, volume, 1)
+    assert version == 3
+    assert new_path != old_path
+    assert _stl_faces(new_path) == len(expected_faces)
+    assert _stl_faces(new_path) < _stl_faces(old_path)
+    assert old_path.read_bytes() == old_bytes
 
 
 def test_selection_model_does_not_reuse_legacy_downsampled_cache(confirmed_case):

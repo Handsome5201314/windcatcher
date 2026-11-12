@@ -3,9 +3,14 @@ from __future__ import annotations
 from collections import Counter
 
 import numpy as np
+import pytest
 from skimage import measure
 
-from pipeline.surface import clip_mesh_by_oblique_planes, mask_to_stl, prepare_volume, select_largest_component
+from pipeline.errors import PipelineError
+from pipeline.surface import (
+    MAX_LOCAL_INLET_FACES, clip_mesh_by_oblique_planes, ensure_local_mesh_face_capacity,
+    local_geometry_guard, mask_to_stl, prepare_volume, select_largest_component,
+)
 
 
 def _boundary_edge_count(faces: np.ndarray) -> int:
@@ -133,3 +138,40 @@ def test_oblique_mesh_clip_is_watertight_and_records_caps():
     assert _boundary_edge_count(clipped_faces) == 0
     assert all(count == 2 for count in edges.values())
     assert np.all(np.isfinite(clipped_vertices))
+
+
+def test_local_geometry_capacity_and_nonblocking_guard_release_after_failure():
+    ensure_local_mesh_face_capacity(MAX_LOCAL_INLET_FACES)
+    with pytest.raises(PipelineError, match="网格过大"):
+        ensure_local_mesh_face_capacity(MAX_LOCAL_INLET_FACES + 1)
+    with pytest.raises(RuntimeError):
+        with local_geometry_guard():
+            with pytest.raises(PipelineError, match="正在运行"):
+                with local_geometry_guard():
+                    pass
+            raise RuntimeError("synthetic failure")
+    with local_geometry_guard():
+        pass
+
+def test_opposite_coincident_face_pairs_are_removed_without_moving_geometry():
+    from pipeline.surface import remove_opposite_coincident_faces
+    vertices = np.asarray([[0.,0.,0.],[1.,0.,0.],[0.,1.,0.],[0.,0.,1.],[0.2,0.2,0.2]])
+    shell = np.asarray([[0,2,1],[0,1,3],[1,2,3],[2,0,3]], dtype=np.int32)
+    # A zero-thickness interior sheet shares a wall edge, creating four owners.
+    damaged = np.vstack([shell, [[0,1,4],[4,1,0]]])
+    original_vertices = vertices.copy()
+    cleaned, stats = remove_opposite_coincident_faces(damaged)
+    assert stats["removed_faces"] == 2
+    assert np.array_equal(cleaned, shell)
+    assert np.array_equal(vertices, original_vertices)
+    signed_volume = lambda faces: np.einsum("ij,ij->i", vertices[faces[:,0]], np.cross(vertices[faces[:,1]],vertices[faces[:,2]])).sum()/6
+    assert signed_volume(cleaned) == pytest.approx(signed_volume(damaged))
+    edges = Counter(tuple(sorted((int(a),int(b)))) for tri in cleaned for a,b in zip(tri,np.roll(tri,-1)))
+    assert set(edges.values()) == {2}
+
+def test_coincident_cleanup_does_not_remove_same_orientation_or_distinct_thin_surfaces():
+    from pipeline.surface import remove_opposite_coincident_faces
+    faces = np.asarray([[0,1,2],[1,2,0],[3,5,4]],dtype=np.int32)
+    cleaned, stats = remove_opposite_coincident_faces(faces)
+    assert np.array_equal(cleaned, faces)
+    assert stats["removed_faces"] == 0

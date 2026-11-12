@@ -69,6 +69,23 @@ function harness(names, overrides = {}) {
   return { context, state: context.__state, calls, nodes };
 }
 
+test("failed mask confirmation keeps the reason and recovery action in the review panel", async () => {
+  const { context, state, calls } = harness(["refreshAfterMaskReview"], {
+    externalAirCleanupState: () => ({ pending: false }),
+    updateCtViewerGuide: () => {},
+    api: async () => { throw { detail: {
+      reason: "掩膜仍有体外空气，不能确认", remediation: ["请返回编辑掩膜修正"]
+    } }; },
+  });
+  state.caseId = "case-synthetic";
+  const button = { textContent: "确认气道范围" };
+  await context.refreshAfterMaskReview(button, "/segment/confirm", "成功");
+  assert.equal(state.maskEditor.externalAirFeedback.kind, "error");
+  assert.match(state.maskEditor.externalAirFeedback.message, /不能确认.*返回编辑掩膜/);
+  assert.equal(button.textContent, "确认气道范围");
+  assert.equal(calls.at(-1), "idle");
+});
+
 function caseData(status = "ok", caseId = "case-a", updatedAt = "2026-10-07T10:00:00Z", version = 4) {
   return {
     case_id: caseId,
@@ -340,7 +357,7 @@ function threeHarness() {
       load(url, onLoad, _onProgress, onError) { requests.push({ url, onLoad, onError }); }
     },
   };
-  const h = harness(["createViewer3d"], {
+  const h = harness(["preparePreviewShading", "applyPreviewShading", "createViewer3d"], {
     THREE,
     window: { devicePixelRatio: 1, addEventListener() {} },
     requestAnimationFrame: () => 1,
@@ -352,6 +369,41 @@ function threeHarness() {
 function geometry(name) {
   return { name, disposed: 0, normals: 0, dispose() { this.disposed += 1; }, computeVertexNormals() { this.normals += 1; } };
 }
+
+test("preview mode synchronizes both workbench viewers without reloading their STL", () => {
+  const h = harness(["setSurfacePreviewMode"]);
+  const modes = [];
+  h.state.viewer3d = { setPreviewMode: (mode) => modes.push(["formal", mode]) };
+  h.state.endplanes.viewer = { setPreviewMode: (mode) => modes.push(["endplane", mode]) };
+  h.context.setSurfacePreviewMode("raw");
+  assert.equal(h.state.previewMode, "raw");
+  assert.equal(h.nodes.get("viewer-preview-mode").value, "raw");
+  assert.equal(h.nodes.get("endplane-preview-mode").value, "raw");
+  assert.deepEqual(modes, [["formal", "raw"], ["endplane", "raw"]]);
+});
+
+test("formal STL preview switches between flat and shared normals without moving vertices", () => {
+  const h = threeHarness();
+  const three = require("../static/vendor/three.min.js");
+  const mesh = new three.BufferGeometry();
+  mesh.setAttribute("position", new three.Float32BufferAttribute([
+    0, 0, 0, 1, 0, 0, 0, 1, 0,
+    0, 0, 0, 0, 1, 0, 0, 0, 1,
+  ], 3));
+  mesh.computeVertexNormals();
+  const coordinates = Array.from(mesh.getAttribute("position").array);
+  const raw = Array.from(mesh.getAttribute("normal").array);
+  h.viewer.load("same-airway.stl");
+  h.requests[0].onLoad(mesh);
+  const smooth = Array.from(mesh.getAttribute("normal").array);
+  assert.notDeepEqual(smooth, raw);
+  h.viewer.setPreviewMode("raw");
+  assert.deepEqual(Array.from(mesh.getAttribute("normal").array), raw);
+  h.viewer.setPreviewMode("smooth");
+  assert.deepEqual(Array.from(mesh.getAttribute("normal").array), smooth);
+  assert.deepEqual(Array.from(mesh.getAttribute("position").array), coordinates);
+  assert.equal(h.requests.length, 1, "switching display mode must not reload the STL");
+});
 
 test("late STL success cannot overwrite the newer model and its geometry is disposed", () => {
   const h = threeHarness();

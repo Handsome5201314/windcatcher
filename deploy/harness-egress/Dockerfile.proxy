@@ -1,0 +1,7 @@
+FROM node:24.9.0-bookworm-slim@sha256:3e69116c924bfcba6c6979aff60d966c37aef56d488ce091c69d442ebec9f103
+LABEL org.windcatcher.component="harness-egress-proxy"
+LABEL windcatcher.role="harness-egress-proxy"
+COPY deploy/harness-egress/proxy.js /opt/windcatcher/proxy.js
+USER 10001:10001
+WORKDIR /opt/windcatcher
+ENTRYPOINT ["node", "/opt/windcatcher/proxy.js"]

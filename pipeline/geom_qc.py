@@ -123,6 +123,29 @@ def _cap_geometry(vertices: np.ndarray, faces: np.ndarray, face_indices: np.ndar
     }
 
 
+def _cap_component_count(faces: np.ndarray, indices: np.ndarray) -> int:
+    """Count edge-connected cap patches; one file must not hide two openings."""
+    owners: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for local_index, face in enumerate(faces[np.asarray(indices, dtype=np.int64)]):
+        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+            owners[_edge_key(int(a), int(b))].append(local_index)
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    for members in owners.values():
+        for member in members[1:]:
+            adjacency[members[0]].add(member)
+            adjacency[member].add(members[0])
+    remaining = set(range(len(indices)))
+    components = 0
+    while remaining:
+        components += 1
+        stack = [remaining.pop()]
+        while stack:
+            for neighbor in adjacency[stack.pop()] & remaining:
+                remaining.remove(neighbor)
+                stack.append(neighbor)
+    return components
+
+
 def _signed_volume(vertices: np.ndarray, faces: np.ndarray) -> float:
     v0 = vertices[faces[:, 0]]
     v1 = vertices[faces[:, 1]]
@@ -246,8 +269,41 @@ def check_mesh(
     # Oblique clipping closes the shell with explicit inlet/outlet caps. Those
     # caps replace boundary loops as the source of truth for opening counts.
     cap_openings = []
-    cap_files = ((root / "inlet_triangles.npy", "anterior"), (root / "outlet_triangles.npy", "posterior"))
-    for cap_path, end in cap_files:
+    bilateral_paths = {
+        "left": root / "inlet_left_triangles.npy",
+        "right": root / "inlet_right_triangles.npy",
+        "outlet": root / "outlet_triangles.npy",
+    }
+    bilateral_record = root / "surface.json"
+    bilateral_declared = False
+    if bilateral_record.exists():
+        try:
+            surface_meta = json.loads(bilateral_record.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PipelineError("failed", "表面记录无法读取", ["重新生成 STL 与几何质检"]) from exc
+        bilateral_declared = (
+            (surface_meta.get("endplanes") or {}).get("format") == "oblique_bilateral_local_v3"
+        )
+    bilateral_caps = bilateral_declared or bilateral_paths["left"].exists() or bilateral_paths["right"].exists()
+    if bilateral_caps:
+        if not all(path.exists() for path in bilateral_paths.values()) or (root / "inlet_triangles.npy").exists():
+            raise PipelineError(
+                "failed", "双侧入口封盖文件缺失或混入旧版单入口封盖",
+                ["重新生成双侧局部 STL 和几何质检"],
+            )
+        cap_files = (
+            (bilateral_paths["left"], "anterior", "left"),
+            (bilateral_paths["right"], "anterior", "right"),
+            (bilateral_paths["outlet"], "posterior", "outlet"),
+        )
+    else:
+        cap_files = (
+            (root / "inlet_triangles.npy", "anterior", None),
+            (root / "outlet_triangles.npy", "posterior", None),
+        )
+    cap_components: dict[str, int] = {}
+    cap_indices_by_side: dict[str, np.ndarray] = {}
+    for cap_path, end, side in cap_files:
         if not cap_path.exists():
             continue
         try:
@@ -256,6 +312,10 @@ def check_mesh(
             raise PipelineError("failed", f"{end}封盖记录无法读取", ["重新生成 STL 与几何质检"]) from exc
         record = _cap_geometry(vertices, faces, cap_indices, end, ap_coord)
         if record is not None:
+            if side is not None:
+                record["side"] = side
+                cap_components[side] = _cap_component_count(faces, np.asarray(cap_indices).reshape(-1))
+                cap_indices_by_side[side] = np.asarray(cap_indices).reshape(-1)
             cap_openings.append(record)
     has_cap_openings = bool(cap_openings)
     if has_cap_openings:
@@ -406,6 +466,16 @@ def check_mesh(
     if duplicate_vertices > 0:
         reasons.append(f"存在 {duplicate_vertices} 个重复顶点位置（建议 Merge by Distance）")
 
+    if bilateral_caps:
+        unique_cap_faces = [int(face) for values in cap_indices_by_side.values() for face in values]
+        if (len(cap_openings) != 3 or len(set(unique_cap_faces)) != len(unique_cap_faces)
+                or set(cap_components) != {"left", "right", "outlet"}
+                or any(count != 1 for count in cap_components.values())
+                or usable_openings_by_end != {"anterior": 2, "posterior": 1, "middle": 0}
+                or components != 1):
+            verdict = "fail"
+            reasons.append("双侧 CFD 必须有独立且各自连通的左/右入口、单一鼻咽出口，且完整气道为一个连通壳")
+
     result = {
         "faces": int(len(faces)),
         "vertices": int(len(vertices)),
@@ -414,6 +484,10 @@ def check_mesh(
         "openings": loop_info,
         "opening_count": len(loop_info),
         "openings_by_end": openings_by_end,
+        "bilateral_local_caps": {
+            "enabled": bilateral_caps,
+            "components_by_side": cap_components if bilateral_caps else {},
+        },
         "usable_openings_by_end": usable_openings_by_end,
         "opening_area_threshold_mm2": MIN_OPENING_AREA_MM2,
         "degenerate_faces": degenerate_faces,

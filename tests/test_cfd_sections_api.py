@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi import HTTPException
@@ -9,7 +11,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import server
-from pipeline import cases, cfd_postprocess_jobs, cfd_sections
+from pipeline import cases, cfd_postprocess_jobs, cfd_sections, scenario_jobs
 from pipeline.errors import PipelineError
 from tests.test_cfd_results_api import result_case
 
@@ -65,13 +67,39 @@ def test_whole_section_analyze_endpoint_passes_position_and_source_signatures(re
 def test_conflicting_mutation_rejected_before_section_reader(result_case, monkeypatch):
     case_id, _root, _ = result_case
     monkeypatch.setattr(server, "_record_activity", lambda _event: None)
-    cfd_postprocess_jobs.reserve_mutation(case_id)
+    scenario_jobs.reserve_mutation(case_id)
     try:
         response = TestClient(server.app).post(f"/api/cases/{case_id}/cfd-sections/preview", json={"position_fraction": .5})
     finally:
-        cfd_postprocess_jobs.release_mutation(case_id)
+        scenario_jobs.release_mutation(case_id)
     assert response.status_code == 409
-    assert "正在处理" in response.json()["reason"]
+    assert "正在保存另一项操作" in response.json()["reason"]
+
+
+def test_read_only_section_preview_does_not_block_postprocessing(result_case, monkeypatch):
+    case_id, _root, _ = result_case
+    entered = threading.Event()
+    release = threading.Event()
+
+    def preview(_root, _position):
+        entered.set()
+        assert release.wait(5)
+        return {"status": "preview"}
+
+    monkeypatch.setattr(server, "_record_activity", lambda _event: None)
+    monkeypatch.setattr(cfd_sections, "preview_section", preview)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(TestClient(server.app).post,
+                                 f"/api/cases/{case_id}/cfd-sections/preview",
+                                 json={"position_fraction": .5})
+            assert entered.wait(5)
+            cfd_postprocess_jobs.reserve_mutation(case_id)
+            cfd_postprocess_jobs.release_mutation(case_id)
+            release.set()
+            assert future.result(timeout=5).status_code == 200
+    finally:
+        release.set()
 
 
 def test_stale_analysis_error_remains_observable(result_case, monkeypatch):

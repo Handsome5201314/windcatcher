@@ -1,0 +1,6 @@
+**
+!deploy/
+!deploy/harness-egress/
+!deploy/harness-egress/proxy.js
+!deploy/harness-egress/Dockerfile.proxy
+!deploy/harness-egress/Dockerfile.proxy.dockerignore
